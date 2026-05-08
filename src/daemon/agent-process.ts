@@ -167,6 +167,41 @@ export class AgentProcess {
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
 
+      // Issue #326 hang watchdog: only AgentPTY (Claude) exposes this today.
+      // CodexPTY/HermesPTY can opt in later — the failure mode is specific
+      // to PTY-resident REPLs that can wedge after large pasted input. The
+      // configurable threshold (config.json: pty_hang_timeout_seconds)
+      // defaults to 6 minutes, generous enough that a long Claude turn does
+      // not trip it but tight enough to catch a wedged PTY before further
+      // injections pile up. Setting it to 0 disables the watchdog entirely.
+      const hangTimeoutSec =
+        (this.config as AgentConfig & { pty_hang_timeout_seconds?: number }).pty_hang_timeout_seconds ?? 360;
+      // Feature-detect enableHangWatchdog so test mocks (which provide a thin
+      // PTY surface) and HermesPTY/CodexPTY (no watchdog yet) don't crash
+      // start(). Real AgentPTY exposes it; everything else is a no-op.
+      type WatchdogCapable = { enableHangWatchdog: (ms: number, cb: (idle: number) => void) => void };
+      const watchdog = this.pty as unknown as Partial<WatchdogCapable>;
+      if (
+        this.config.runtime !== 'hermes' &&
+        this.config.runtime !== 'codex' &&
+        hangTimeoutSec > 0 &&
+        typeof watchdog.enableHangWatchdog === 'function'
+      ) {
+        const ptyForKill = this.pty as AgentPTY;
+        watchdog.enableHangWatchdog(hangTimeoutSec * 1000, (idleMs: number) => {
+          this.log(`PTY hang detected (${Math.round(idleMs / 1000)}s idle after injection) — killing for crash-recovery restart`);
+          // Kill the PTY: the existing onExit handler routes through
+          // handleExit, which already does exponential-backoff restart with
+          // crash-counter accounting. Reusing that path keeps recovery
+          // semantics identical to a real crash and audited in restarts.log.
+          try {
+            ptyForKill.kill();
+          } catch (err) {
+            this.log(`Watchdog kill failed: ${err}`);
+          }
+        });
+      }
+
       // Start session timer
       this.startSessionTimer();
 

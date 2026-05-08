@@ -1,6 +1,7 @@
 import { join } from 'path';
 import { existsSync, readFileSync, readdirSync } from 'fs';
-import { platform } from 'os';
+import { execFileSync } from 'child_process';
+import { platform, homedir } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 
@@ -36,6 +37,19 @@ export class AgentPTY {
   private config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
+  // Issue #326 watchdog: track when output last arrived from the PTY.
+  // After an injection, if the PTY produces no output for hangTimeoutMs the
+  // process is considered hung (alive but quiescent — Telegram photo
+  // injections, oversized pastes, and certain TUI states have all been
+  // observed to produce this failure mode). The watchdog fires onHangHandler
+  // exactly once per detected hang; the supervisor decides what to do
+  // (typically: kill + restart). Disabled by default — start() opts in.
+  private lastOutputAt: number = Date.now();
+  private lastInjectionAt: number = 0;
+  private hangTimer: ReturnType<typeof setInterval> | null = null;
+  private hangFired: boolean = false;
+  private onHangHandler: ((idleMs: number) => void) | null = null;
+  private hangTimeoutMs: number = 0;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
     this.env = env;
@@ -155,6 +169,8 @@ export class AgentPTY {
 
     // Set up output capture
     this.pty.onData((data: string) => {
+      this.lastOutputAt = Date.now();
+      this.hangFired = false;
       this.outputBuffer.push(data);
     });
 
@@ -189,11 +205,19 @@ export class AgentPTY {
   }
 
   /**
-   * Returns the binary name for the agent process.
+   * Returns the binary path for the agent process.
    * Protected so HermesPTY can override to return 'hermes'.
+   *
+   * Issue #342: PM2 caches PATH at daemon-spawn time. When Claude Code
+   * self-updates and the binary moves (e.g. from /usr/local/bin/claude to
+   * ~/.local/bin/claude), bare `claude` resolution against PM2's frozen
+   * PATH fails and every agent spawn silently exits 1. Re-resolving to an
+   * absolute path on each spawn — through the user's login shell so live
+   * PATH is consulted, plus a fallback scan of the install locations
+   * Claude Code actually uses — closes that failure mode.
    */
   protected getBinaryName(): string {
-    if (platform() !== 'win32') return 'claude';
+    if (platform() !== 'win32') return this.resolveClaudeBinaryUnix();
     // The Claude Code Windows installer historically shipped a `claude.cmd`
     // shim alongside `claude.exe`. Newer installers (e.g. when claude lives
     // under `~/.local/bin`) ship only `claude.exe` and have no `.cmd` shim.
@@ -214,6 +238,32 @@ export class AgentPTY {
     // Neither found on PATH — fall back to the legacy default so the error
     // message from node-pty surfaces a recognizable filename for debugging.
     return 'claude.cmd';
+  }
+
+  private resolveClaudeBinaryUnix(): string {
+    const home = homedir();
+    // Order matters: prefer user-local installs (~/.local/bin, ~/.claude/local)
+    // because that's where Claude Code self-updater writes new binaries on
+    // macOS/Linux. PM2's frozen PATH may still point at an older system path.
+    const candidates = [
+      join(home, '.local/bin/claude'),
+      join(home, '.claude/local/claude'),
+      '/opt/homebrew/bin/claude',
+      '/usr/local/bin/claude',
+      '/usr/bin/claude',
+    ];
+    for (const p of candidates) {
+      if (existsSync(p)) return p;
+    }
+    try {
+      const out = execFileSync('/usr/bin/which', ['claude'], {
+        encoding: 'utf-8',
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      if (out && existsSync(out)) return out;
+    } catch { /* ignore */ }
+    return 'claude';
   }
 
   /**
@@ -269,13 +319,48 @@ export class AgentPTY {
     if (!this.pty) {
       throw new Error('PTY not spawned');
     }
+    this.lastInjectionAt = Date.now();
     this.pty.write(data);
+  }
+
+  /**
+   * Enable the hang watchdog. Calls handler once per detected hang
+   * (alive PTY + no stdout for `timeoutMs` after the most recent injection).
+   * The handler is responsible for any kill/restart decision.
+   *
+   * Issue #326: Telegram photo injection has been observed to leave the
+   * PTY alive but stdout-idle indefinitely. Without a watchdog the daemon
+   * happily keeps queueing further injections that the agent will never
+   * process.
+   */
+  enableHangWatchdog(timeoutMs: number, handler: (idleMs: number) => void): void {
+    this.hangTimeoutMs = timeoutMs;
+    this.onHangHandler = handler;
+    if (this.hangTimer) clearInterval(this.hangTimer);
+    this.hangTimer = setInterval(() => this.checkHang(), Math.max(100, Math.floor(timeoutMs / 4)));
+  }
+
+  private checkHang(): void {
+    if (!this._alive || !this.pty || this.hangFired || this.hangTimeoutMs <= 0) return;
+    if (this.lastInjectionAt === 0) return; // never injected — nothing to watch
+    const now = Date.now();
+    const idleSinceOutput = now - this.lastOutputAt;
+    const sinceInjection = now - this.lastInjectionAt;
+    // Only trip if (a) an injection happened, (b) no output since, (c) exceeds threshold.
+    if (sinceInjection >= this.hangTimeoutMs && idleSinceOutput >= this.hangTimeoutMs) {
+      this.hangFired = true;
+      this.onHangHandler?.(idleSinceOutput);
+    }
   }
 
   /**
    * Kill the PTY process.
    */
   kill(): void {
+    if (this.hangTimer) {
+      clearInterval(this.hangTimer);
+      this.hangTimer = null;
+    }
     const pty = this.pty;
     if (pty) {
       this._alive = false;
