@@ -1,0 +1,45 @@
+# Dependencies (built fresh in the deps stage)
+node_modules
+.pnp
+.pnp.*
+
+# Build artifacts
+.next
+out
+build
+dist
+
+# Local env (must be set via Coolify environment, not baked into the image)
+.env
+.env.local
+.env.*.local
+
+# State (mounted as a volume, not copied)
+.data
+*.db
+*.db-shm
+*.db-wal
+
+# Tests + dev tooling
+__tests__
+*.test.ts
+*.test.tsx
+playwright-report
+test-results
+.eslintcache
+coverage
+
+# Editor / VCS / OS noise
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Docs that don't belong in the image
+README.md
+AGENTS.md
+CLAUDE.md
+*.md
+!next.config.ts

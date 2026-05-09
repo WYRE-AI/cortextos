@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import path from "path";
 
 // Next.js 15.2+ blocks non-localhost origins from /_next/* dev-internal
 // resources by default. When the dashboard is accessed over Tailscale, a LAN
@@ -17,6 +18,15 @@ const allowedDevOrigins = (process.env.DASHBOARD_ALLOWED_DEV_ORIGINS ?? '')
   .filter(Boolean);
 
 const nextConfig: NextConfig = {
+  // Coolify deployment: emit a self-contained server bundle so the runtime
+  // image can ship without dev deps or the full node_modules tree. Standalone
+  // mode produces .next/standalone/server.js which the Dockerfile runs.
+  output: 'standalone',
+  // Pin trace root to this package — without it, Next.js detects the parent
+  // monorepo (root + dashboard each have a package-lock.json) and nests the
+  // standalone output under .next/standalone/dashboard/. The Docker COPY
+  // commands assume server.js sits directly in .next/standalone/.
+  outputFileTracingRoot: path.join(__dirname),
   serverExternalPackages: ['better-sqlite3'],
   ...(allowedDevOrigins.length > 0 && { allowedDevOrigins }),
   async headers() {
