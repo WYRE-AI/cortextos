@@ -37,15 +37,17 @@ export class AgentPTY {
   private config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
-  // Issue #326 watchdog: track when output last arrived from the PTY.
-  // After an injection, if the PTY produces no output for hangTimeoutMs the
-  // process is considered hung (alive but quiescent — Telegram photo
-  // injections, oversized pastes, and certain TUI states have all been
-  // observed to produce this failure mode). The watchdog fires onHangHandler
-  // exactly once per detected hang; the supervisor decides what to do
-  // (typically: kill + restart). Disabled by default — start() opts in.
-  private lastOutputAt: number = Date.now();
+  // Issue #326 watchdog: detect "injection went into a black hole" hangs —
+  // an injection happens but the PTY produces ZERO output before the
+  // timeout. A healthy agent that responds and then goes idle is NOT a
+  // hang, even after long quiet periods — agents are supposed to be quiet
+  // when they're done with a turn. The earlier "idleSinceOutput" check was
+  // wrong: it treated normal post-turn quiet as a hang and killed healthy
+  // agents on a 6-minute idle timer. Correct semantics: track whether ANY
+  // output has been seen since the most recent injection. Hung iff
+  // (sinceInjection >= timeout) AND (no output since injection).
   private lastInjectionAt: number = 0;
+  private outputSeenSinceInjection: boolean = true;
   private hangTimer: ReturnType<typeof setInterval> | null = null;
   private hangFired: boolean = false;
   private onHangHandler: ((idleMs: number) => void) | null = null;
@@ -169,7 +171,11 @@ export class AgentPTY {
 
     // Set up output capture
     this.pty.onData((data: string) => {
-      this.lastOutputAt = Date.now();
+      // Any output between an injection and the watchdog timeout proves the
+      // agent received the injection — even if it then goes quiet, that's
+      // a normal completed turn, not a hang. Re-arming hangFired here lets
+      // the next injection start fresh.
+      this.outputSeenSinceInjection = true;
       this.hangFired = false;
       this.outputBuffer.push(data);
     });
@@ -320,6 +326,8 @@ export class AgentPTY {
       throw new Error('PTY not spawned');
     }
     this.lastInjectionAt = Date.now();
+    this.outputSeenSinceInjection = false;
+    this.hangFired = false;
     this.pty.write(data);
   }
 
@@ -343,13 +351,11 @@ export class AgentPTY {
   private checkHang(): void {
     if (!this._alive || !this.pty || this.hangFired || this.hangTimeoutMs <= 0) return;
     if (this.lastInjectionAt === 0) return; // never injected — nothing to watch
-    const now = Date.now();
-    const idleSinceOutput = now - this.lastOutputAt;
-    const sinceInjection = now - this.lastInjectionAt;
-    // Only trip if (a) an injection happened, (b) no output since, (c) exceeds threshold.
-    if (sinceInjection >= this.hangTimeoutMs && idleSinceOutput >= this.hangTimeoutMs) {
+    if (this.outputSeenSinceInjection) return; // agent acked the inject — healthy
+    const sinceInjection = Date.now() - this.lastInjectionAt;
+    if (sinceInjection >= this.hangTimeoutMs) {
       this.hangFired = true;
-      this.onHangHandler?.(idleSinceOutput);
+      this.onHangHandler?.(sinceInjection);
     }
   }
 
