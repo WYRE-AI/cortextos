@@ -31,9 +31,15 @@ async function main(): Promise<void> {
   const input = await readStdin();
   const { tool_name, tool_input } = parseHookInput(input);
 
-  // ExitPlanMode and AskUserQuestion are handled by other hooks
+  // Short-circuit cases that don't need env/config loading on the hot path:
+  // ExitPlanMode and AskUserQuestion are handled by other hooks; .claude/
+  // directory writes are auto-approved.
   if (tool_name === 'ExitPlanMode' || tool_name === 'AskUserQuestion') {
     process.exit(0);
+  }
+  if (isClaudeDirOperation(tool_name, tool_input)) {
+    outputDecision('allow');
+    return;
   }
 
   // loadEnv() loads the agent .env into process.env (side effect) and gives us
@@ -43,12 +49,6 @@ async function main(): Promise<void> {
 
   if (!config) {
     outputDecision('deny', 'No Discord credentials configured for remote approval');
-    return;
-  }
-
-  // Auto-approve .claude/ directory writes
-  if (isClaudeDirOperation(tool_name, tool_input)) {
-    outputDecision('allow');
     return;
   }
 
@@ -85,9 +85,7 @@ async function main(): Promise<void> {
 
   if (content !== null) {
     try {
-      const response = JSON.parse(content);
-      const decision = response.decision || 'deny';
-      if (decision === 'allow') {
+      if (JSON.parse(content).decision === 'allow') {
         outputDecision('allow');
       } else {
         outputDecision('deny', 'Denied by user via Discord');
@@ -96,14 +94,12 @@ async function main(): Promise<void> {
       outputDecision('deny', 'Invalid response file');
     }
   } else {
-    try {
-      await api.createMessage({
+    await api
+      .createMessage({
         channel: config.orchChannelId,
         content: `Permission request TIMED OUT (auto-denied): ${tool_name}`,
-      });
-    } catch {
-      /* ignore notification failure */
-    }
+      })
+      .catch(() => { /* ignore notification failure */ });
     outputDecision('deny', 'Timed out waiting for Discord approval (30m)');
   }
 }

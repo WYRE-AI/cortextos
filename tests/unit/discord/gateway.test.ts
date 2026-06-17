@@ -13,48 +13,34 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { DiscordGateway, createGatewayFromEnv } from '../../../src/discord/gateway';
 import { deliverInbound, type DiscordInboundMessage } from '../../../src/discord/inbound';
-import type { BusPaths } from '../../../src/types/index';
 import { MockDiscordGateway } from '../../playwright/mock-discord-gateway';
+import { makePaths } from './helpers';
 
 const ORCH_CHANNEL = 'ORCH123';
 
-function makePaths(root: string, agent: string, org: string): BusPaths {
-  return {
-    ctxRoot: root,
-    inbox: join(root, 'inbox', agent),
-    inflight: join(root, 'inflight', agent),
-    processed: join(root, 'processed', agent),
-    logDir: join(root, 'logs', agent),
-    stateDir: join(root, 'state', agent),
-    taskDir: join(root, 'orgs', org, 'tasks'),
-    approvalDir: join(root, 'orgs', org, 'approvals'),
-    analyticsDir: join(root, 'orgs', org, 'analytics'),
-    deliverablesDir: join(root, 'orgs', org, 'deliverables'),
-  };
-}
-
 describe('DiscordGateway (mock-driven inbound)', () => {
   let mock: MockDiscordGateway;
+  let gw: DiscordGateway;
 
   beforeEach(() => {
     mock = new MockDiscordGateway();
+    gw = new DiscordGateway(
+      { botToken: 't', orchChannelId: ORCH_CHANNEL },
+      mock.factory,
+    );
   });
 
   it('logs in with the configured token on start', async () => {
-    const gw = new DiscordGateway(
+    const gwWithToken = new DiscordGateway(
       { botToken: 'secret-tok', orchChannelId: ORCH_CHANNEL },
       mock.factory,
     );
-    await gw.start();
+    await gwWithToken.start();
     expect(mock.client.loggedInToken).toBe('secret-tok');
     expect(mock.client.loginCount).toBe(1);
   });
 
   it('forwards messages in the configured channel to handlers', async () => {
-    const gw = new DiscordGateway(
-      { botToken: 't', orchChannelId: ORCH_CHANNEL },
-      mock.factory,
-    );
     const received: DiscordInboundMessage[] = [];
     gw.onMessage((m) => received.push(m));
     await gw.start();
@@ -67,10 +53,6 @@ describe('DiscordGateway (mock-driven inbound)', () => {
   });
 
   it('drops messages from other channels (orchestrator-only scope)', async () => {
-    const gw = new DiscordGateway(
-      { botToken: 't', orchChannelId: ORCH_CHANNEL },
-      mock.factory,
-    );
     const received: DiscordInboundMessage[] = [];
     gw.onMessage((m) => received.push(m));
     await gw.start();
@@ -81,10 +63,6 @@ describe('DiscordGateway (mock-driven inbound)', () => {
   });
 
   it('a handler throw does not kill the gateway', async () => {
-    const gw = new DiscordGateway(
-      { botToken: 't', orchChannelId: ORCH_CHANNEL },
-      mock.factory,
-    );
     const seen: string[] = [];
     gw.onMessage(() => {
       throw new Error('boom');
@@ -97,10 +75,6 @@ describe('DiscordGateway (mock-driven inbound)', () => {
   });
 
   it('destroys the client on stop (supervisor teardown)', async () => {
-    const gw = new DiscordGateway(
-      { botToken: 't', orchChannelId: ORCH_CHANNEL },
-      mock.factory,
-    );
     await gw.start();
     await gw.stop();
     expect(mock.client.destroyed).toBe(true);
@@ -108,10 +82,6 @@ describe('DiscordGateway (mock-driven inbound)', () => {
   });
 
   it('refuses a double start', async () => {
-    const gw = new DiscordGateway(
-      { botToken: 't', orchChannelId: ORCH_CHANNEL },
-      mock.factory,
-    );
     await gw.start();
     await expect(gw.start()).rejects.toThrow(/already started/);
   });
@@ -133,23 +103,17 @@ describe('createGatewayFromEnv', () => {
 
 describe('end-to-end: gateway message lands in the orchestrator bus inbox', () => {
   let ctxRoot: string;
+  let mock: MockDiscordGateway;
+  let gw: DiscordGateway;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     ctxRoot = mkdtempSync(join(tmpdir(), 'discord-gw-e2e-'));
-  });
-
-  afterEach(() => {
-    rmSync(ctxRoot, { recursive: true, force: true });
-  });
-
-  it('routes an inbound channel message into inbox/orchestrator/', async () => {
     const paths = makePaths(ctxRoot, 'orchestrator', 'home');
-    const mock = new MockDiscordGateway();
-    const gw = new DiscordGateway(
+    mock = new MockDiscordGateway();
+    gw = new DiscordGateway(
       { botToken: 't', orchChannelId: ORCH_CHANNEL },
       mock.factory,
     );
-
     // Wire the gateway to the inbound delivery path exactly as the daemon would.
     gw.onMessage((msg) => {
       deliverInbound({
@@ -161,7 +125,13 @@ describe('end-to-end: gateway message lands in the orchestrator bus inbox', () =
       });
     });
     await gw.start();
+  });
 
+  afterEach(() => {
+    rmSync(ctxRoot, { recursive: true, force: true });
+  });
+
+  it('routes an inbound channel message into inbox/orchestrator/', () => {
     mock.client.emitMessage({
       channelId: ORCH_CHANNEL,
       authorName: 'Aaron',
@@ -174,24 +144,7 @@ describe('end-to-end: gateway message lands in the orchestrator bus inbox', () =
     expect(files).toHaveLength(1);
   });
 
-  it('does not route a bot-authored message into the inbox', async () => {
-    const paths = makePaths(ctxRoot, 'orchestrator', 'home');
-    const mock = new MockDiscordGateway();
-    const gw = new DiscordGateway(
-      { botToken: 't', orchChannelId: ORCH_CHANNEL },
-      mock.factory,
-    );
-    gw.onMessage((msg) => {
-      deliverInbound({
-        paths,
-        ctxRoot,
-        orchestrator: 'orchestrator',
-        org: 'home',
-        message: msg,
-      });
-    });
-    await gw.start();
-
+  it('does not route a bot-authored message into the inbox', () => {
     mock.client.emitMessage({
       channelId: ORCH_CHANNEL,
       authorIsBot: true,

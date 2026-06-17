@@ -7,7 +7,7 @@
  * Discord token or network: the REST client is replaced with a vi.fn() stub,
  * and the gateway is never touched here.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runTestSend } from '../../../src/cli/discord';
 import { DiscordRestAPI } from '../../../src/discord/rest';
 import {
@@ -66,29 +66,15 @@ describe('runTestSend (Discord outbound payloads)', () => {
     expect(api.createMessage).not.toHaveBeenCalled();
   });
 
-  it('converts codex-style literal \\n into real newlines before sending', async () => {
-    await runTestSend({ channel: 'C1', text: 'hello\\n\\nworld', env: {} }, api as never);
+  it.each<[label: string, input: string, expected: string]>([
+    ['converts codex literal \\n to real newlines', 'hello\\n\\nworld', 'hello\n\nworld'],
+    ['converts codex literal \\t to real tabs', 'col1\\tcol2', 'col1\tcol2'],
+    ['leaves real newlines untouched (claude-runtime no-op)', 'line1\nline2', 'line1\nline2'],
+    ['preserves other escape sequences verbatim (e.g. \\r)', 'has\\rcarriage', 'has\\rcarriage'],
+  ])('%s', async (_label, input, expected) => {
+    await runTestSend({ channel: 'C1', text: input, env: {} }, api as never);
     const content = api.createMessage.mock.calls[0][0].content as string;
-    expect(content).toBe('hello\n\nworld');
-    expect(content).not.toContain('\\n');
-  });
-
-  it('converts codex-style literal \\t into real tabs before sending', async () => {
-    await runTestSend({ channel: 'C1', text: 'col1\\tcol2', env: {} }, api as never);
-    const content = api.createMessage.mock.calls[0][0].content as string;
-    expect(content).toBe('col1\tcol2');
-  });
-
-  it('leaves real newlines untouched (claude-runtime no-op)', async () => {
-    await runTestSend({ channel: 'C1', text: 'line1\nline2', env: {} }, api as never);
-    const content = api.createMessage.mock.calls[0][0].content as string;
-    expect(content).toBe('line1\nline2');
-  });
-
-  it('preserves other escape sequences verbatim (e.g. \\r)', async () => {
-    await runTestSend({ channel: 'C1', text: 'has\\rcarriage', env: {} }, api as never);
-    const content = api.createMessage.mock.calls[0][0].content as string;
-    expect(content).toBe('has\\rcarriage');
+    expect(content).toBe(expected);
   });
 });
 
@@ -133,66 +119,57 @@ describe('loadDiscordConfig', () => {
 });
 
 describe('DiscordRestAPI payload shape', () => {
-  it('builds a Bot-auth createMessage request against the mock REST base', async () => {
-    const fetchSpy = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({ id: 'm1', channel_id: 'C1' }),
+  let fetchSpy: ReturnType<typeof vi.fn>;
+  let origFetch: typeof globalThis.fetch;
+
+  function stubFetchResponse(ok: boolean, status: number, json: object): void {
+    fetchSpy.mockResolvedValue({
+      ok,
+      status,
+      text: async () => JSON.stringify(json),
     });
-    const orig = globalThis.fetch;
+  }
+
+  beforeEach(() => {
+    fetchSpy = vi.fn();
+    origFetch = globalThis.fetch;
     (globalThis as { fetch: unknown }).fetch = fetchSpy;
-    try {
-      const api = new DiscordRestAPI('tok', 'http://localhost:1');
-      const res = await api.createMessage({ channel: 'C1', content: 'hi' });
-      expect(res).toEqual({ id: 'm1', channel_id: 'C1' });
-      const [url, init] = fetchSpy.mock.calls[0];
-      expect(url).toBe('http://localhost:1/channels/C1/messages');
-      expect((init as RequestInit).method).toBe('POST');
-      expect((init as { headers: Record<string, string> }).headers.Authorization).toBe(
-        'Bot tok',
-      );
-      expect(JSON.parse((init as { body: string }).body)).toEqual({ content: 'hi' });
-    } finally {
-      (globalThis as { fetch: unknown }).fetch = orig;
-    }
+  });
+
+  afterEach(() => {
+    (globalThis as { fetch: unknown }).fetch = origFetch;
+  });
+
+  it('builds a Bot-auth createMessage request against the mock REST base', async () => {
+    stubFetchResponse(true, 200, { id: 'm1', channel_id: 'C1' });
+    const api = new DiscordRestAPI('tok', 'http://localhost:1');
+    const res = await api.createMessage({ channel: 'C1', content: 'hi' });
+    expect(res).toEqual({ id: 'm1', channel_id: 'C1' });
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe('http://localhost:1/channels/C1/messages');
+    expect((init as RequestInit).method).toBe('POST');
+    expect((init as { headers: Record<string, string> }).headers.Authorization).toBe(
+      'Bot tok',
+    );
+    expect(JSON.parse((init as { body: string }).body)).toEqual({ content: 'hi' });
   });
 
   it('includes message_reference with fail_if_not_exists:false on reply', async () => {
-    const fetchSpy = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({ id: 'm2', channel_id: 'C1' }),
+    stubFetchResponse(true, 200, { id: 'm2', channel_id: 'C1' });
+    const api = new DiscordRestAPI('tok', 'http://localhost:1');
+    await api.createMessage({ channel: 'C1', content: 'hi', replyToMessageId: 'M9' });
+    const body = JSON.parse((fetchSpy.mock.calls[0][1] as { body: string }).body);
+    expect(body.message_reference).toEqual({
+      message_id: 'M9',
+      fail_if_not_exists: false,
     });
-    const orig = globalThis.fetch;
-    (globalThis as { fetch: unknown }).fetch = fetchSpy;
-    try {
-      const api = new DiscordRestAPI('tok', 'http://localhost:1');
-      await api.createMessage({ channel: 'C1', content: 'hi', replyToMessageId: 'M9' });
-      const body = JSON.parse((fetchSpy.mock.calls[0][1] as { body: string }).body);
-      expect(body.message_reference).toEqual({
-        message_id: 'M9',
-        fail_if_not_exists: false,
-      });
-    } finally {
-      (globalThis as { fetch: unknown }).fetch = orig;
-    }
   });
 
   it('throws a descriptive error on a non-2xx response', async () => {
-    const fetchSpy = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 401,
-      text: async () => JSON.stringify({ message: '401: Unauthorized' }),
-    });
-    const orig = globalThis.fetch;
-    (globalThis as { fetch: unknown }).fetch = fetchSpy;
-    try {
-      const api = new DiscordRestAPI('bad', 'http://localhost:1');
-      await expect(
-        api.createMessage({ channel: 'C1', content: 'hi' }),
-      ).rejects.toThrow(/401: Unauthorized/);
-    } finally {
-      (globalThis as { fetch: unknown }).fetch = orig;
-    }
+    stubFetchResponse(false, 401, { message: '401: Unauthorized' });
+    const api = new DiscordRestAPI('bad', 'http://localhost:1');
+    await expect(
+      api.createMessage({ channel: 'C1', content: 'hi' }),
+    ).rejects.toThrow(/401: Unauthorized/);
   });
 });

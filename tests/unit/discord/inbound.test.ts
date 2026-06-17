@@ -18,24 +18,10 @@ import {
   normalizeInbound,
   type DiscordInboundMessage,
 } from '../../../src/discord/inbound';
+import { makePaths } from './helpers';
 
 let ctxRoot: string;
 let paths: BusPaths;
-
-function makePaths(root: string, agent: string, org: string): BusPaths {
-  return {
-    ctxRoot: root,
-    inbox: join(root, 'inbox', agent),
-    inflight: join(root, 'inflight', agent),
-    processed: join(root, 'processed', agent),
-    logDir: join(root, 'logs', agent),
-    stateDir: join(root, 'state', agent),
-    taskDir: join(root, 'orgs', org, 'tasks'),
-    approvalDir: join(root, 'orgs', org, 'approvals'),
-    analyticsDir: join(root, 'orgs', org, 'analytics'),
-    deliverablesDir: join(root, 'orgs', org, 'deliverables'),
-  };
-}
 
 function baseMessage(overrides: Partial<DiscordInboundMessage> = {}): DiscordInboundMessage {
   return {
