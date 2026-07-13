@@ -148,7 +148,14 @@ alert → cooldown) via a shimmed agent binary on 2026-07-16.
   its instance's `daemon.pid` already points at a live process that isn't
   itself, instead of silently overwriting the pidfile and joining a
   split-brain. Unknown states (missing/stale/corrupt pidfile) boot normally —
-  it only refuses on a positively-indicated live daemon.
+  it only refuses on a positively-indicated live daemon. Ownership is
+  verified via a new `daemon.start-time` anchor (epoch-ms process start time,
+  written anchor-first/atomically): a live pid whose start time mismatches
+  the anchor is a **recycled pid** (crash-orphaned pidfile) and boots instead
+  of false-refusing; `daemon.pid` itself stays bare-int for operator `cat`s
+  and the deploy-runbook invariant. NOTE: the daemon uses pm2 restart /
+  stop-then-start, NEVER `pm2 reload` — reload spawns-new-before-kill-old, so
+  this guard structurally refuses it by design.
 
 ### Fixed — freeze-cure: context-handoff default-ON + fleet-wide bridge wiring
 

@@ -18,9 +18,10 @@
 // Refusing a boot is recoverable (pm2 logs show exactly why); a duplicate
 // fleet is what this fleet just spent a day untangling.
 
-import { existsSync, readFileSync } from 'fs';
+import { chmodSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { isPidAlive } from '../utils/agent-pidfile.js';
+import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { isPidAlive, processStartTimeMs, START_TIME_TOLERANCE_MS } from '../utils/agent-pidfile.js';
 
 /** Extract the value of `--instance <id>` or `--instance=<id>`, or null. */
 function argvInstance(argv: string[]): string | null {
@@ -61,12 +62,59 @@ export function resolveInstanceId(argv: string[], env: NodeJS.ProcessEnv): strin
 }
 
 /**
+ * Record this daemon's pid for the boot guard. Two files:
+ *   daemon.pid        — bare int, format unchanged (operators `cat` it and the
+ *                       deploy runbook's invariant check compares it to pm2's pid)
+ *   daemon.start-time — epoch-ms process start time (`ps -o lstart=`), the
+ *                       pid-recycling anchor assertSingleDaemon() uses to tell a
+ *                       still-running daemon from a recycled pid after a crash
+ *                       (daemon.pid is only unlinked on GRACEFUL shutdown, so a
+ *                       crash leaves it behind indefinitely).
+ * Best-effort on the anchor: if `ps` fails the anchor is simply absent, which
+ * the guard treats as no-anchor (fail-closed), same as a legacy pidfile.
+ *
+ * WRITE ORDERING IS LOAD-BEARING: anchor FIRST, pid SECOND (pid = commit
+ * point). Inverted, a failed anchor write pairs a FRESH pid with a STALE
+ * anchor from a previous generation — a third daemon booting while this one
+ * is live would observe start-time(live) ≠ stale-anchor as a positive
+ * "recycled pid" disproof and boot past it: the guard inverted into a
+ * false-BOOT. Anchor-first degrades the same failure to fresh-anchor +
+ * OLD-dead-pid, which boots harmlessly and never disproves a live daemon.
+ * Both writes are atomic (temp+rename) per repo convention.
+ */
+export function recordDaemonPid(ctxRoot: string, pid: number): void {
+  ensureDir(ctxRoot);
+  const pidFile = join(ctxRoot, 'daemon.pid');
+  const anchorFile = join(ctxRoot, 'daemon.start-time');
+  const startedAt = processStartTimeMs(pid);
+  if (startedAt !== null) {
+    atomicWriteSync(anchorFile, String(startedAt));
+  }
+  atomicWriteSync(pidFile, String(pid));
+  if (process.platform !== 'win32') {
+    try {
+      chmodSync(pidFile, 0o600);
+      if (startedAt !== null) chmodSync(anchorFile, 0o600);
+    } catch { /* best effort */ }
+  }
+}
+
+/**
  * Single-daemon-per-instance boot guard: throw if this instance's daemon.pid
- * points at a live process other than us. Unknown states (no file, dead pid,
- * corrupt content) boot fine — we only refuse when a second live daemon can be
- * POSITIVELY indicated. (A recycled pid can false-positive this; the error
- * says exactly how to clear a stale file, and refusing is the recoverable
- * direction for this incident class.)
+ * points at a live process other than us that we cannot POSITIVELY rule out as
+ * a still-running daemon. Decision table (fail-closed on unknowns, boot only
+ * on positive disproof — a wrong refusal is recoverable, a second daemon is
+ * the split-brain):
+ *   no file / dead pid / corrupt pid / our own pid  → boot
+ *   alive + anchor MISMATCHES real start time       → boot (recycled pid — the
+ *     crash-then-long-gap case: daemon.pid persists across crashes and the OS
+ *     eventually reuses the pid for an unrelated process)
+ *   alive + anchor matches                          → refuse (confirmed daemon)
+ *   alive + no/corrupt/unreadable anchor            → refuse (cannot disprove)
+ *
+ * OPERATIONAL INVARIANT: the daemon uses pm2 restart / stop-then-start, NEVER
+ * `pm2 reload` — reload spawns-new-before-kill-old, so this guard structurally
+ * refuses it BY DESIGN. A refusal under reload is the guard working, not a bug.
  */
 export function assertSingleDaemon(ctxRoot: string, currentPid: number): void {
   const pidFile = join(ctxRoot, 'daemon.pid');
@@ -80,6 +128,24 @@ export function assertSingleDaemon(ctxRoot: string, currentPid: number): void {
   if (!Number.isInteger(recorded) || recorded <= 0) return; // corrupt → boot
   if (recorded === currentPid) return; // our own record (restart path)
   if (!isPidAlive(recorded)) return; // stale record from a crash → boot
+
+  // Alive — check the start-time anchor before refusing (pid-recycling disproof).
+  let anchor: number | null = null;
+  try {
+    const anchorFile = join(ctxRoot, 'daemon.start-time');
+    if (existsSync(anchorFile)) {
+      const parsed = parseInt(readFileSync(anchorFile, 'utf-8').trim(), 10);
+      anchor = Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+    }
+  } catch {
+    anchor = null; // unreadable anchor → treated as absent (fail-closed below)
+  }
+  if (anchor !== null) {
+    const observed = processStartTimeMs(recorded);
+    if (observed !== null && Math.abs(observed - anchor) > START_TIME_TOLERANCE_MS) {
+      return; // live pid is NOT the recorded daemon — recycled pid, safe to boot
+    }
+  }
 
   throw new Error(
     `[daemon] REFUSING TO START: ${pidFile} already points at live pid ${recorded} — ` +
