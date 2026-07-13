@@ -70,15 +70,57 @@ function expandField(field: string, min: number, max: number): number[] {
 }
 
 /**
+ * Default timezone for a cron expression with no explicit `timezone` field.
+ * UTC, not the daemon process's ambient/local timezone — see the bug this
+ * fixes: with no TZ env override, Node's Date getters fall back to the OS
+ * timezone (America/New_York on the fleet host), silently evaluating every
+ * cron-expr field 4-5h (DST-dependent) off from its stated UTC time.
+ */
+const DEFAULT_CRON_TIMEZONE = 'UTC';
+
+const WEEKDAY_ABBR_TO_NUM: Record<string, number> = {
+  Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+};
+
+/**
+ * Extract cron-relevant calendar fields (minute/hour/day/month/weekday) for
+ * `ms` in whatever timezone `formatter` was constructed with. Timezone-aware
+ * via Intl.DateTimeFormat (DST-native — a "America/New_York" formatter
+ * correctly reflects EST vs EDT per-date, not a fixed offset), independent
+ * of the process's ambient TZ env.
+ */
+function fieldsFromFormatter(
+  formatter: Intl.DateTimeFormat,
+  ms: number,
+): { minute: number; hour: number; day: number; month: number; weekday: number } {
+  const parts = formatter.formatToParts(new Date(ms));
+  const map: Record<string, string> = {};
+  for (const p of parts) map[p.type] = p.value;
+  return {
+    minute: parseInt(map.minute, 10),
+    hour: parseInt(map.hour, 10),
+    day: parseInt(map.day, 10),
+    month: parseInt(map.month, 10),
+    weekday: WEEKDAY_ABBR_TO_NUM[map.weekday],
+  };
+}
+
+/**
  * Compute the next fire timestamp (ms since epoch) for a 5-field cron
  * expression, starting from `fromMs` (exclusive — the next fire must be
  * strictly after fromMs, rounded forward to the next whole minute).
  *
- * @param expr   - 5-field cron expression ("min hour dom month dow").
- * @param fromMs - Starting epoch time in milliseconds.
- * @returns      Epoch ms of the next matching minute, or NaN if unparseable.
+ * @param expr     - 5-field cron expression ("min hour dom month dow").
+ * @param fromMs   - Starting epoch time in milliseconds.
+ * @param timezone - IANA timezone the expression's fields are evaluated in
+ *                   (e.g. "America/New_York"). Defaults to "UTC" — a cron
+ *                   with no explicit timezone fires at its literal stated
+ *                   UTC time, never at the ambient/local time of whatever
+ *                   process happens to be running the daemon.
+ * @returns        Epoch ms of the next matching minute, or NaN if
+ *                 unparseable (including an invalid IANA timezone string).
  */
-export function nextFireFromCron(expr: string, fromMs: number): number {
+export function nextFireFromCron(expr: string, fromMs: number, timezone: string = DEFAULT_CRON_TIMEZONE): number {
   const parts = expr.trim().split(/\s+/);
   if (parts.length !== 5) return NaN;
 
@@ -95,6 +137,22 @@ export function nextFireFromCron(expr: string, fromMs: number): number {
     return NaN;
   }
 
+  // Build the Intl formatter once (throws RangeError on an invalid IANA
+  // timezone string — caught here so an invalid cron.timezone in crons.json
+  // fails safe as NaN rather than crashing the daemon's scheduler tick).
+  let formatter: Intl.DateTimeFormat;
+  try {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit',
+      hourCycle: 'h23',
+      weekday: 'short',
+    });
+  } catch {
+    return NaN;
+  }
+
   // Start from the next whole minute after fromMs
   const startMs = Math.floor(fromMs / 60_000) * 60_000 + 60_000;
 
@@ -103,12 +161,7 @@ export function nextFireFromCron(expr: string, fromMs: number): number {
   let candidate = startMs;
 
   for (let i = 0; i < MAX_MINUTES; i++) {
-    const d = new Date(candidate);
-    const m  = d.getMinutes();
-    const h  = d.getHours();
-    const dy = d.getDate();
-    const mo = d.getMonth() + 1; // 1-12
-    const dw = d.getDay();       // 0-6
+    const { minute: m, hour: h, day: dy, month: mo, weekday: dw } = fieldsFromFormatter(formatter, candidate);
 
     if (
       months.includes(mo) &&
@@ -203,8 +256,10 @@ export function computeNextFireAt(cron: CronDefinition, referenceMs: number): nu
   if (!isNaN(durationMs)) {
     return referenceMs + durationMs;
   }
-  // Try as a cron expression
-  const next = nextFireFromCron(cron.schedule, referenceMs);
+  // Try as a cron expression, in the cron's declared timezone (default UTC —
+  // see nextFireFromCron's docblock for why this must not be the process's
+  // ambient/local timezone).
+  const next = nextFireFromCron(cron.schedule, referenceMs, cron.timezone ?? DEFAULT_CRON_TIMEZONE);
   return next;
 }
 
