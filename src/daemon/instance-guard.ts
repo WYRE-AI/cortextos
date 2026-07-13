@@ -18,7 +18,7 @@
 // Refusing a boot is recoverable (pm2 logs show exactly why); a duplicate
 // fleet is what this fleet just spent a day untangling.
 
-import { chmodSync, existsSync, readFileSync } from 'fs';
+import { chmodSync, existsSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { isPidAlive, processStartTimeMs, START_TIME_TOLERANCE_MS } from '../utils/agent-pidfile.js';
@@ -89,6 +89,13 @@ export function recordDaemonPid(ctxRoot: string, pid: number): void {
   const startedAt = processStartTimeMs(pid);
   if (startedAt !== null) {
     atomicWriteSync(anchorFile, String(startedAt));
+  } else {
+    // `ps` hiccup — no anchor for THIS generation. A PRIOR generation's stale
+    // anchor left next to the fresh pid would recreate the false-boot pairing
+    // via this skip path (start-time(live) ≠ stale anchor = bogus "recycled"
+    // disproof), so remove it: the state degrades to no-anchor = fail-closed
+    // refuse, per the decision table on assertSingleDaemon.
+    rmSync(anchorFile, { force: true });
   }
   atomicWriteSync(pidFile, String(pid));
   if (process.platform !== 'win32') {

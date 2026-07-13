@@ -123,6 +123,16 @@ describe('assertSingleDaemon — one live daemon per instance', () => {
     expect(Math.abs(parseInt(anchorRaw, 10) - real!)).toBeLessThanOrEqual(5_000);
   });
 
+  it('recordDaemonPid REMOVES a stale prior-generation anchor when the start-time read fails (skip-path cell: stale anchor + fresh pid must degrade to no-anchor/fail-closed, never to a false-boot pairing)', () => {
+    // Prior generation left an anchor behind.
+    writeFileSync(join(ctxRoot, 'daemon.start-time'), '1700000000000', 'utf-8');
+    // A dead pid drives processStartTimeMs() to null — the same skip path a
+    // live-boot `ps` hiccup takes.
+    recordDaemonPid(ctxRoot, 4194304);
+    expect(readFileSync(join(ctxRoot, 'daemon.pid'), 'utf-8').trim()).toBe('4194304');
+    expect(() => readFileSync(join(ctxRoot, 'daemon.start-time'), 'utf-8')).toThrow(); // anchor ABSENT
+  });
+
   it('daemon.pid pointing at OUR OWN pid → boots fine (idempotent same-process restart path)', () => {
     writeFileSync(join(ctxRoot, 'daemon.pid'), String(process.pid), 'utf-8');
     expect(() => assertSingleDaemon(ctxRoot, process.pid)).not.toThrow();

@@ -315,9 +315,11 @@ class Daemon {
       }
       // Clean up PID file
       try {
-        const { unlinkSync } = require('fs');
-        unlinkSync(join(this.ctxRoot, 'daemon.pid'));
-        unlinkSync(join(this.ctxRoot, 'daemon.start-time'));
+        // rmSync force: pair-cleanup is unconditional — a missing pidfile must
+        // not skip the anchor removal (they travel together or not at all).
+        const { rmSync } = require('fs');
+        rmSync(join(this.ctxRoot, 'daemon.pid'), { force: true });
+        rmSync(join(this.ctxRoot, 'daemon.start-time'), { force: true });
       } catch { /* ignore */ }
       process.exit(0);
     };
@@ -373,9 +375,11 @@ class Daemon {
         this.ipcServer.stop();
       }
       try {
-        const { unlinkSync } = require('fs');
-        unlinkSync(join(this.ctxRoot, 'daemon.pid'));
-        unlinkSync(join(this.ctxRoot, 'daemon.start-time'));
+        // rmSync force: pair-cleanup is unconditional — a missing pidfile must
+        // not skip the anchor removal (they travel together or not at all).
+        const { rmSync } = require('fs');
+        rmSync(join(this.ctxRoot, 'daemon.pid'), { force: true });
+        rmSync(join(this.ctxRoot, 'daemon.start-time'), { force: true });
       } catch { /* ignore */ }
     });
   }
