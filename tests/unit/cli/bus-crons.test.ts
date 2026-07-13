@@ -246,6 +246,53 @@ describe('bus add-cron', () => {
     const errOut = errSpy.mock.calls.flat().join(' ');
     expect(errOut).toContain('Invalid');
   });
+
+  it('success: --timezone persists an explicit IANA timezone on the cron', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync([
+      'node', 'bus', 'add-cron', TEST_AGENT, 'morning-briefing', '0 9 * * *',
+      '--timezone', 'America/New_York',
+      'Prepare and send the morning briefing.',
+    ]);
+
+    const crons = readCronsFile();
+    expect(crons).toHaveLength(1);
+    expect(crons[0].timezone).toBe('America/New_York');
+  });
+
+  it('omitting --timezone leaves the field unset (defaults to UTC at schedule time)', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync([
+      'node', 'bus', 'add-cron', TEST_AGENT, 'weekly-report', '0 16 * * 1',
+      'Compile the weekly report.',
+    ]);
+
+    const crons = readCronsFile();
+    expect(crons[0].timezone).toBeUndefined();
+  });
+
+  it('error: --timezone with an invalid IANA string exits 1 with helpful message', async () => {
+    const exitSpy = mockExit();
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await expect(
+      busCommand.parseAsync([
+        'node', 'bus', 'add-cron', TEST_AGENT, 'morning-briefing', '0 9 * * *',
+        '--timezone', 'Not/AZone',
+        'Prepare and send the morning briefing.',
+      ])
+    ).rejects.toThrow('__PROCESS_EXIT_1__');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const errOut = errSpy.mock.calls.flat().join(' ');
+    expect(errOut).toContain('Invalid');
+    expect(errOut).toContain('timezone');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -401,6 +448,35 @@ describe('bus update-cron', () => {
 
     const crons = readCronsFile();
     expect(crons[0].description).toBe('New description.');
+  });
+
+  it('updates timezone (--timezone)', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync([
+      'node', 'bus', 'update-cron', TEST_AGENT, 'heartbeat', '--timezone', 'America/New_York',
+    ]);
+
+    const crons = readCronsFile();
+    expect(crons[0].timezone).toBe('America/New_York');
+  });
+
+  it('error: --timezone with an invalid IANA string exits 1 with helpful message', async () => {
+    const exitSpy = mockExit();
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await expect(
+      busCommand.parseAsync([
+        'node', 'bus', 'update-cron', TEST_AGENT, 'heartbeat', '--timezone', 'Not/AZone',
+      ])
+    ).rejects.toThrow('__PROCESS_EXIT_1__');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const errOut = errSpy.mock.calls.flat().join(' ');
+    expect(errOut).toContain('Invalid');
+    expect(errOut).toContain('timezone');
   });
 
   it('error: no options provided → exits 1', async () => {
