@@ -1,4 +1,5 @@
 import { AgentManager } from './agent-manager.js';
+import { resolveInstanceId, assertSingleDaemon } from './instance-guard.js';
 import { IPCServer } from './ipc-server.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { spawnSync } from 'child_process';
@@ -245,7 +246,10 @@ class Daemon {
   private ctxRoot: string;
 
   constructor() {
-    this.instanceId = process.env.CTX_INSTANCE_ID || 'default';
+    // Topology guard (2026-07-13 two-daemon incident): argv + env must agree —
+    // env-only resolution let a --update-env re-bake silently point a
+    // gateway-named pm2 app at instance 'default'. Throws loudly on mismatch.
+    this.instanceId = resolveInstanceId(process.argv, process.env);
     // Always derive ctxRoot from instanceId to avoid inheriting a parent cortextOS's CTX_ROOT
     this.ctxRoot = join(homedir(), '.cortextos', this.instanceId);
   }
@@ -266,6 +270,11 @@ class Daemon {
       console.error('[daemon] CTX_FRAMEWORK_ROOT not set');
       process.exit(1);
     }
+
+    // Single-daemon-per-instance boot guard (2026-07-13 incident): refuse to
+    // start if daemon.pid already points at a live daemon for this instance —
+    // overwriting it below would otherwise hide the split-brain it implies.
+    assertSingleDaemon(this.ctxRoot, process.pid);
 
     const buildManifest = readBuildManifest(frameworkRoot);
     if (buildManifest) {
@@ -381,7 +390,15 @@ class Daemon {
 // with TelegramPollers, IPC server, and Claude PTY processes as a side effect.
 // See: https://github.com/grandamenium/cortextos/issues/44
 if (require.main === module) {
-  const daemon = new Daemon();
+  let daemon: Daemon;
+  try {
+    daemon = new Daemon();
+  } catch (err) {
+    // Instance-resolution mismatch (instance-guard) — the message carries the
+    // exact operator fix; a stack trace would bury it.
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
   daemon.start().catch(err => {
     console.error('[daemon] Fatal error:', err);
     process.exit(1);
