@@ -72,8 +72,11 @@ On limit event for agent A:
 Where the hang verdict currently triggers auto-restart: if the agent is
 limit-blocked (per rotation-state), skip the restart and log
 `[agent] limit-blocked — hang restart suppressed (rotation manager owns recovery)`.
-Flag clears on rotation-restart or when the agent's `last_idle.flag` advances past
-`detectedAt` (proof of recovery, e.g. limit window reset on its own).
+Flag clears on rotation-restart. A blocked session never recovers unrestarted (the
+dialog holds until keypress), so self-recovery of the ACTIVE account is handled in
+the rotation flow instead: when the bench is dry, recheck the active account
+(unless a fresh exhausted-mark says the banner just proved it dry) and, on
+recovery, restart blocked agents onto it without flipping accounts.
 
 ### 4. Proactive preflight (in rotation-manager, timer in daemon startup)
 
