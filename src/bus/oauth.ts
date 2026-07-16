@@ -436,7 +436,7 @@ function pct(v: number): string {
  * Writes CLAUDE_CODE_OAUTH_TOKEN=<token> — bare string, not JSON.
  * Scoped to a specific agent if opts.agent is set, otherwise all agents in org.
  */
-function writeTokenToAgents(
+export function writeTokenToAgents(
   frameworkRoot: string,
   org: string,
   token: string,
@@ -482,4 +482,30 @@ function writeTokenToAgents(
       try { chmodSync(envPath, 0o600); } catch { /* ignore */ }
     } catch { /* skip agents whose .env we can't write */ }
   }
+}
+
+/**
+ * Flip the active account and record the rotation, WITHOUT any preflight.
+ * Used by the daemon's rotation manager, whose preflight is an inference ping
+ * (the usage API rejects setup-tokens — no user:profile scope).
+ */
+export function setActiveAccount(
+  ctxRoot: string,
+  name: string,
+  logEntry: { reason: string; from: string },
+): void {
+  const store = loadAccounts(ctxRoot);
+  if (!store) throw new Error('No accounts.json found');
+  if (!store.accounts[name]) throw new Error(`Account "${name}" not found in accounts.json`);
+  const from = store.accounts[logEntry.from];
+  store.active = name;
+  store.rotation_log = [{
+    timestamp: new Date().toISOString(),
+    from: logEntry.from,
+    to: name,
+    reason: logEntry.reason,
+    five_hour_util: from?.five_hour_utilization ?? 0,
+    seven_day_util: from?.seven_day_utilization ?? 0,
+  }, ...store.rotation_log].slice(0, ROTATION_LOG_MAX);
+  saveAccounts(ctxRoot, store);
 }
