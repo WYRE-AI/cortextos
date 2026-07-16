@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import { readCrons } from '../bus/crons.js';
 import { evaluateHang, evaluateBootstrapHang, mostRecentDeliveredFireMs } from './hang-detector.js';
+import { isLimitBlocked } from './rotation-manager.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
@@ -1379,6 +1380,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
     const fireVerdict = evaluateHang({ now, graceMs: 15 * 60_000, deliveredFireAt, lastSessionHeartbeat, lastIdleFlagAt });
     if (fireVerdict.hung) {
+      if (this.hangSuppressedByLimit()) return;
       this.log(`Hang detected for ${this.agent.name}: ${fireVerdict.reason}`);
       this.forceHangRestart(fireVerdict.reason);
       return;
@@ -1401,7 +1403,16 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     if (!bootVerdict.hung) return;
 
     this.log(`Bootstrap hang detected for ${this.agent.name}: ${bootVerdict.reason}`);
+    if (this.hangSuppressedByLimit()) return;
     this.forceHangRestart(bootVerdict.reason);
+  }
+
+  /** Rate-limit-blocked sessions look hung (no beats) but restarting burns a
+   *  fresh session into the same wall — the rotation manager owns recovery. */
+  private hangSuppressedByLimit(): boolean {
+    if (!isLimitBlocked(this.paths.ctxRoot, this.agent.name)) return false;
+    this.log(`${this.agent.name} limit-blocked — hang restart suppressed (rotation manager owns recovery)`);
+    return true;
   }
 
   /**
