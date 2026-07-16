@@ -36,6 +36,8 @@ export class AgentPTY {
   private config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
+  /** Optional secondary consumer of raw PTY output (limit-banner scanning). */
+  onOutputChunk: ((data: string) => void) | null = null;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
     this.env = env;
@@ -156,6 +158,7 @@ export class AgentPTY {
     // Set up output capture
     this.pty.onData((data: string) => {
       this.outputBuffer.push(data);
+      try { this.onOutputChunk?.(data); } catch { /* scanner must never kill the PTY */ }
     });
 
     // Set up exit handler
