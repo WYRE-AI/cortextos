@@ -183,6 +183,14 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 - `gog gmail search "query" --max 10 -a you@gmail.com`
 - `gog calendar ls -a you@gmail.com --max 5`
 
+### markitdown (Document Conversion — PDF/DOCX/XLSX/PPTX/HTML to Markdown)
+- Microsoft's `markitdown` CLI (Python, install via pipx: `pipx install "markitdown[all]"`) converts non-markdown documents into clean markdown before you read them
+- Formats: PDF, DOCX, XLSX, PPTX, HTML, images (OCR/captioning), audio (transcription), and more — `markitdown --help` for the full list
+- Usage: `markitdown <file> -o <file>.md` (or pipe: `cat file.pdf | markitdown`)
+- Cuts token usage substantially vs raw extraction, and is the only practical way to read .docx/.xlsx/.pptx content at all since those formats are not natively readable. Measured on a real Conduit SharePoint doc: 48.8KB raw XML extraction down to 17.5KB clean markdown (~64% smaller)
+- **Always convert non-.md files before reading them off the SharePoint mount** (`onedrive/` symlink) — see `plugins/cortextos-agent-skills/skills/sharepoint-docs/SKILL.md`
+- Installed on: Mac fleet host (pipx, confirmed working 2026-07-22). wyre-os-dev (wh-harness angela/tyler) rollout in progress
+
 ---
 
 ## Reminder
