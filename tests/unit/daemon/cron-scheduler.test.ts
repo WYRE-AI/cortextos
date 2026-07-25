@@ -728,6 +728,75 @@ describe('CronScheduler', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Never-fired cron survives agent restarts (created_at anchor).
+  //
+  // agent-manager.ts's stopAgent()/startAgent() (the path behind `bus
+  // self-restart` / `bus hard-restart`) tears down and recreates the
+  // CronScheduler entirely, so start()'s loadCrons(isReload=false) hits the
+  // "new or modified cron" branch for every cron that hasn't fired yet —
+  // including on every routine agent restart, not just a rare daemon
+  // restart. Before this fix, a never-fired cron had no fire-timestamp
+  // candidates and fell back to `referenceMs = now`, so each restart
+  // recomputed nextFireAt = restart-time + interval — a cron whose interval
+  // is longer than the typical gap between restarts could perpetually
+  // reset and never actually become due.
+  // -------------------------------------------------------------------------
+
+  it('does not perpetually reset nextFireAt when the scheduler is torn down and recreated before the first fire', async () => {
+    // Simulate two independent CronScheduler instances reading the SAME
+    // never-fired cron (created 1h ago, 3h interval) — standing in for two
+    // agent restarts, each of which builds a brand-new scheduler per
+    // agent-manager.ts's stopAgent()+startAgent().
+    const createdAt = new Date(Date.now() - 3_600_000).toISOString(); // 1h ago
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'long-interval', schedule: '3h', created_at: createdAt }),
+    ]);
+
+    const schedulerA = new CronScheduler({
+      agentName: 'test-agent',
+      onFire: (cron) => { fired.push(cron); },
+      logger: (msg) => { logs.push(msg); },
+    });
+    schedulerA.start();
+    const firstNextFire = schedulerA.getNextFireTimes().find(c => c.name === 'long-interval')?.nextFireAt;
+    schedulerA.stop();
+
+    // Advance the clock before the "restart" — long enough that the pre-fix
+    // bug (referenceMs falling back to `now`) would visibly shift the
+    // second scheduler's computed nextFireAt.
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+    const schedulerB = new CronScheduler({
+      agentName: 'test-agent',
+      onFire: (cron) => { fired.push(cron); },
+      logger: (msg) => { logs.push(msg); },
+    });
+    schedulerB.start();
+    const secondNextFire = schedulerB.getNextFireTimes().find(c => c.name === 'long-interval')?.nextFireAt;
+    schedulerB.stop();
+
+    expect(firstNextFire).toBeDefined();
+    // Anchored to created_at + interval — unaffected by the simulated restart.
+    expect(secondNextFire).toBe(firstNextFire);
+    expect(secondNextFire).toBe(new Date(createdAt).getTime() + 3 * 3_600_000);
+  });
+
+  it('still catches up and fires once a never-fired cron is actually overdue after a restart', async () => {
+    // created_at is 4h ago, schedule is "3h" — overdue by 1h despite having
+    // never fired. A fresh start() (simulating a restart) must catch-up
+    // fire immediately rather than pushing nextFireAt out to now+3h.
+    const createdAt = new Date(Date.now() - 4 * 3_600_000).toISOString();
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'overdue-unfired', schedule: '3h', created_at: createdAt }),
+    ]);
+
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(fired.some(c => c.name === 'overdue-unfired')).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
   // stop() — clears interval, no further fires
   // -------------------------------------------------------------------------
 

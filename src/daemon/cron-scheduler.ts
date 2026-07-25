@@ -388,13 +388,36 @@ export class CronScheduler {
       // crons.json.last_fire_attempted_at (set pre-onFire to detect crash
       // mid-fire — iter 11), and cron-state.json.last_fire (either may be
       // more current depending on which write path recorded the fire).
-      // Fall back to now.
+      //
+      // NEVER-FIRED FALLBACK: fall back to the cron's own created_at, NOT
+      // `now`. A never-fired cron has no fire-timestamp candidates, and this
+      // branch runs on every fresh in-memory load — including every agent
+      // restart (stopAgent()/startAgent() tears down and recreates the
+      // CronScheduler, so start()'s loadCrons(isReload=false) hits this
+      // exact path for every cron that hasn't fired yet). Falling back to
+      // `now` there means each restart recomputes nextFireAt = restart-time
+      // + interval, so a cron whose interval is longer than the typical gap
+      // between restarts (self-restart/hard-restart, the 71h auto-continue,
+      // hang-detector recovery) can perpetually reset and never actually
+      // become due. created_at is a fixed point on disk, so nextFireAt =
+      // created_at + interval stays the same across restarts, and the
+      // catch-up-if-overdue logic below still fires it once as soon as it's
+      // actually due. Only truly-new crons (added moments ago) hit this
+      // path with created_at ≈ now, so behavior for the normal case is
+      // unchanged. Falls back to `now` itself only if created_at is missing
+      // or unparseable (defensive — every write path sets it).
       const stateFire = stateLastFireByName.get(def.name);
       const candidates: number[] = [];
       if (def.last_fired_at) candidates.push(new Date(def.last_fired_at).getTime());
       if (def.last_fire_attempted_at) candidates.push(new Date(def.last_fire_attempted_at).getTime());
       if (stateFire) candidates.push(new Date(stateFire).getTime());
-      const referenceMs = candidates.length > 0 ? Math.max(...candidates) : now;
+      let referenceMs: number;
+      if (candidates.length > 0) {
+        referenceMs = Math.max(...candidates);
+      } else {
+        const createdMs = def.created_at ? new Date(def.created_at).getTime() : NaN;
+        referenceMs = isNaN(createdMs) ? now : createdMs;
+      }
 
       let nextFireAt = computeNextFireAt(def, referenceMs);
 
