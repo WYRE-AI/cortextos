@@ -41,6 +41,7 @@ interface Experiment {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  kind?: 'intervention' | 'snapshot';
 }
 
 interface Cycle {
@@ -71,7 +72,7 @@ interface AgentExperiments {
     completed: number;
     kept: number;
     discarded: number;
-    keepRate: number;
+    keepRate: number | null;
   };
 }
 
@@ -85,7 +86,7 @@ interface ApiResponse {
     completed: number;
     kept: number;
     discarded: number;
-    keepRate: number;
+    keepRate: number | null;
   };
 }
 
@@ -229,9 +230,11 @@ export default function ExperimentsPage() {
           <Card>
             <CardContent className="pt-4 pb-3">
               <p className="text-xs text-muted-foreground uppercase tracking-wide">Keep Rate</p>
-              <p className="text-2xl font-semibold mt-1">
-                {summary.keepRate > 0 ? `${summary.keepRate}%` : '-'}
-              </p>
+              {summary.keepRate == null ? (
+                <p className="text-sm text-muted-foreground mt-2">No interventions scored yet</p>
+              ) : (
+                <p className="text-2xl font-semibold mt-1">{summary.keepRate}%</p>
+              )}
             </CardContent>
           </Card>
           <Card>
@@ -310,10 +313,14 @@ export default function ExperimentsPage() {
                         <div className="flex items-center gap-4">
                           <div className="text-right text-xs text-muted-foreground">
                             <span>{agentData.stats.total} experiments</span>
-                            {agentData.stats.total > 0 && (
+                            {agentData.stats.keepRate != null ? (
                               <span className="ml-2">
                                 {agentData.stats.keepRate}% kept
                               </span>
+                            ) : (
+                              agentData.stats.total > 0 && (
+                                <span className="ml-2">no interventions scored yet</span>
+                              )
                             )}
                           </div>
                           {isExpanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
@@ -331,7 +338,7 @@ export default function ExperimentsPage() {
                             <span>{agentData.stats.kept} kept</span>
                             <span>{agentData.stats.discarded} discarded</span>
                           </div>
-                          <Progress value={agentData.stats.keepRate} className="h-2" />
+                          <Progress value={agentData.stats.keepRate ?? 0} className="h-2" />
                         </div>
                       )}
 

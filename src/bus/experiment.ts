@@ -25,6 +25,7 @@ export interface Experiment {
   started_at: string | null;
   completed_at: string | null;
   changes_description: string | null;
+  kind: 'intervention' | 'snapshot';
 }
 
 export interface ExperimentCreateOptions {
@@ -33,6 +34,7 @@ export interface ExperimentCreateOptions {
   window?: string;
   measurement?: string;
   approval_required?: boolean;
+  kind?: 'intervention' | 'snapshot';
 }
 
 export interface ExperimentEvaluateOptions {
@@ -181,6 +183,7 @@ export function createExperiment(
     started_at: null,
     completed_at: null,
     changes_description: null,
+    kind: options?.kind ?? 'intervention',
   };
 
   saveExperiment(agentDir, experiment);
