@@ -50,21 +50,6 @@ function isQuietHoursLA(now: Date): boolean {
 }
 
 /**
- * Read max_crashes_per_day from the agent's config.json. Returns null if the
- * file is missing, malformed, or the field is not a number — caller treats
- * null as "no limit configured" so a missing config never blocks the alert.
- */
-export function readMaxCrashesPerDay(agentDir: string | undefined): number | null {
-  if (!agentDir) return null;
-  try {
-    const cfg = JSON.parse(readFileSync(join(agentDir, 'config.json'), 'utf-8')) as Record<string, unknown>;
-    return typeof cfg.max_crashes_per_day === 'number' ? cfg.max_crashes_per_day : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Send a crash notification via `cortextos bus send-message` to the listed
  * recipient agents. Best-effort: failures are swallowed so an alert miss never
  * cascades into a hook crash.
@@ -75,15 +60,23 @@ export function notifyAgents(opts: {
   reason: string;
   lastTask: string;
   crashCount: number;
-  restartAttempted: boolean;
   recipients: string[];
 }): void {
+  // NOTE: `crashCount` here is this HOOK's own counter (state/<agent>/
+  // .crash_count_today), which is DISTINCT from the real halt-gate's counter
+  // (agent-process.ts's in-memory crashCount, persisted to logs/<agent>/
+  // .crash_count_today) that actually decides whether a restart happens.
+  // This function must never assert whether a restart was attempted or
+  // blocked — it has no visibility into that decision. An earlier version
+  // computed a `restartAttempted` claim from this cosmetic counter compared
+  // against max_crashes_per_day, which produced a false "restart attempted:
+  // no (max_crashes_per_day reached)" line during a hook-firing burst that
+  // never came close to tripping the real gate (task_1785077810721 S1).
   const body = [
     `agent=${opts.agentName} crashed (type=${opts.endType})`,
     `reason: ${opts.reason || 'none'}`,
     `last status: ${opts.lastTask || 'unknown'}`,
-    `crashes today: ${opts.crashCount}`,
-    `restart attempted: ${opts.restartAttempted ? 'yes' : 'no (max_crashes_per_day reached)'}`,
+    `crashes today (hook-observed, not the restart-gate count): ${opts.crashCount}`,
   ].join('\n');
   // PATH-unaware execFile is unreliable on Windows: the daemon spawned by
   // PM2 doesn't inherit the npm-link target, so 'cortextos' fails ENOENT and
@@ -342,16 +335,12 @@ async function main(): Promise<void> {
   // Telegram-credential gate so agents without BOT_TOKEN/CHAT_ID still reach
   // the bus (issue #317).
   if (endType === 'crash' || endType === 'daemon-crashed') {
-    const agentDir = process.env.CTX_AGENT_DIR || process.cwd();
-    const maxCrashes = readMaxCrashesPerDay(agentDir);
-    const restartAttempted = maxCrashes === null || crashCount < maxCrashes;
     notifyAgents({
       agentName,
       endType,
       reason,
       lastTask,
       crashCount,
-      restartAttempted,
       recipients: ['chief', 'analyst'],
     });
   }

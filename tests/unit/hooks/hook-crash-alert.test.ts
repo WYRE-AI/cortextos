@@ -8,52 +8,30 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { readMaxCrashesPerDay, notifyAgents, classifyFromMarkers } from '../../../src/hooks/hook-crash-alert';
+import { notifyAgents, classifyFromMarkers } from '../../../src/hooks/hook-crash-alert';
 import { clearEndMarkers } from '../../../src/bus/heartbeat';
 
-describe('readMaxCrashesPerDay', () => {
-  let tmp: string;
+describe('notifyAgents', () => {
+  // notifyAgents branches on process.env.CTX_FRAMEWORK_ROOT (execPath+cliPath
+  // vs a bare 'cortextos' PATH lookup — see the function's own comment), which
+  // shifts where `body` lands in the execFile args array. Pin it unset here
+  // so these tests are deterministic regardless of the shell they run in —
+  // running from a live agent's own shell (which DOES have CTX_FRAMEWORK_ROOT
+  // set) previously made these tests silently environment-dependent.
+  let originalFrameworkRoot: string | undefined;
 
   beforeEach(() => {
-    tmp = mkdtempSync(join(tmpdir(), 'crashalert-'));
+    execFileMock.mockReset();
+    originalFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    delete process.env.CTX_FRAMEWORK_ROOT;
   });
 
   afterEach(() => {
-    rmSync(tmp, { recursive: true, force: true });
-  });
-
-  it('returns null when agentDir is undefined', () => {
-    expect(readMaxCrashesPerDay(undefined)).toBeNull();
-  });
-
-  it('returns null when config.json is missing', () => {
-    expect(readMaxCrashesPerDay(tmp)).toBeNull();
-  });
-
-  it('returns null when config.json is malformed', () => {
-    writeFileSync(join(tmp, 'config.json'), '{ not valid json', 'utf-8');
-    expect(readMaxCrashesPerDay(tmp)).toBeNull();
-  });
-
-  it('returns null when max_crashes_per_day is missing', () => {
-    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ agent_name: 'x' }), 'utf-8');
-    expect(readMaxCrashesPerDay(tmp)).toBeNull();
-  });
-
-  it('returns the configured number when present', () => {
-    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ max_crashes_per_day: 10 }), 'utf-8');
-    expect(readMaxCrashesPerDay(tmp)).toBe(10);
-  });
-
-  it('returns null when max_crashes_per_day is not a number', () => {
-    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ max_crashes_per_day: 'ten' }), 'utf-8');
-    expect(readMaxCrashesPerDay(tmp)).toBeNull();
-  });
-});
-
-describe('notifyAgents', () => {
-  beforeEach(() => {
-    execFileMock.mockReset();
+    if (originalFrameworkRoot === undefined) {
+      delete process.env.CTX_FRAMEWORK_ROOT;
+    } else {
+      process.env.CTX_FRAMEWORK_ROOT = originalFrameworkRoot;
+    }
   });
 
   it('sends one bus send-message per recipient', () => {
@@ -63,7 +41,6 @@ describe('notifyAgents', () => {
       reason: 'uncaught exception',
       lastTask: 'building hooks',
       crashCount: 2,
-      restartAttempted: true,
       recipients: ['chief', 'analyst'],
     });
     expect(execFileMock).toHaveBeenCalledTimes(2);
@@ -76,7 +53,6 @@ describe('notifyAgents', () => {
       reason: 'r',
       lastTask: 't',
       crashCount: 1,
-      restartAttempted: true,
       recipients: ['chief'],
     });
     const [cmd, args] = execFileMock.mock.calls[0];
@@ -84,14 +60,17 @@ describe('notifyAgents', () => {
     expect(args.slice(0, 4)).toEqual(['bus', 'send-message', 'chief', 'high']);
   });
 
-  it('body includes all required fields', () => {
+  it('body includes all required fields, and does NOT assert a restart-attempted claim', () => {
+    // task_1785077810721 (S1): this hook has zero visibility into the real
+    // halt-gate decision (agent-process.ts) — it must never claim whether a
+    // restart was attempted or blocked. Body should surface the hook's own
+    // counter honestly labeled, not as an authoritative restart-gate signal.
     notifyAgents({
       agentName: 'dev',
       endType: 'daemon-crashed',
       reason: 'PTY null write',
       lastTask: 'idle',
       crashCount: 3,
-      restartAttempted: false,
       recipients: ['analyst'],
     });
     const body: string = execFileMock.mock.calls[0][1][4];
@@ -99,21 +78,9 @@ describe('notifyAgents', () => {
     expect(body).toContain('type=daemon-crashed');
     expect(body).toContain('reason: PTY null write');
     expect(body).toContain('last status: idle');
-    expect(body).toContain('crashes today: 3');
-    expect(body).toContain('restart attempted: no');
-  });
-
-  it('marks restart attempted yes when crashCount under limit', () => {
-    notifyAgents({
-      agentName: 'dev',
-      endType: 'crash',
-      reason: '',
-      lastTask: '',
-      crashCount: 1,
-      restartAttempted: true,
-      recipients: ['chief'],
-    });
-    expect(execFileMock.mock.calls[0][1][4]).toContain('restart attempted: yes');
+    expect(body).toContain('crashes today (hook-observed, not the restart-gate count): 3');
+    expect(body).not.toContain('restart attempted');
+    expect(body).not.toContain('max_crashes_per_day');
   });
 
   it('uses fallback strings when reason and lastTask are empty', () => {
@@ -123,7 +90,6 @@ describe('notifyAgents', () => {
       reason: '',
       lastTask: '',
       crashCount: 1,
-      restartAttempted: true,
       recipients: ['chief'],
     });
     const body: string = execFileMock.mock.calls[0][1][4];
@@ -139,7 +105,6 @@ describe('notifyAgents', () => {
       reason: '',
       lastTask: '',
       crashCount: 1,
-      restartAttempted: true,
       recipients: ['chief', 'analyst'],
     })).not.toThrow();
     // Second recipient still attempted
