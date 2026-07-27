@@ -131,10 +131,14 @@ describe('detectRateLimitWithRetry', () => {
   });
 
   it('returns true immediately, no retry needed, when the signature is already present', async () => {
+    // Spy on setTimeout (rather than asserting a wall-clock elapsed-time
+    // ceiling — flaky under CI load per Codex review) to prove the retry
+    // interval was never entered: the first read hit, zero sleeps scheduled.
+    const timeoutSpy = vi.spyOn(global, 'setTimeout');
     writeFileSync(stdoutPath, 'some output\nrate limit exceeded\n', 'utf-8');
-    const start = Date.now();
     expect(await detectRateLimitWithRetry(stdoutPath, 3, 50)).toBe(true);
-    expect(Date.now() - start).toBeLessThan(50); // first read hit — no interval waited
+    expect(timeoutSpy).not.toHaveBeenCalled();
+    timeoutSpy.mockRestore();
   });
 
   it('catches a LATE-appearing banner — absent on the first read, written before a later retry', async () => {
@@ -159,13 +163,15 @@ describe('detectRateLimitWithRetry', () => {
   });
 
   it('gives up after the bounded attempt count — does not retry indefinitely', async () => {
+    // Spy on setTimeout instead of a wall-clock ceiling (flaky under CI
+    // load per Codex review) — proves the EXACT bound deterministically:
+    // 3 attempts means exactly 2 intervals waited, then it gives up.
+    const timeoutSpy = vi.spyOn(global, 'setTimeout');
     writeFileSync(stdoutPath, 'no signature here, ever\n', 'utf-8');
-    const start = Date.now();
     const result = await detectRateLimitWithRetry(stdoutPath, 3, 20);
     expect(result).toBe(false);
-    // 3 attempts = 2 intervals of 20ms = ~40ms ceiling; generous margin for
-    // test-runner jitter, still proves it isn't hanging around indefinitely.
-    expect(Date.now() - start).toBeLessThan(300);
+    expect(timeoutSpy).toHaveBeenCalledTimes(2);
+    timeoutSpy.mockRestore();
   });
 });
 
