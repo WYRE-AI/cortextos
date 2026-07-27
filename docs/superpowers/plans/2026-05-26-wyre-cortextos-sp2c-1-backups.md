@@ -11,7 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-05-24-wyre-cortextos-sp2c-tunnel-backups-design.md`
 
 **Conventions:**
-- Working dir `/Users/asachs/cortextos`, branch `feat/sp2c-tunnel-backups` (already checked out).
+- Working dir `~/cortextos`, branch `feat/sp2c-tunnel-backups` (already checked out).
 - After each Terraform task: `terraform fmt -recursive infra/terraform && terraform validate` from `infra/terraform/`.
 - Commit per task with `git -c user.name="Aaron Sachs" -c user.email="aaron@wyretechnology.com" commit`.
 - This sub-project needs NO Cloudflare token — it is fully applicable now.

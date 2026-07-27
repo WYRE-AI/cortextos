@@ -11,7 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-05-29-wyre-cortextos-sp2c-4-admin-bootstrap.md`
 
 **Conventions:**
-- Working dir `/Users/asachs/cortextos`, branch `feat/sp2c-4-admin-bootstrap` (already checked out).
+- Working dir `~/cortextos`, branch `feat/sp2c-4-admin-bootstrap` (already checked out).
 - After each Terraform task: `terraform fmt -recursive infra/terraform && terraform validate` from `infra/terraform/`.
 - After each cloud-init edit: run the YAML validation snippet documented in SP2b's plan/runbook.
 - Drift checker should still pass for the systemd units (we're not touching them).

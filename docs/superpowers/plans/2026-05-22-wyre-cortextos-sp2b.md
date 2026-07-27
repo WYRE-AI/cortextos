@@ -11,7 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-05-22-wyre-cortextos-sp2b-cloud-init-systemd-design.md`
 
 **Conventions for every task below:**
-- Working dir: `/Users/asachs/cortextos`. Branch: `feat/sp2b-cloud-init` (already checked out).
+- Working dir: `~/cortextos`. Branch: `feat/sp2b-cloud-init` (already checked out).
 - Commit with `git -c user.name="Aaron Sachs" -c user.email="aaron@wyretechnology.com" commit -m "..."`. Conventional Commits.
 - After every Terraform task: `terraform fmt -recursive infra/terraform && terraform validate` (from `infra/terraform/`).
 - After every shell/systemd task: `shellcheck` the script if shellcheck is installed; `systemd-analyze verify infra/systemd/*.service` if installed. If neither tool is installed, skip — these are quality nets, not gates.

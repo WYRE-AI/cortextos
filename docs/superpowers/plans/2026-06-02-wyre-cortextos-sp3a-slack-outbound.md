@@ -11,7 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-06-02-wyre-cortextos-sp3-slack-design.md`
 
 **Conventions:**
-- Working dir `/Users/asachs/cortextos`. Branch `feat/sp3a-slack-outbound` (created in Task 1).
+- Working dir `~/cortextos`. Branch `feat/sp3a-slack-outbound` (created in Task 1).
 - All TS tests run via `npm test` (Vitest, `tests/unit/...` for unit tests).
 - After every code task: `npm run typecheck && npm run build && npm test` (full suite must stay at the same pass/skip baseline).
 - Commit per task with `git -c user.name="Aaron Sachs" -c user.email="aaron@wyretechnology.com"`.
