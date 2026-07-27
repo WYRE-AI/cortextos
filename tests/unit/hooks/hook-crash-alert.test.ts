@@ -8,7 +8,7 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { notifyAgents, classifyFromMarkers } from '../../../src/hooks/hook-crash-alert';
+import { notifyAgents, classifyFromMarkers, detectRateLimitWithRetry } from '../../../src/hooks/hook-crash-alert';
 import { clearEndMarkers } from '../../../src/bus/heartbeat';
 
 describe('notifyAgents', () => {
@@ -109,6 +109,63 @@ describe('notifyAgents', () => {
     })).not.toThrow();
     // Second recipient still attempted
     expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('detectRateLimitWithRetry', () => {
+  // task_1785077810721 (S1, part b, defect 1): detectRateLimitInLog reads
+  // ONLY the current tail of stdout.log — a process that dies immediately
+  // after hitting a rate limit can exit before the banner is flushed to
+  // disk. These tests prove the RETRY actually catches that race, not just
+  // that the final state happens to match.
+  let tmp: string;
+  let stdoutPath: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'crashalert-ratelimit-'));
+    stdoutPath = join(tmp, 'stdout.log');
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('returns true immediately, no retry needed, when the signature is already present', async () => {
+    writeFileSync(stdoutPath, 'some output\nrate limit exceeded\n', 'utf-8');
+    const start = Date.now();
+    expect(await detectRateLimitWithRetry(stdoutPath, 3, 50)).toBe(true);
+    expect(Date.now() - start).toBeLessThan(50); // first read hit — no interval waited
+  });
+
+  it('catches a LATE-appearing banner — absent on the first read, written before a later retry', async () => {
+    // Simulates the exact repro from crashes.log (task_1785077810721): the
+    // process died before flushing the rate-limit banner, so the file has
+    // no signature at hook-fire time. The banner lands moments later.
+    writeFileSync(stdoutPath, 'starting up...\n', 'utf-8');
+    const resultPromise = detectRateLimitWithRetry(stdoutPath, 3, 30);
+    // Write the banner between the 1st and 2nd read, before the retry loop
+    // gives up — proves a RETRY caught it, not the initial read.
+    await new Promise((resolve) => setTimeout(resolve, 12));
+    writeFileSync(stdoutPath, 'starting up...\nAPI Error: rate_limit_error: usage limit reached\n', 'utf-8');
+    expect(await resultPromise).toBe(true);
+  });
+
+  it('returns false (real crash, not rate-limited) when the signature never appears — no false positive', async () => {
+    // Guards the false-positive direction boss flagged: a genuine crash
+    // must still classify as crash, not get swept into rate-limited by an
+    // overly generous retry.
+    writeFileSync(stdoutPath, 'Uncaught TypeError: x is not a function\n', 'utf-8');
+    expect(await detectRateLimitWithRetry(stdoutPath, 3, 15)).toBe(false);
+  });
+
+  it('gives up after the bounded attempt count — does not retry indefinitely', async () => {
+    writeFileSync(stdoutPath, 'no signature here, ever\n', 'utf-8');
+    const start = Date.now();
+    const result = await detectRateLimitWithRetry(stdoutPath, 3, 20);
+    expect(result).toBe(false);
+    // 3 attempts = 2 intervals of 20ms = ~40ms ceiling; generous margin for
+    // test-runner jitter, still proves it isn't hanging around indefinitely.
+    expect(Date.now() - start).toBeLessThan(300);
   });
 });
 
