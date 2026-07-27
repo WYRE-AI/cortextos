@@ -155,9 +155,26 @@ export class FastChecker {
       // session but MUST NOT advance last_session_heartbeat — otherwise the hang
       // detector could never tell a frozen session (only the watchdog beating) from a
       // live one. The heartbeat writer carries the prior last_session_heartbeat forward.
-      execFile('cortextos', ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`, '--source', 'watchdog'], (err) => {
-        if (err) this.log(`Heartbeat watchdog error: ${err.message}`);
-      });
+      //
+      // Explicit env override — REQUIRED, not cosmetic: this daemon process is a
+      // single PM2-managed process shared by every agent (one FastChecker instance
+      // per agent, all children of the same daemon PID). Without an explicit `env`,
+      // execFile's spawned `cortextos` subprocess inherits the DAEMON's own
+      // process.env wholesale — and resolveEnv() (src/utils/env.ts) resolves the
+      // heartbeat write's TARGET agent from process.env.CTX_AGENT_NAME, which takes
+      // priority over any cwd-basename fallback. If the daemon's own PM2 env has a
+      // stale/baked CTX_AGENT_NAME (it has, historically — see task_1785174835840),
+      // EVERY agent's watchdog write silently stamps the WRONG agent's
+      // heartbeat.json. Passing agentName explicitly here makes the target
+      // deterministic regardless of what the daemon's own env happens to carry.
+      execFile(
+        'cortextos',
+        ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`, '--source', 'watchdog'],
+        { env: { ...process.env, CTX_AGENT_NAME: agentName } },
+        (err) => {
+          if (err) this.log(`Heartbeat watchdog error: ${err.message}`);
+        },
+      );
     }, HEARTBEAT_INTERVAL_MS);
 
     while (this.running) {

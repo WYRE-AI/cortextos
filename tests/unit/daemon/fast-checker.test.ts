@@ -802,6 +802,38 @@ describe('FastChecker', () => {
       expect(execFile).toHaveBeenCalledWith(
         'cortextos',
         expect.arrayContaining(['bus', 'update-heartbeat', expect.stringContaining('[watchdog] my-agent alive — idle session')]),
+        expect.objectContaining({ env: expect.any(Object) }),
+        expect.any(Function),
+      );
+      checker.stop();
+      checker.wake();
+    });
+
+    // task_1785174835840: the daemon is a SINGLE PM2 process shared by every
+    // agent (one FastChecker per agent, all children of the same daemon PID).
+    // Without an explicit env, execFile's spawned `cortextos` subprocess
+    // inherits the DAEMON's own process.env wholesale — and resolveEnv()
+    // resolves the write's target agent from process.env.CTX_AGENT_NAME,
+    // which wins over any cwd-basename fallback. Confirmed live: the daemon's
+    // own PM2 env carries a stale/baked CTX_AGENT_NAME (observed: "boss"),
+    // so every agent's watchdog write was silently stamping the WRONG
+    // agent's heartbeat.json. Pins that the spawned subprocess's env
+    // explicitly carries the WATCHED agent's name (not left to whatever the
+    // daemon's own ambient env happens to be) — deliberately not mutating
+    // the real process.env in this test to simulate the contamination, since
+    // that global is shared with the live daemon/agent processes on this
+    // machine; the explicit-override property holds regardless of ambient
+    // state.
+    it('passes the WATCHED agent name via explicit env (task_1785174835840)', async () => {
+      const { execFile } = await import('child_process');
+      const agent = createMockAgent('my-agent');
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      checker.start();
+      await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
+      expect(execFile).toHaveBeenCalledWith(
+        'cortextos',
+        expect.arrayContaining(['bus', 'update-heartbeat', expect.stringContaining('[watchdog] my-agent alive — idle session')]),
+        expect.objectContaining({ env: expect.objectContaining({ CTX_AGENT_NAME: 'my-agent' }) }),
         expect.any(Function),
       );
       checker.stop();
@@ -833,6 +865,7 @@ describe('FastChecker', () => {
       expect(execFile).not.toHaveBeenCalledWith(
         'cortextos',
         expect.arrayContaining([expect.stringContaining('[watchdog]')]),
+        expect.objectContaining({ env: expect.any(Object) }),
         expect.any(Function),
       );
       checker.stop();
