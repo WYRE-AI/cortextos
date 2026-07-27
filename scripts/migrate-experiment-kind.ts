@@ -1,21 +1,29 @@
 /**
  * scripts/migrate-experiment-kind.ts
  *
- * One-shot migration that backfills the `kind` field onto pre-existing
- * `system_effectiveness` experiment records in every agent's
- * experiments/history/*.json. Those records were logged as recurring
- * qualitative health-scores through the create-experiment/evaluate-experiment
- * machinery, which implies a discrete tested intervention — they aren't one.
+ * One-shot migration that backfills `kind: "snapshot"` onto analyst's
+ * pre-existing `system_effectiveness` experiment records. Those records were
+ * logged as recurring qualitative health-scores through the
+ * create-experiment/evaluate-experiment machinery, which implies a discrete
+ * tested intervention — they aren't one.
  * See deliverables/2026-07-27-experiment-scoring-honesty-proposal.md.
+ *
+ * Scope is deliberately narrow, per spec: only wyre/analyst's own
+ * system_effectiveness records are known to be misclassified today. Every
+ * other record — a same-named agent in a different org, a different agent,
+ * or any other metric of analyst's — is left untouched; its `kind` stays
+ * implicitly `intervention` via the code-side default (createExperiment()'s
+ * default, the dashboard's `?? 'intervention'` fallback), not written
+ * explicitly here. If this same recurring-health-score pattern turns up for
+ * another agent later, that's a separate, reviewed decision — not something
+ * this migration should silently extend to.
  *
  * Behavior:
  *   - Walk orgs/<org>/agents/<agent>/experiments/history/*.json
  *   - If `kind` is already set → leave the file alone (idempotent)
- *   - If `metric` is `system_effectiveness` and `kind` is missing → set
- *     `kind: "snapshot"`
- *   - Any other record missing `kind` → set `kind: "intervention"` (matches
- *     the backward-compat default used by createExperiment()/the CLI flag,
- *     so the migration is safe to run before or after the code deploys)
+ *   - If org is `wyre`, agent is `analyst`, `metric` is `system_effectiveness`,
+ *     and `kind` is missing → set `kind: "snapshot"`
+ *   - Everything else missing `kind` → left alone, not applicable
  *   - Never touches results.tsv — that's an append-only historical log.
  *
  * Usage:
@@ -26,13 +34,18 @@
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs';
 import { join } from 'path';
 
+// Scoped to the exact agent instance the finding was grounded against — a
+// same-named "analyst" in another org is a different agent, not covered by
+// this backfill.
+const SNAPSHOT_ORG = 'wyre';
+const SNAPSHOT_AGENT = 'analyst';
 const SNAPSHOT_METRIC = 'system_effectiveness';
 
 interface MigrationResult {
   path: string;
   org: string;
   agent: string;
-  action: 'skip-already-set' | 'skip-not-json' | 'add-snapshot' | 'add-intervention';
+  action: 'skip-already-set' | 'skip-not-json' | 'skip-not-applicable' | 'add-snapshot';
   before?: string | undefined;
   after?: string;
 }
@@ -89,20 +102,23 @@ export function migrateRecord(path: string, root: string): MigrationResult {
     return { path, org, agent, action: 'skip-already-set', before: String(record.kind) };
   }
 
-  const kind = record.metric === SNAPSHOT_METRIC ? 'snapshot' : 'intervention';
-  const next = { ...record, kind };
+  if (org !== SNAPSHOT_ORG || agent !== SNAPSHOT_AGENT || record.metric !== SNAPSHOT_METRIC) {
+    return { path, org, agent, action: 'skip-not-applicable' };
+  }
+
+  const next = { ...record, kind: 'snapshot' };
   return {
     path,
     org,
     agent,
-    action: kind === 'snapshot' ? 'add-snapshot' : 'add-intervention',
+    action: 'add-snapshot',
     after: JSON.stringify(next, null, 2) + '\n',
   };
 }
 
 export function runMigration(opts: MigrationOptions): {
   results: MigrationResult[];
-  summary: { total: number; addedSnapshot: number; addedIntervention: number; alreadySet: number; skipped: number };
+  summary: { total: number; addedSnapshot: number; alreadySet: number; notApplicable: number; skipped: number };
 } {
   const files = findExperimentHistoryFiles(opts.root);
   const results: MigrationResult[] = [];
@@ -111,7 +127,7 @@ export function runMigration(opts: MigrationOptions): {
     const result = migrateRecord(path, opts.root);
     results.push(result);
 
-    if ((result.action === 'add-snapshot' || result.action === 'add-intervention') && !opts.dryRun && result.after) {
+    if (result.action === 'add-snapshot' && !opts.dryRun && result.after) {
       writeFileSync(path, result.after, 'utf-8');
     }
   }
@@ -119,8 +135,8 @@ export function runMigration(opts: MigrationOptions): {
   const summary = {
     total: results.length,
     addedSnapshot: results.filter(r => r.action === 'add-snapshot').length,
-    addedIntervention: results.filter(r => r.action === 'add-intervention').length,
     alreadySet: results.filter(r => r.action === 'skip-already-set').length,
+    notApplicable: results.filter(r => r.action === 'skip-not-applicable').length,
     skipped: results.filter(r => r.action === 'skip-not-json').length,
   };
 
@@ -136,10 +152,10 @@ function formatResults(results: MigrationResult[], dryRun: boolean): string {
     const prefix = `[${r.org}/${r.agent}]`;
     if (r.action === 'add-snapshot') {
       lines.push(`${prefix} ADD kind="snapshot"  ${r.path}`);
-    } else if (r.action === 'add-intervention') {
-      lines.push(`${prefix} ADD kind="intervention"  ${r.path}`);
     } else if (r.action === 'skip-already-set') {
       lines.push(`${prefix} SKIP (already set: kind="${r.before}")  ${r.path}`);
+    } else if (r.action === 'skip-not-applicable') {
+      lines.push(`${prefix} SKIP (not analyst/system_effectiveness)  ${r.path}`);
     } else {
       lines.push(`${prefix} SKIP (not parseable JSON)  ${r.path}`);
     }
@@ -167,12 +183,12 @@ if (isMain) {
   console.log(formatResults(results, dryRun));
   console.log('');
   console.log(`Total records scanned: ${summary.total}`);
-  console.log(`Will add kind=snapshot:     ${summary.addedSnapshot}`);
-  console.log(`Will add kind=intervention: ${summary.addedIntervention}`);
-  console.log(`Already set:                ${summary.alreadySet}`);
-  console.log(`Skipped (parse err):        ${summary.skipped}`);
+  console.log(`Will add kind=snapshot: ${summary.addedSnapshot}`);
+  console.log(`Already set:            ${summary.alreadySet}`);
+  console.log(`Not applicable:         ${summary.notApplicable}`);
+  console.log(`Skipped (parse err):    ${summary.skipped}`);
 
-  if (dryRun && (summary.addedSnapshot > 0 || summary.addedIntervention > 0)) {
+  if (dryRun && summary.addedSnapshot > 0) {
     console.log('');
     console.log('Re-run without --dry-run to apply.');
   }
