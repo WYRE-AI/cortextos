@@ -28,6 +28,7 @@ interface Experiment {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  kind?: 'intervention' | 'snapshot';
 }
 
 interface Cycle {
@@ -58,7 +59,7 @@ interface AgentExperiments {
     completed: number;
     kept: number;
     discarded: number;
-    keepRate: number;
+    keepRate: number | null;
   };
 }
 
@@ -73,7 +74,15 @@ function getFrameworkRoot(): string {
   );
 }
 
-function scanExperiments(): AgentExperiments[] {
+// Missing `kind` predates this field — treat it as `intervention` (backward
+// compat, matches createExperiment()'s default). Only explicit
+// kind: 'snapshot' records (recurring qualitative self-scores) are excluded
+// from keep-rate math; they were never a tested before/after comparison.
+function isIntervention(e: Experiment): boolean {
+  return e.kind !== 'snapshot';
+}
+
+function scanExperiments(filterKind?: 'intervention' | 'snapshot'): AgentExperiments[] {
   const frameworkRoot = getFrameworkRoot();
   const orgsDir = path.join(frameworkRoot, 'orgs');
   if (!fs.existsSync(orgsDir)) return [];
@@ -101,7 +110,7 @@ function scanExperiments(): AgentExperiments[] {
       }
 
       // Read experiments from history/
-      const experiments: Experiment[] = [];
+      let experiments: Experiment[] = [];
       const histDir = path.join(expDir, 'history');
       if (fs.existsSync(histDir)) {
         for (const f of fs.readdirSync(histDir)) {
@@ -113,6 +122,12 @@ function scanExperiments(): AgentExperiments[] {
             experiments.push(exp);
           } catch { /* skip bad files */ }
         }
+      }
+
+      if (filterKind) {
+        experiments = experiments.filter(
+          (e) => (e.kind ?? 'intervention') === filterKind,
+        );
       }
 
       // Sort by created_at descending
@@ -137,12 +152,11 @@ function scanExperiments(): AgentExperiments[] {
       const completed = experiments.filter(
         (e) => e.status === 'completed',
       ).length;
-      const kept = experiments.filter((e) => e.decision === 'keep').length;
-      const discarded = experiments.filter(
-        (e) => e.decision === 'discard',
-      ).length;
+      const scored = experiments.filter(isIntervention);
+      const kept = scored.filter((e) => e.decision === 'keep').length;
+      const discarded = scored.filter((e) => e.decision === 'discard').length;
       const decided = kept + discarded;
-      const keepRate = decided > 0 ? Math.round((kept / decided) * 100) : 0;
+      const keepRate = decided > 0 ? Math.round((kept / decided) * 100) : null;
 
       // Only include agents that have cycles or experiments
       if (cycles.length > 0 || experiments.length > 0) {
@@ -169,9 +183,14 @@ export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const filterAgent = searchParams.get('agent');
   const filterOrg = searchParams.get('org');
+  const kindParam = searchParams.get('kind');
+  const filterKind =
+    kindParam === 'intervention' || kindParam === 'snapshot'
+      ? kindParam
+      : undefined;
 
   try {
-    let data = scanExperiments();
+    let data = scanExperiments(filterKind);
 
     if (filterOrg) {
       data = data.filter((d) => d.org === filterOrg);
@@ -183,10 +202,11 @@ export async function GET(request: NextRequest) {
     // Aggregate stats across all agents
     const allExperiments = data.flatMap((d) => d.experiments);
     const allCycles = data.flatMap((d) => d.cycles);
-    const totalKept = allExperiments.filter(
+    const scoredExperiments = allExperiments.filter(isIntervention);
+    const totalKept = scoredExperiments.filter(
       (e) => e.decision === 'keep',
     ).length;
-    const totalDiscarded = allExperiments.filter(
+    const totalDiscarded = scoredExperiments.filter(
       (e) => e.decision === 'discard',
     ).length;
     const totalDecided = totalKept + totalDiscarded;
@@ -203,7 +223,7 @@ export async function GET(request: NextRequest) {
         kept: totalKept,
         discarded: totalDiscarded,
         keepRate:
-          totalDecided > 0 ? Math.round((totalKept / totalDecided) * 100) : 0,
+          totalDecided > 0 ? Math.round((totalKept / totalDecided) * 100) : null,
       },
     });
   } catch (err) {

@@ -720,13 +720,15 @@ busCommand
   .option('--surface <path>', 'Surface file path')
   .option('--direction <dir>', 'Direction: higher or lower', 'higher')
   .option('--window <dur>', 'Measurement window', '24h')
-  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string }) => {
+  .option('--kind <kind>', 'intervention or snapshot', 'intervention')
+  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string }) => {
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     const id = createExperiment(agentDir, env.agentName, metric, hypothesis, {
       surface: opts.surface,
       direction: opts.direction as 'higher' | 'lower',
       window: opts.window,
+      kind: opts.kind as 'intervention' | 'snapshot',
     });
     console.log(id);
 

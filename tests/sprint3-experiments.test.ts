@@ -169,6 +169,18 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(exp.direction).toBe('higher'); // static default
       expect(exp.window).toBe('24h'); // static default
     });
+
+    it('defaults kind to intervention when not specified', () => {
+      const id = createExperiment(testDir, 'testbot', 'engagement_rate', 'test');
+      const exp = JSON.parse(readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim());
+      expect(exp.kind).toBe('intervention');
+    });
+
+    it('accepts kind: snapshot for recurring qualitative scores', () => {
+      const id = createExperiment(testDir, 'testbot', 'system_effectiveness', 'test', { kind: 'snapshot' });
+      const exp = JSON.parse(readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim());
+      expect(exp.kind).toBe('snapshot');
+    });
   });
 
   describe('runExperiment', () => {
