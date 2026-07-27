@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Capture the PTY exit handler so tests can simulate exits at controlled times
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
@@ -293,6 +293,91 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     // the PTY dies must already see the marker, or it classifies a false crash.
     const markerWriteOrder = fsMocks.writeFileSync.mock.invocationCallOrder[writeIdx];
     expect(markerWriteOrder).toBeLessThan(stopSpy.mock.invocationCallOrder[0]);
+  });
+});
+
+describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919)', () => {
+  // tailStdoutLog()'s byte-level read uses require('fs').openSync/readSync,
+  // which are NOT among the functions this file's `vi.mock('fs', ...)`
+  // factory overrides — they pass through to the real fs. So exercising the
+  // rate-limit-signature branch needs an actual file on disk at the exact
+  // path tailStdoutLog computes; existsSync/statSync are still mocked (per
+  // this file's convention) to point at it.
+  const logDir = '/tmp/test-ctx/logs/alice';
+  const logPath = `${logDir}/stdout.log`;
+  let realFs: typeof import('fs');
+
+  beforeEach(async () => {
+    realFs = await vi.importActual<typeof import('fs')>('fs');
+  });
+
+  function writeRealStdout(content: string) {
+    realFs.mkdirSync(logDir, { recursive: true });
+    realFs.writeFileSync(logPath, content, 'utf-8');
+    fsMocks.existsSync.mockImplementation((p: any) => String(p) === logPath);
+    fsMocks.statSync.mockImplementation((p: any) => {
+      if (String(p) === logPath) return { size: Buffer.byteLength(content, 'utf-8') } as any;
+      throw new Error('ENOENT');
+    });
+  }
+
+  afterEach(() => {
+    try {
+      realFs.rmSync(logDir, { recursive: true, force: true });
+    } catch { /* ignore */ }
+  });
+
+  it('an organic exit with a rate-limit signature in recent stdout is exempted from the crash counter and restarts', async () => {
+    writeRealStdout('some prior turn output\nAPI Error: rate_limit_error: Number of request tokens has exceeded your per-minute rate limit\n');
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    expect(ap.getStatus().status).toBe('running');
+
+    // No stop() call first — simulates Claude Code dying on its own.
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
+    const [restartsLogPath, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(restartsLogPath)).toContain('/logs/alice/restarts.log');
+    expect(String(logLine)).toMatch(
+      /] RATE_LIMIT_RECOVERY: exit_code=1 backoff_s=5 \(not counted toward max_crashes\)/,
+    );
+
+    // The daily crash counter file must never have been touched.
+    expect(fsMocks.writeFileSync).not.toHaveBeenCalledWith(
+      expect.stringContaining('.crash_count_today'),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('does not arm .force-fresh — a rate limit does not poison the conversation', async () => {
+    writeRealStdout('overloaded_error: Overloaded\n');
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    capturedOnExit!(1, 0);
+
+    expect(fsMocks.writeFileSync).not.toHaveBeenCalledWith(
+      expect.stringContaining('.force-fresh'),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('a genuine crash with no rate-limit signature in stdout still counts normally (no false exemption)', async () => {
+    writeRealStdout('TypeError: cannot read property of undefined\n    at somewhere.js:12\n');
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
   });
 });
 

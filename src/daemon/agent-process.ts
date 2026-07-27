@@ -12,6 +12,7 @@ import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 import { tryAcquireRestartLock, releaseRestartLock } from './restart-lock.js';
+import { hasRateLimitSignature } from '../pty/rate-limit-detector.js';
 
 type LogFn = (msg: string) => void;
 
@@ -670,6 +671,41 @@ export class AgentProcess {
       return;
     }
 
+    // Organic rate-limit exit exemption (task_1785180731919, S1 follow-up).
+    // The daemon's OWN proactive rate-limit rotation (fast-checker.ts's
+    // hang-restart path) already goes through sessionRefresh()'s stop()
+    // BEFORE start(), which sets stopRequested — so a daemon-INITIATED
+    // rate-limit restart is already exempted above, before this point ever
+    // runs. The residual gap this covers: Claude Code itself dying on a
+    // 429/rate-limit signature ORGANICALLY, racing ahead of the hang
+    // detector's poll cycle. That is an upstream API-availability condition
+    // outside the agent's control — structurally the same shape as the
+    // image-poison case above — and should not burn a crash-counter slot.
+    //
+    // Unlike image-poison, this is NOT gated on exitCode === 0: Claude
+    // Code's exit code on a 429 isn't a confirmed fixed value the way the
+    // image-poison 400's clean exit(0) is, and the two other call sites for
+    // this exact signature — fast-checker.ts's live restart-decision path
+    // and hook-crash-alert.ts's SessionEnd classification — both already key
+    // purely off hasRateLimitSignature(), not exit code. Matching that here
+    // keeps all three call sites on one predicate.
+    //
+    // Also does NOT arm .force-fresh: a rate limit is a transient API-supply
+    // condition, not a poisoned conversation — the next restart resumes
+    // normally via --continue, same as any other recoverable restart.
+    if (hasRateLimitSignature(recentOutput)) {
+      this.log('Organic rate-limit exit detected (429/rate-limit signature in recent output). Restarting without counting against max_crashes_per_day.');
+      this.appendCrashToRestartsLog(exitCode, 5000, 'RATE_LIMIT_RECOVERY');
+      this.status = 'crashed';
+      this.notifyStatusChange();
+      setTimeout(() => {
+        if (this.status === 'crashed') {
+          this.start().catch(err => this.log(`Rate-limit restart failed: ${err}`));
+        }
+      }, 5000);
+      return;
+    }
+
     // CrashLoopPauser (instar-inspired): if a sliding window is configured,
     // check whether the agent is crash-looping before falling through to
     // the legacy daily counter. The window is a more precise signal than
@@ -994,16 +1030,17 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'RATE_LIMIT_RECOVERY',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
       ensureDir(logDir);
       const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      const notCountedTowardMaxCrashes = kind === 'IMAGE_POISON_RECOVERY' || kind === 'RATE_LIMIT_RECOVERY';
       const details =
         kind === 'HALTED'
           ? `exit_code=${exitCode} crash_count=${this.crashCount} max_crashes=${this.maxCrashesPerDay}`
-          : kind === 'IMAGE_POISON_RECOVERY'
+          : notCountedTowardMaxCrashes
             ? `exit_code=${exitCode} backoff_s=${backoffMs / 1000} (not counted toward max_crashes)`
             : `exit_code=${exitCode} crash_count=${this.crashCount} backoff_s=${backoffMs / 1000}`;
       const logLine = `[${timestamp}] ${kind}: ${details}\n`;
