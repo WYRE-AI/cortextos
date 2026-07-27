@@ -67,3 +67,12 @@ dashboard/test-*.py
 # AGENTS.md, memory skill, and scaffold files.
 !community/agents/research-agent/
 !community/agents/research-agent/**
+
+# Internal ops/dev reports — never public (defense-in-depth alongside
+# leak-guard CI, ported from upstream #698). docs/ is already ignored above;
+# these cover root-level and phase-report globs so a dev artifact cannot
+# re-track outside docs/ or survive a future narrowing of that rule.
+WINDOWS_INSTALL_REPORT.md
+*INSTALL_REPORT.md
+/PHASE*-REPORT.md
+docs/phase-reports/

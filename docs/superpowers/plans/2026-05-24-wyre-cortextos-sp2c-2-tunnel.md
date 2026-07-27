@@ -14,7 +14,7 @@
 
 ## CRITICAL context for every task
 
-- **Branch:** `feat/sp2c-2-tunnel` (already checked out). Working dir `/Users/asachs/cortextos`.
+- **Branch:** `feat/sp2c-2-tunnel` (already checked out). Working dir `~/cortextos`.
 - **Commits:** `git -c user.name="Aaron Sachs" -c user.email="aaron@wyretechnology.com" commit ...`, Conventional Commits.
 - **The Cloudflare provider v5 renamed many resources from v4.** This plan uses the **v5** names to the best of current knowledge, but the authoritative source is the installed provider. After `terraform init` downloads the provider, **every Terraform task's gate is `terraform validate`** — if validate reports an unknown resource type or attribute, run `terraform providers schema -json | jq '.provider_schemas | keys'` (and drill into the specific resource) to find the correct v5 name/shape, fix it, and re-validate. This is expected, not a failure.
 - **`terraform validate` does NOT call the Cloudflare API** — it needs no `CLOUDFLARE_API_TOKEN`. So all authoring tasks complete and validate-clean offline. The live `terraform apply` is an operator step deferred to the end (Task 8), gated on operator prerequisites (Cloudflare token + Entra IdP). Do **not** attempt `terraform apply` in tasks 1-7.

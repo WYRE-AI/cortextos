@@ -11,7 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-05-21-wyre-cortextos-sp2-central-host-design.md`
 
 **Conventions for every task below:**
-- Working dir: `/Users/asachs/cortextos`. Branch: `feat/sp2-central-host` (already checked out).
+- Working dir: `~/cortextos`. Branch: `feat/sp2-central-host` (already checked out).
 - Commit with `git -c user.name="Aaron Sachs" -c user.email="aaron@wyretechnology.com" commit -m "..."`.
 - Conventional Commits messages.
 - After every task: `terraform fmt -recursive infra/terraform` and `terraform validate` (run from `infra/terraform/`).
