@@ -24,6 +24,46 @@ const DEDUP_WINDOW_MS = 10 * 60 * 1000;         // 10 minutes
 const QUIET_HOUR_START_LA = 22;                 // 22:00 America/Los_Angeles
 const QUIET_HOUR_END_LA = 7;                    // 07:00 America/Los_Angeles
 
+// task_1785077810721 (S1, part b, defect 1): detectRateLimitInLog() reads
+// ONLY the current tail of stdout.log at the instant this hook fires. During
+// a rapid rate-limit retry burst, a process that dies immediately after
+// hitting the limit can exit before Claude Code has flushed the rate-limit
+// banner to disk — a narrow write-flush race, not a detection-signature gap
+// (confirmed via a same-burst repro: 2 exits landed as type=crash reason=none
+// seconds before 3 later exits in the SAME burst correctly classified as
+// rate-limited once the banner had landed). A couple of quick, tightly-
+// bounded re-reads of the SAME check closes that race without loosening what
+// counts as a signal (hasRateLimitSignature is untouched) and without
+// meaningfully stalling the hook (it sits on the exit path).
+const RATE_LIMIT_RECHECK_ATTEMPTS = 3;      // initial read + 2 re-reads
+const RATE_LIMIT_RECHECK_INTERVAL_MS = 75;  // tight ceiling: ~150ms total extra wait
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Does stdout.log show an Anthropic rate-limit signature? Re-checks the SAME
+ * predicate a couple of times on a short interval before giving up, to cover
+ * the banner-not-yet-flushed race above. Exported for direct testing of the
+ * retry behavior (writing the banner mid-poll, between attempts).
+ */
+export async function detectRateLimitWithRetry(
+  stdoutPath: string,
+  attempts: number = RATE_LIMIT_RECHECK_ATTEMPTS,
+  intervalMs: number = RATE_LIMIT_RECHECK_INTERVAL_MS,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (existsSync(stdoutPath) && detectRateLimitInLog(stdoutPath)) {
+      return true;
+    }
+    if (attempt < attempts - 1) {
+      await sleep(intervalMs);
+    }
+  }
+  return false;
+}
+
 // End types that are routine and should be suppressed during quiet hours.
 // "crash" is deliberately NOT in this list — a genuine unexpected crash at
 // 3am is worth waking up for.
@@ -265,10 +305,12 @@ async function main(): Promise<void> {
 
   // If no marker matched but the stdout tail shows a rate-limit signature,
   // reclassify as rate-limited. Prevents the 30-minute 🚨 CRASH buzz storm
-  // when the weekly limit is exhausted.
+  // when the weekly limit is exhausted. Bounded-retry check (see
+  // detectRateLimitWithRetry) — closes the banner-not-yet-flushed race
+  // without loosening the signature match itself.
   if (endType === 'crash') {
     const stdoutPath = join(logDir, 'stdout.log');
-    if (existsSync(stdoutPath) && detectRateLimitInLog(stdoutPath)) {
+    if (await detectRateLimitWithRetry(stdoutPath)) {
       endType = 'rate-limited';
       reason = 'anthropic rate limit detected in stdout.log';
     }
