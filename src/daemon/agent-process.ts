@@ -624,10 +624,21 @@ export class AgentProcess {
   private hasRateLimitExitBanner(text: string): boolean {
     if (!text) return false;
     const normalized = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').toLowerCase();
-    if (normalized.includes('overloaded_error') || normalized.includes('rate_limit_error')) {
-      return true;
-    }
-    if (normalized.includes('api error') && /\b429\b/.test(normalized)) {
+    // Require the "API Error" context marker alongside the JSON error.type
+    // tokens, not a bare substring match — the same convention
+    // detectImagePoisonCrash() already relies on ("API Error: 400" +
+    // "image.source.base64"). Without it, this codebase's OWN source and
+    // test files (rate-limit-detector.ts, this very method, hook-crash-alert
+    // tests) legitimately contain the literal strings "overloaded_error" and
+    // "rate_limit_error" — an agent that crashes for an unrelated reason
+    // shortly after printing any of that (e.g. a grep/cat/diff of those
+    // files) would otherwise get misclassified as exempt.
+    const hasApiErrorContext = normalized.includes('api error');
+    if (hasApiErrorContext && (
+      normalized.includes('overloaded_error') ||
+      normalized.includes('rate_limit_error') ||
+      /\b429\b/.test(normalized)
+    )) {
       return true;
     }
     if (/you['’]ve hit your (weekly|usage|5-hour|5h)\s*limit/.test(normalized)) {

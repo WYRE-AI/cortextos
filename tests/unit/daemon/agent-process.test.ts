@@ -371,7 +371,7 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
     seedPreExistingLog('');
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
-    appendDuringLifecycle('overloaded_error: Overloaded\n');
+    appendDuringLifecycle('API Error: overloaded_error: Overloaded\n');
     capturedOnExit!(1, 0);
 
     expect(fsMocks.writeFileSync).not.toHaveBeenCalledWith(
@@ -455,6 +455,31 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
     await ap.start();
     appendDuringLifecycle(
       'Updated rate-limit-detector.ts to also match the weekly usage limit banner and quota exceeded errors.\n' +
+      'TypeError: cannot read property of undefined\n    at somewhere.js:12\n',
+    );
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
+  });
+
+  it('a bare error-type token with no "API Error" context does NOT exempt an unrelated crash (Codex P2 round 5)', async () => {
+    // Codex's round-5 finding: this codebase's OWN source and test files
+    // legitimately contain the literal strings "overloaded_error" and
+    // "rate_limit_error" (rate-limit-detector.ts, this very method's source,
+    // hook-crash-alert tests). An agent that crashes for an unrelated
+    // reason shortly after printing any of that — e.g. a grep/cat/diff of
+    // those files — must not get misclassified as a rate-limit exemption
+    // just because the bare token is present. Requires the same "API Error"
+    // context marker detectImagePoisonCrash() already relies on.
+    seedPreExistingLog('');
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    appendDuringLifecycle(
+      "$ grep -n 'rate_limit_error' src/pty/rate-limit-detector.ts\n" +
+      "19:    normalized.includes('rate_limit_error') ||\n" +
       'TypeError: cannot read property of undefined\n    at somewhere.js:12\n',
     );
     capturedOnExit!(1, 0);
