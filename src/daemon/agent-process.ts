@@ -16,6 +16,10 @@ import { hasRateLimitSignature } from '../pty/rate-limit-detector.js';
 
 type LogFn = (msg: string) => void;
 
+// See the organic rate-limit exit block in handleExit() for why this is
+// deliberately narrower than the 16KB image-poison capture it slices from.
+const RATE_LIMIT_EXIT_TAIL_BYTES = 4096;
+
 /**
  * Manages a single agent's lifecycle.
  * Replaces agent-wrapper.sh for one agent.
@@ -693,7 +697,23 @@ export class AgentProcess {
     // Also does NOT arm .force-fresh: a rate limit is a transient API-supply
     // condition, not a poisoned conversation — the next restart resumes
     // normally via --continue, same as any other recoverable restart.
-    if (hasRateLimitSignature(recentOutput)) {
+    //
+    // Checked against a NARROWER slice than the full 16KB `recentOutput`
+    // capture, on purpose. Image-poison's signature is structurally
+    // guaranteed to be the last thing printed before that exit (the 400 IS
+    // what kills the process) — but a rate-limit banner can appear
+    // mid-session if Claude Code retried and recovered, then crashed minutes
+    // later for an unrelated reason while the banner is still inside a
+    // 16KB window. This call site is also higher-stakes than the other two
+    // hasRateLimitSignature() consumers: fast-checker.ts's hang-check and
+    // hook-crash-alert.ts's SessionEnd classification only affect whether we
+    // get PAGED, not whether the crash counter increments — a false positive
+    // here would let an actually-crash-looping agent evade
+    // max_crashes_per_day entirely. Restricting the check to the last
+    // RATE_LIMIT_EXIT_TAIL_BYTES keeps the exemption tied to "this is what
+    // just happened," not "this happened at some point recently."
+    const rateLimitTail = recentOutput.slice(-RATE_LIMIT_EXIT_TAIL_BYTES);
+    if (hasRateLimitSignature(rateLimitTail)) {
       this.log('Organic rate-limit exit detected (429/rate-limit signature in recent output). Restarting without counting against max_crashes_per_day.');
       this.appendCrashToRestartsLog(exitCode, 5000, 'RATE_LIMIT_RECOVERY');
       this.status = 'crashed';

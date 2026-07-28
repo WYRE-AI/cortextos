@@ -379,6 +379,34 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
     const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
     expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
   });
+
+  it('a STALE rate-limit banner (recovered earlier, then crashed for an unrelated reason) does NOT exempt the later crash', async () => {
+    // Boss's boundary concern: a rate-limit signature that appears earlier
+    // in the captured tail — because Claude Code hit the limit, retried, and
+    // recovered — must not blanket-exempt an unrelated crash that happens
+    // afterward. Construct content where the banner is present, but pushed
+    // outside the narrower RATE_LIMIT_EXIT_TAIL_BYTES slice by enough
+    // intervening "normal" output, while the WHOLE thing still stays under
+    // the outer 16KB tailStdoutLog capture (so this specifically exercises
+    // the new inner slice, not just the pre-existing 16KB truncation).
+    const banner = 'API Error: rate_limit_error: Number of request tokens has exceeded your per-minute rate limit\n';
+    const recoveredWorkOutput = 'x'.repeat(5000) + '\n'; // > RATE_LIMIT_EXIT_TAIL_BYTES (4096)
+    const unrelatedCrashTail = 'TypeError: cannot read property of undefined\n    at somewhere.js:12\n';
+    const content = banner + recoveredWorkOutput + unrelatedCrashTail;
+    expect(content.length).toBeLessThan(16384); // still fully within tailStdoutLog's outer capture
+    expect(content.length - banner.length).toBeGreaterThan(4096); // banner sits outside the inner slice
+
+    writeRealStdout(content);
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
+  });
 });
 
 describe('AgentProcess.sessionRefresh — cross-path restart-in-flight lock (2026-07-13, revised scope)', () => {
