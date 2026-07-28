@@ -573,19 +573,28 @@ export class AgentProcess {
   }
 
   /**
-   * Does recent output show an ACTUAL Anthropic API rate-limit/overload
-   * error, as opposed to prose that merely mentions rate limits, quotas, or
-   * usage limits? Deliberately narrower than the shared
+   * Does recent output show an ACTUAL Anthropic/Claude Code rate-limit
+   * condition, as opposed to prose that merely mentions rate limits,
+   * quotas, or usage limits? Deliberately narrower than the shared
    * hasRateLimitSignature() in rate-limit-detector.ts (used by
    * fast-checker.ts's hang-check and hook-crash-alert.ts's SessionEnd
    * classification) — those live-alert paths can afford the shared
    * predicate's broader recall because a false positive there only costs a
    * missed page. This method gates whether handleExit's organic rate-limit
-   * exit exemption bypasses the crash counter, so it requires the literal
-   * Anthropic API error.type tokens or an explicit "API Error"+429 banner —
-   * not any text containing phrases like "rate limit" or "usage limit",
-   * which ordinary task output (including this codebase's own source and
-   * docs) can legitimately contain.
+   * exit exemption bypasses the crash counter, so ordinary prose
+   * mentioning "rate limit" or "usage limit" (which this codebase's own
+   * source and docs legitimately contain) must NOT match. It requires one
+   * of:
+   *   - the literal Anthropic API error.type tokens (overloaded_error,
+   *     rate_limit_error) or an explicit "API Error"+429 banner
+   *   - Claude Code's own confirmed CLI usage-limit banner text — "You've
+   *     hit your weekly/5-hour limit" or "You've used N% of your ... limit"
+   *     — verified against tests/unit/pty/rate-limit-detector.test.ts and
+   *     tests/unit/daemon/fast-checker.test.ts, not guessed. This is
+   *     second-person, direct-address CLI status phrasing that ordinary
+   *     third-person prose about rate limits does not use, so it stays
+   *     narrow without missing the primary real-world organic-exit case
+   *     (Claude Code exiting after printing this exact banner).
    */
   private hasRateLimitExitBanner(text: string): boolean {
     if (!text) return false;
@@ -594,6 +603,12 @@ export class AgentProcess {
       return true;
     }
     if (normalized.includes('api error') && /\b429\b/.test(normalized)) {
+      return true;
+    }
+    if (/you['’]ve hit your (weekly|usage|5-hour|5h)\s*limit/.test(normalized)) {
+      return true;
+    }
+    if (/you['’]ve used \d+% of your (weekly|usage|5-hour|5h)?\s*limit/.test(normalized)) {
       return true;
     }
     return false;

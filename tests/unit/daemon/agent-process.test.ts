@@ -464,6 +464,41 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
     const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
     expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
   });
+
+  it("recognizes Claude Code's confirmed weekly-limit exit banner (Codex P1 round 2)", async () => {
+    // Codex's round-2 finding: the narrowed predicate missed the PRIMARY
+    // real-world organic-exit case — Claude Code's own confirmed CLI
+    // banner, "You've hit your weekly limit for Claude." — verified
+    // against tests/unit/pty/rate-limit-detector.test.ts and
+    // tests/unit/daemon/fast-checker.test.ts (not a guess). Requiring only
+    // raw API-error tokens would have made this exemption nearly useless
+    // for the exact scenario that originally motivated rate-limit-detector.ts
+    // (freeze#4: weekly-limit exhaustion).
+    seedPreExistingLog('');
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    appendDuringLifecycle("You've hit your weekly limit for Claude.\n");
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(
+      /] RATE_LIMIT_RECOVERY: exit_code=1 backoff_s=5 \(not counted toward max_crashes\)/,
+    );
+  });
+
+  it('recognizes the percentage-warning variant ("You\'ve used N% of your ... limit")', async () => {
+    seedPreExistingLog('');
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    appendDuringLifecycle("You've used 95% of your weekly limit.\n");
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(/] RATE_LIMIT_RECOVERY:/);
+  });
 });
 
 describe('AgentProcess.sessionRefresh — cross-path restart-in-flight lock (2026-07-13, revised scope)', () => {
