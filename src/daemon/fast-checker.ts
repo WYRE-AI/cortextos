@@ -19,6 +19,22 @@ import { agentHoldsContextHandoffLease, releaseContextHandoffLease, requestConte
 type LogFn = (msg: string) => void;
 
 /**
+ * Post-boot grace window (ms) during which soft context-handoff actions are
+ * suppressed. Runtime-aware: codex-app-server (and opencode, upstream-only
+ * runtime kept here for parity) briefly report inflated prior prompt-cache
+ * context tokens, and that spurious spike can land ~6-8min after a fresh boot
+ * (observed double-handoffs ~6-8min apart on a codex agent), OUTSIDE a short
+ * grace. Those runtimes get a 10min window; all others keep 2min.
+ * Ported from upstream (grandamenium/cortextos) — additive only, does not
+ * touch the consecutive-restart circuit breaker below (see that field's
+ * comment for why it must stay consecutive, not windowed).
+ */
+export function handoffGraceMs(runtime: string | undefined): number {
+  if (runtime === 'codex-app-server' || runtime === 'opencode') return 600_000;
+  return 120_000;
+}
+
+/**
  * Fast message checker for a single agent.
  * Replaces fast-checker.sh: polls Telegram and inbox, injects into PTY.
  */
@@ -66,6 +82,9 @@ export class FastChecker {
   private ctxHandoffFiredAt: number = 0;    // fires once per session (0 = not yet)
   private ctxHandoffDeadlineAt: number = 0; // timestamp after which force-restart fires
   private ctxLastSessionId: string | null = null; // detects new session → clears stale deadline
+  // Anchors the post-boot handoff grace window (see handoffGraceMs above). Set
+  // when a new session_id is first observed; 0 means no session seen yet.
+  private ctxSessionStartedAt: number = 0;
   private ctxHandoffLeaseId: string | null = null;
   private ctxHandoffQueuedLogAt: number = 0;
   // 2026-07-14 (freeze#4 fix): was a timestamp array capped by a 15min *window*
@@ -1090,6 +1109,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
           this.log(`New session detected (${incomingSessionId.slice(0, 8)}…) — per-session ctx state reset`);
         }
         this.ctxLastSessionId = incomingSessionId;
+        // Anchor the handoff grace window. A freshly-started session begins at low
+        // context, so soft context-handoff actions are suppressed for HANDOFF_GRACE_MS
+        // to avoid acting on a transient/stale high reading (observed on fresh codex
+        // app-server threads that briefly report prior prompt-cache tokens) that would
+        // otherwise fire an immediate handoff → restart → fresh-session loop.
+        this.ctxSessionStartedAt = now;
       }
     } catch { return; }
 
@@ -1156,6 +1181,21 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       this.log('Released leaked context-handoff lease by name (fresh below-threshold session)');
     }
 
+    // Grace window after a fresh session start: suppress soft context actions
+    // (warning + handoff) while the session is younger than HANDOFF_GRACE_MS. A
+    // just-started session cannot legitimately be at genuine overflow, so a high
+    // reading inside this window is a transient/stale spike (e.g. a fresh codex
+    // app-server thread briefly reporting prior prompt-cache tokens). The window
+    // is runtime-aware — see handoffGraceMs(). Deliberately NOT applied to Tier 3
+    // (deadline-exceeded force-restart) or the hard API-overflow check above: a
+    // genuine overflow or an unmet handoff deadline must still act regardless of
+    // how young the session is. Also independent of the consecutive circuit
+    // breaker and the separate hang-detector subsystem — neither reads this
+    // window, so this only ever suppresses Tier 1/2, never a safety backstop.
+    const HANDOFF_GRACE_MS = handoffGraceMs(this.agent.getConfig().runtime);
+    const withinHandoffGrace =
+      this.ctxSessionStartedAt > 0 && now - this.ctxSessionStartedAt < HANDOFF_GRACE_MS;
+
     // Tier 3: deadline exceeded — force restart if agent ignored handoff prompt
     if (this.ctxHandoffDeadlineAt > 0 && now > this.ctxHandoffDeadlineAt) {
       this.log(`Handoff deadline exceeded (${Math.round(effectivePct)}%) — force restarting`);
@@ -1165,7 +1205,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     }
 
     // Tier 1: warning — PTY injection only, no Telegram ping (context management is internal)
-    if (effectivePct >= warn && now - this.ctxWarningFiredAt > 15 * 60_000) {
+    if (effectivePct >= warn && !withinHandoffGrace && now - this.ctxWarningFiredAt > 15 * 60_000) {
       this.ctxWarningFiredAt = now;
       const pctRound = Math.round(effectivePct);
       const statusSuffix = effectivePct >= handoff ? 'Handoff in progress.' : `Handoff triggers at ${handoff}%.`;
@@ -1174,7 +1214,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     }
 
     // Tier 2: handoff (fires once per session lifecycle)
-    if (effectivePct >= handoff && this.ctxHandoffFiredAt === 0) {
+    if (effectivePct >= handoff && this.ctxHandoffFiredAt === 0 && !withinHandoffGrace) {
       const lease = requestContextHandoffLease({
         ctxRoot: this.paths.ctxRoot,
         agentName: this.agent.name,
@@ -1385,6 +1425,17 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     try {
       if (!existsSync(this.ctxCircuitFile)) return;
       const data = JSON.parse(readFileSync(this.ctxCircuitFile, 'utf-8'));
+      // Defensive shape check: upstream (grandamenium/cortextos) persists this file
+      // as `{ restarts: number[] }` (windowed circuit breaker) instead of wyre's
+      // `{ consecutiveWithoutRecovery, handoffFires, brokenAt }`. No evidence this
+      // has ever happened here, but if a state dir were ever touched by
+      // upstream-shaped code, the fields below would silently default to 0/[]/null
+      // with no signal. A timestamp array isn't losslessly convertible to a
+      // consecutive-without-recovery count, so this only makes the reset visible
+      // instead of silent — it does not attempt to migrate the array's data.
+      if (Array.isArray(data.restarts) && typeof data.consecutiveWithoutRecovery !== 'number') {
+        this.log('.ctx-circuit.json is in upstream-shaped format (restarts: number[]) — resetting to wyre\'s consecutive-counter defaults');
+      }
       this.consecutiveCtxRestartsWithoutRecovery = typeof data.consecutiveWithoutRecovery === 'number' ? data.consecutiveWithoutRecovery : 0;
       this.ctxHandoffFires = Array.isArray(data.handoffFires) ? data.handoffFires : [];
       this.ctxCircuitBrokenAt = typeof data.brokenAt === 'number' ? data.brokenAt : null;
