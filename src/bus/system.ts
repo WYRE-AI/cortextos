@@ -326,8 +326,11 @@ export function checkGoalStaleness(
         continue;
       }
 
-      // Parse ISO 8601 timestamp
-      const parsedDate = new Date(updatedLine);
+      // Parse ISO 8601 timestamp — goals.json writes a trailing "(by <agent>)"
+      // attribution suffix (e.g. "2026-07-28T12:03:06Z (by boss)") that
+      // Date() cannot tolerate after a valid ISO string, so strip it first.
+      const isoTimestamp = updatedLine.replace(/\s*\([^()]*\)\s*$/, '').trim();
+      const parsedDate = new Date(isoTimestamp);
       if (isNaN(parsedDate.getTime())) {
         agents.push({
           agent: agentName,
