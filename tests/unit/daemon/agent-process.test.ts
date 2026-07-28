@@ -527,6 +527,32 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
     const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
     expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
   });
+
+  it('after stdout.log rotation, the new (smaller) file is read from byte 0 instead of being wrongly excluded (Codex P2)', async () => {
+    // Codex's P2 finding: OutputBuffer.push() rotates stdout.log (renames
+    // to .1, starts a fresh smaller file) once it crosses 50MB. If that
+    // happens mid-lifecycle, the current file size can drop BELOW
+    // stdoutLogSizeAtStart — treating that stale offset as a valid lower
+    // bound would wrongly read nothing at all, missing a genuine rate-limit
+    // banner written after rotation (safe-direction error: a real
+    // exemption gets miscounted as an ordinary crash, not a bypass — but
+    // still a real functional gap worth closing).
+    seedPreExistingLog('x'.repeat(5000)); // pre-rotation content, sets stdoutLogSizeAtStart=5000
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    // Simulate rotation: the log is REPLACED by a fresh, much smaller file
+    // (not appended to) — new size (42ish bytes) < stdoutLogSizeAtStart (5000).
+    realFs.writeFileSync(logPath, "You've hit your weekly limit for Claude.\n", 'utf-8');
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(
+      /] RATE_LIMIT_RECOVERY: exit_code=1 backoff_s=5 \(not counted toward max_crashes\)/,
+    );
+  });
 });
 
 describe('AgentProcess.sessionRefresh — cross-path restart-in-flight lock (2026-07-13, revised scope)', () => {

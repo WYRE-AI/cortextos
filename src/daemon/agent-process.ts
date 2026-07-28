@@ -535,7 +535,11 @@ export class AgentProcess {
    * string: JS string indices are UTF-16 code units, not bytes, so slicing a
    * decoded string by a byte-count length can read further back than
    * intended once the log contains multibyte UTF-8 output, silently
-   * defeating the lifecycle bound.
+   * defeating the lifecycle bound. If the file has since been rotated
+   * (OutputBuffer.push()'s 50MB rotation renames it and starts a fresh,
+   * smaller one) so `sinceByte` now exceeds the current file size, that
+   * bound is treated as stale and reset to 0 rather than excluding the
+   * entire new file.
    *
    * Returns an empty string if the log doesn't exist, can't be read, or the
    * bounded range is empty.
@@ -545,7 +549,15 @@ export class AgentProcess {
     try {
       if (!existsSync(logPath)) return '';
       const stats = statSync(logPath);
-      const start = Math.max(sinceByte, stats.size - maxBytes, 0);
+      // OutputBuffer.push() rotates stdout.log (renames to .1, starts a
+      // fresh smaller file) once it crosses MAX_LOG_BYTES. If that happened
+      // since sinceByte was recorded, the current file is now SMALLER than
+      // that offset — treating it as a valid lower bound would wrongly
+      // exclude everything in the new file. Detect the rotation (current
+      // size < recorded offset) and fall back to reading from byte 0 of the
+      // new file instead.
+      const effectiveSinceByte = sinceByte > stats.size ? 0 : sinceByte;
+      const start = Math.max(effectiveSinceByte, stats.size - maxBytes, 0);
       const len = stats.size - start;
       if (len <= 0) return '';
       // Synchronous read of the tail; small and bounded so the cost is fine
