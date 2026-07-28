@@ -15,6 +15,10 @@ import { tryAcquireRestartLock, releaseRestartLock } from './restart-lock.js';
 
 type LogFn = (msg: string) => void;
 
+// See the organic rate-limit exit block in handleExit() for why this is
+// deliberately narrower than the 16KB image-poison capture it slices from.
+const RATE_LIMIT_EXIT_TAIL_BYTES = 4096;
+
 /**
  * Manages a single agent's lifecycle.
  * Replaces agent-wrapper.sh for one agent.
@@ -70,6 +74,14 @@ export class AgentProcess {
   // daemon should fire the codex-app-server back-online Telegram directly
   // (skipped on handoff restart — the agent sends its own contextual reply).
   private lastSpawnWasHandoff = false;
+  // task_1785180731919: stdout.log's byte size at THIS lifecycle's start().
+  // stdout.log is append-only across restarts, so without this, the organic
+  // rate-limit exit check in handleExit() could match a banner left over from
+  // a PREVIOUS lifecycle — a fast repeat crash-loop (dies again before
+  // writing new output) would keep seeing the same stale banner and evade
+  // max_crashes_per_day indefinitely. Bounds the check to bytes actually
+  // written by the lifecycle that just exited.
+  private stdoutLogSizeAtStart: number = 0;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -137,6 +149,14 @@ export class AgentProcess {
     const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
     ensureDir(join(this.env.ctxRoot, 'logs', this.name));
     this.log(`Log path: ${logPath}`);
+    // task_1785180731919: record where THIS lifecycle's output begins, so
+    // handleExit's organic rate-limit check can't match a banner left over
+    // from a previous lifecycle. See the field doc above.
+    try {
+      this.stdoutLogSizeAtStart = existsSync(logPath) ? statSync(logPath).size : 0;
+    } catch {
+      this.stdoutLogSizeAtStart = 0;
+    }
     this.pty = this.config.runtime === 'hermes'
       ? new HermesPTY(this.env, this.config, logPath)
       : this.config.runtime === 'codex-app-server'
@@ -506,15 +526,40 @@ export class AgentProcess {
    * (e.g. the image-poison API 400 pattern) so it can decide whether the
    * exit is a real crash or a recoverable upstream artifact.
    *
-   * Returns an empty string if the log doesn't exist or can't be read.
+   * `sinceByte` (default 0) is an optional lower bound on the read: the tail
+   * never starts before this byte offset, even if that means reading fewer
+   * than `maxBytes`. Used by the organic rate-limit exit check to bound the
+   * read to bytes THIS lifecycle wrote (stdoutLogSizeAtStart) — byte-precise
+   * on purpose (reads the exact range via Buffer, same as the rest of this
+   * method) rather than reading the full tail and then slicing the decoded
+   * string: JS string indices are UTF-16 code units, not bytes, so slicing a
+   * decoded string by a byte-count length can read further back than
+   * intended once the log contains multibyte UTF-8 output, silently
+   * defeating the lifecycle bound. If the file has since been rotated
+   * (OutputBuffer.push()'s 50MB rotation renames it and starts a fresh,
+   * smaller one) so `sinceByte` now exceeds the current file size, that
+   * bound is treated as stale and reset to 0 rather than excluding the
+   * entire new file.
+   *
+   * Returns an empty string if the log doesn't exist, can't be read, or the
+   * bounded range is empty.
    */
-  private tailStdoutLog(maxBytes: number): string {
+  private tailStdoutLog(maxBytes: number, sinceByte: number = 0): string {
     const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
     try {
       if (!existsSync(logPath)) return '';
       const stats = statSync(logPath);
-      const start = Math.max(0, stats.size - maxBytes);
+      // OutputBuffer.push() rotates stdout.log (renames to .1, starts a
+      // fresh smaller file) once it crosses MAX_LOG_BYTES. If that happened
+      // since sinceByte was recorded, the current file is now SMALLER than
+      // that offset — treating it as a valid lower bound would wrongly
+      // exclude everything in the new file. Detect the rotation (current
+      // size < recorded offset) and fall back to reading from byte 0 of the
+      // new file instead.
+      const effectiveSinceByte = sinceByte > stats.size ? 0 : sinceByte;
+      const start = Math.max(effectiveSinceByte, stats.size - maxBytes, 0);
       const len = stats.size - start;
+      if (len <= 0) return '';
       // Synchronous read of the tail; small and bounded so the cost is fine
       // even in the exit handler.
       const fd = require('fs').openSync(logPath, 'r');
@@ -547,6 +592,59 @@ export class AgentProcess {
       return true;
     }
     if (/image format image\/[a-z]+ not supported/i.test(recentOutput)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Does recent output show an ACTUAL Anthropic/Claude Code rate-limit
+   * condition, as opposed to prose that merely mentions rate limits,
+   * quotas, or usage limits? Deliberately narrower than the shared
+   * hasRateLimitSignature() in rate-limit-detector.ts (used by
+   * fast-checker.ts's hang-check and hook-crash-alert.ts's SessionEnd
+   * classification) — those live-alert paths can afford the shared
+   * predicate's broader recall because a false positive there only costs a
+   * missed page. This method gates whether handleExit's organic rate-limit
+   * exit exemption bypasses the crash counter, so ordinary prose
+   * mentioning "rate limit" or "usage limit" (which this codebase's own
+   * source and docs legitimately contain) must NOT match. It requires one
+   * of:
+   *   - the literal Anthropic API error.type tokens (overloaded_error,
+   *     rate_limit_error) or an explicit "API Error"+429 banner
+   *   - Claude Code's own confirmed CLI usage-limit banner text — "You've
+   *     hit your weekly/5-hour limit" or "You've used N% of your ... limit"
+   *     — verified against tests/unit/pty/rate-limit-detector.test.ts and
+   *     tests/unit/daemon/fast-checker.test.ts, not guessed. This is
+   *     second-person, direct-address CLI status phrasing that ordinary
+   *     third-person prose about rate limits does not use, so it stays
+   *     narrow without missing the primary real-world organic-exit case
+   *     (Claude Code exiting after printing this exact banner).
+   */
+  private hasRateLimitExitBanner(text: string): boolean {
+    if (!text) return false;
+    const normalized = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').toLowerCase();
+    // Require the "API Error" context marker alongside the JSON error.type
+    // tokens, not a bare substring match — the same convention
+    // detectImagePoisonCrash() already relies on ("API Error: 400" +
+    // "image.source.base64"). Without it, this codebase's OWN source and
+    // test files (rate-limit-detector.ts, this very method, hook-crash-alert
+    // tests) legitimately contain the literal strings "overloaded_error" and
+    // "rate_limit_error" — an agent that crashes for an unrelated reason
+    // shortly after printing any of that (e.g. a grep/cat/diff of those
+    // files) would otherwise get misclassified as exempt.
+    const hasApiErrorContext = normalized.includes('api error');
+    if (hasApiErrorContext && (
+      normalized.includes('overloaded_error') ||
+      normalized.includes('rate_limit_error') ||
+      /\b429\b/.test(normalized)
+    )) {
+      return true;
+    }
+    if (/you['’]ve hit your (weekly|usage|5-hour|5h)\s*limit/.test(normalized)) {
+      return true;
+    }
+    if (/you['’]ve used \d+% of your (weekly|usage|5-hour|5h)?\s*limit/.test(normalized)) {
       return true;
     }
     return false;
@@ -665,6 +763,81 @@ export class AgentProcess {
       setTimeout(() => {
         if (this.status === 'crashed') {
           this.start().catch(err => this.log(`Image-poison restart failed: ${err}`));
+        }
+      }, 5000);
+      return;
+    }
+
+    // Organic rate-limit exit exemption (task_1785180731919, S1 follow-up).
+    // The daemon's OWN proactive rate-limit rotation (fast-checker.ts's
+    // hang-restart path) already goes through sessionRefresh()'s stop()
+    // BEFORE start(), which sets stopRequested — so a daemon-INITIATED
+    // rate-limit restart is already exempted above, before this point ever
+    // runs. The residual gap this covers: Claude Code itself dying on a
+    // 429/rate-limit signature ORGANICALLY, racing ahead of the hang
+    // detector's poll cycle. That is an upstream API-availability condition
+    // outside the agent's control — structurally the same shape as the
+    // image-poison case above — and should not burn a crash-counter slot.
+    //
+    // Unlike image-poison, this is NOT gated on exitCode === 0: Claude
+    // Code's exit code on a 429 isn't a confirmed fixed value the way the
+    // image-poison 400's clean exit(0) is, and the two other call sites for
+    // this exact signature — fast-checker.ts's live restart-decision path
+    // and hook-crash-alert.ts's SessionEnd classification — both already key
+    // purely off hasRateLimitSignature(), not exit code. Matching that here
+    // keeps all three call sites on one predicate.
+    //
+    // Also does NOT arm .force-fresh: a rate limit is a transient API-supply
+    // condition, not a poisoned conversation — the next restart resumes
+    // normally via --continue, same as any other recoverable restart.
+    //
+    // This call site is higher-stakes than the other two
+    // hasRateLimitSignature() consumers (fast-checker.ts's hang-check,
+    // hook-crash-alert.ts's SessionEnd classification): those only affect
+    // whether an alert pages, so a false positive there just means a human
+    // doesn't get woken up for something real — recoverable. Here a false
+    // positive lets a genuinely crash-looping agent evade
+    // max_crashes_per_day entirely, so this uses two independent, deliberately
+    // NARROWER checks instead of reusing the shared predicate outright:
+    //
+    // 1. Read via tailStdoutLog(RATE_LIMIT_EXIT_TAIL_BYTES, stdoutLogSizeAtStart)
+    //    — a fresh, byte-precise read bounded on BOTH sides, not a slice of
+    //    the already-decoded `recentOutput` string. stdout.log is
+    //    append-only across restarts — without the lifecycle bound, a fast
+    //    repeat crash-loop (dies again before writing much new output) would
+    //    keep matching the SAME stale banner from a previous lifecycle and
+    //    evade the counter indefinitely. Without the byte cap, a banner from
+    //    minutes-ago-but-still-this-lifecycle (Claude Code hit a limit,
+    //    retried, recovered, then crashed later for an unrelated reason)
+    //    would wrongly exempt that later, unrelated crash — image-poison
+    //    doesn't have this problem because its signature IS what kills the
+    //    process, always the last thing printed; a rate-limit banner has no
+    //    such guarantee. A prior version of this fix computed the byte
+    //    window separately and did `recentOutput.slice(-window)` — broken,
+    //    because JS string indices are UTF-16 code units, not bytes, so a
+    //    byte-count slice on a decoded string can read further back than
+    //    intended once multibyte UTF-8 output is involved, silently
+    //    defeating the lifecycle bound. tailStdoutLog's own byte-range read
+    //    doesn't have this problem.
+    // 2. hasRateLimitExitBanner() (below), not the shared hasRateLimitSignature().
+    //    The shared predicate is tuned for live-alert paths and matches
+    //    plain English phrases ("rate limit", "usage limit", "quota
+    //    exceeded") that ordinary task output can legitimately contain —
+    //    including THIS codebase's own source and docs (rate-limit-detector.ts's
+    //    own signature list, this very comment). An agent whose recent work
+    //    happens to discuss rate limits could otherwise get any unrelated
+    //    crash silently exempted. This call site requires an actual
+    //    API-error-shaped token, or Claude Code's own confirmed usage-limit
+    //    banner text, instead.
+    const rateLimitTail = this.tailStdoutLog(RATE_LIMIT_EXIT_TAIL_BYTES, this.stdoutLogSizeAtStart);
+    if (this.hasRateLimitExitBanner(rateLimitTail)) {
+      this.log('Organic rate-limit exit detected (429/rate-limit signature in recent output). Restarting without counting against max_crashes_per_day.');
+      this.appendCrashToRestartsLog(exitCode, 5000, 'RATE_LIMIT_RECOVERY');
+      this.status = 'crashed';
+      this.notifyStatusChange();
+      setTimeout(() => {
+        if (this.status === 'crashed') {
+          this.start().catch(err => this.log(`Rate-limit restart failed: ${err}`));
         }
       }, 5000);
       return;
@@ -994,16 +1167,17 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'RATE_LIMIT_RECOVERY',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
       ensureDir(logDir);
       const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      const notCountedTowardMaxCrashes = kind === 'IMAGE_POISON_RECOVERY' || kind === 'RATE_LIMIT_RECOVERY';
       const details =
         kind === 'HALTED'
           ? `exit_code=${exitCode} crash_count=${this.crashCount} max_crashes=${this.maxCrashesPerDay}`
-          : kind === 'IMAGE_POISON_RECOVERY'
+          : notCountedTowardMaxCrashes
             ? `exit_code=${exitCode} backoff_s=${backoffMs / 1000} (not counted toward max_crashes)`
             : `exit_code=${exitCode} crash_count=${this.crashCount} backoff_s=${backoffMs / 1000}`;
       const logLine = `[${timestamp}] ${kind}: ${details}\n`;
