@@ -12,7 +12,6 @@ import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 import { tryAcquireRestartLock, releaseRestartLock } from './restart-lock.js';
-import { hasRateLimitSignature } from '../pty/rate-limit-detector.js';
 
 type LogFn = (msg: string) => void;
 
@@ -75,6 +74,14 @@ export class AgentProcess {
   // daemon should fire the codex-app-server back-online Telegram directly
   // (skipped on handoff restart — the agent sends its own contextual reply).
   private lastSpawnWasHandoff = false;
+  // task_1785180731919: stdout.log's byte size at THIS lifecycle's start().
+  // stdout.log is append-only across restarts, so without this, the organic
+  // rate-limit exit check in handleExit() could match a banner left over from
+  // a PREVIOUS lifecycle — a fast repeat crash-loop (dies again before
+  // writing new output) would keep seeing the same stale banner and evade
+  // max_crashes_per_day indefinitely. Bounds the check to bytes actually
+  // written by the lifecycle that just exited.
+  private stdoutLogSizeAtStart: number = 0;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -142,6 +149,14 @@ export class AgentProcess {
     const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
     ensureDir(join(this.env.ctxRoot, 'logs', this.name));
     this.log(`Log path: ${logPath}`);
+    // task_1785180731919: record where THIS lifecycle's output begins, so
+    // handleExit's organic rate-limit check can't match a banner left over
+    // from a previous lifecycle. See the field doc above.
+    try {
+      this.stdoutLogSizeAtStart = existsSync(logPath) ? statSync(logPath).size : 0;
+    } catch {
+      this.stdoutLogSizeAtStart = 0;
+    }
     this.pty = this.config.runtime === 'hermes'
       ? new HermesPTY(this.env, this.config, logPath)
       : this.config.runtime === 'codex-app-server'
@@ -558,6 +573,33 @@ export class AgentProcess {
   }
 
   /**
+   * Does recent output show an ACTUAL Anthropic API rate-limit/overload
+   * error, as opposed to prose that merely mentions rate limits, quotas, or
+   * usage limits? Deliberately narrower than the shared
+   * hasRateLimitSignature() in rate-limit-detector.ts (used by
+   * fast-checker.ts's hang-check and hook-crash-alert.ts's SessionEnd
+   * classification) — those live-alert paths can afford the shared
+   * predicate's broader recall because a false positive there only costs a
+   * missed page. This method gates whether handleExit's organic rate-limit
+   * exit exemption bypasses the crash counter, so it requires the literal
+   * Anthropic API error.type tokens or an explicit "API Error"+429 banner —
+   * not any text containing phrases like "rate limit" or "usage limit",
+   * which ordinary task output (including this codebase's own source and
+   * docs) can legitimately contain.
+   */
+  private hasRateLimitExitBanner(text: string): boolean {
+    if (!text) return false;
+    const normalized = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').toLowerCase();
+    if (normalized.includes('overloaded_error') || normalized.includes('rate_limit_error')) {
+      return true;
+    }
+    if (normalized.includes('api error') && /\b429\b/.test(normalized)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Write the `.force-fresh` marker that AgentProcess.shouldContinue() reads
    * on the next start() to force a fresh Claude Code session (no --continue).
    * Used by the image-poison auto-recovery in handleExit().
@@ -698,22 +740,46 @@ export class AgentProcess {
     // condition, not a poisoned conversation — the next restart resumes
     // normally via --continue, same as any other recoverable restart.
     //
-    // Checked against a NARROWER slice than the full 16KB `recentOutput`
-    // capture, on purpose. Image-poison's signature is structurally
-    // guaranteed to be the last thing printed before that exit (the 400 IS
-    // what kills the process) — but a rate-limit banner can appear
-    // mid-session if Claude Code retried and recovered, then crashed minutes
-    // later for an unrelated reason while the banner is still inside a
-    // 16KB window. This call site is also higher-stakes than the other two
-    // hasRateLimitSignature() consumers: fast-checker.ts's hang-check and
-    // hook-crash-alert.ts's SessionEnd classification only affect whether we
-    // get PAGED, not whether the crash counter increments — a false positive
-    // here would let an actually-crash-looping agent evade
-    // max_crashes_per_day entirely. Restricting the check to the last
-    // RATE_LIMIT_EXIT_TAIL_BYTES keeps the exemption tied to "this is what
-    // just happened," not "this happened at some point recently."
-    const rateLimitTail = recentOutput.slice(-RATE_LIMIT_EXIT_TAIL_BYTES);
-    if (hasRateLimitSignature(rateLimitTail)) {
+    // This call site is higher-stakes than the other two
+    // hasRateLimitSignature() consumers (fast-checker.ts's hang-check,
+    // hook-crash-alert.ts's SessionEnd classification): those only affect
+    // whether an alert pages, so a false positive there just means a human
+    // doesn't get woken up for something real — recoverable. Here a false
+    // positive lets a genuinely crash-looping agent evade
+    // max_crashes_per_day entirely, so this uses two independent, deliberately
+    // NARROWER checks instead of reusing the shared predicate outright:
+    //
+    // 1. Bounded to bytes THIS lifecycle actually wrote (stdoutLogSizeAtStart),
+    //    capped further at RATE_LIMIT_EXIT_TAIL_BYTES. stdout.log is
+    //    append-only across restarts — without the lifecycle bound, a fast
+    //    repeat crash-loop (dies again before writing much new output) would
+    //    keep matching the SAME stale banner from a previous lifecycle and
+    //    evade the counter indefinitely. Without the byte cap, a banner from
+    //    minutes-ago-but-still-this-lifecycle (Claude Code hit a limit,
+    //    retried, recovered, then crashed later for an unrelated reason)
+    //    would wrongly exempt that later, unrelated crash — image-poison
+    //    doesn't have this problem because its signature IS what kills the
+    //    process, always the last thing printed; a rate-limit banner has no
+    //    such guarantee.
+    // 2. hasRateLimitExitBanner() (below), not the shared hasRateLimitSignature().
+    //    The shared predicate is tuned for live-alert paths and matches
+    //    plain English phrases ("rate limit", "usage limit", "quota
+    //    exceeded") that ordinary task output can legitimately contain —
+    //    including THIS codebase's own source and docs (rate-limit-detector.ts's
+    //    own signature list, this very comment). An agent whose recent work
+    //    happens to discuss rate limits could otherwise get any unrelated
+    //    crash silently exempted. This call site requires an actual
+    //    API-error-shaped token instead.
+    const bytesThisLifecycle = (() => {
+      try {
+        return Math.max(0, statSync(join(this.env.ctxRoot, 'logs', this.name, 'stdout.log')).size - this.stdoutLogSizeAtStart);
+      } catch {
+        return 0;
+      }
+    })();
+    const rateLimitWindow = Math.min(RATE_LIMIT_EXIT_TAIL_BYTES, bytesThisLifecycle);
+    const rateLimitTail = rateLimitWindow > 0 ? recentOutput.slice(-rateLimitWindow) : '';
+    if (this.hasRateLimitExitBanner(rateLimitTail)) {
       this.log('Organic rate-limit exit detected (429/rate-limit signature in recent output). Restarting without counting against max_crashes_per_day.');
       this.appendCrashToRestartsLog(exitCode, 5000, 'RATE_LIMIT_RECOVERY');
       this.status = 'crashed';

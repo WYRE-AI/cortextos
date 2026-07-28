@@ -301,25 +301,24 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
   // which are NOT among the functions this file's `vi.mock('fs', ...)`
   // factory overrides — they pass through to the real fs. So exercising the
   // rate-limit-signature branch needs an actual file on disk at the exact
-  // path tailStdoutLog computes; existsSync/statSync are still mocked (per
-  // this file's convention) to point at it.
+  // path tailStdoutLog computes. existsSync/statSync are mocked (per this
+  // file's convention) but delegate to the REAL file's current state, so
+  // they reflect growth as content is appended between start() and exit —
+  // load-bearing for the lifecycle-offset tests below, which depend on
+  // stdoutLogSizeAtStart being captured correctly at start() time and the
+  // size growing afterward as the (simulated) session produces output.
   const logDir = '/tmp/test-ctx/logs/alice';
   const logPath = `${logDir}/stdout.log`;
   let realFs: typeof import('fs');
 
   beforeEach(async () => {
     realFs = await vi.importActual<typeof import('fs')>('fs');
-  });
-
-  function writeRealStdout(content: string) {
-    realFs.mkdirSync(logDir, { recursive: true });
-    realFs.writeFileSync(logPath, content, 'utf-8');
-    fsMocks.existsSync.mockImplementation((p: any) => String(p) === logPath);
+    fsMocks.existsSync.mockImplementation((p: any) => String(p) === logPath && realFs.existsSync(logPath));
     fsMocks.statSync.mockImplementation((p: any) => {
-      if (String(p) === logPath) return { size: Buffer.byteLength(content, 'utf-8') } as any;
+      if (String(p) === logPath) return { size: realFs.statSync(logPath).size } as any;
       throw new Error('ENOENT');
     });
-  }
+  });
 
   afterEach(() => {
     try {
@@ -327,12 +326,27 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
     } catch { /* ignore */ }
   });
 
-  it('an organic exit with a rate-limit signature in recent stdout is exempted from the crash counter and restarts', async () => {
-    writeRealStdout('some prior turn output\nAPI Error: rate_limit_error: Number of request tokens has exceeded your per-minute rate limit\n');
+  // Content already on disk BEFORE this test's AgentProcess.start() runs —
+  // simulates leftover output from a PREVIOUS lifecycle.
+  function seedPreExistingLog(content: string) {
+    realFs.mkdirSync(logDir, { recursive: true });
+    if (content) realFs.writeFileSync(logPath, content, 'utf-8');
+  }
 
+  // Content appended AFTER start() — simulates output THIS lifecycle
+  // actually produced, which is what stdoutLogSizeAtStart bounds against.
+  function appendDuringLifecycle(content: string) {
+    realFs.mkdirSync(logDir, { recursive: true });
+    realFs.appendFileSync(logPath, content, 'utf-8');
+  }
+
+  it("an organic exit with a rate-limit error banner in this lifecycle's output is exempted from the crash counter and restarts", async () => {
+    seedPreExistingLog('');
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
     expect(ap.getStatus().status).toBe('running');
+
+    appendDuringLifecycle('some prior turn output\nAPI Error: rate_limit_error: Number of request tokens has exceeded your per-minute rate limit\n');
 
     // No stop() call first — simulates Claude Code dying on its own.
     capturedOnExit!(1, 0);
@@ -354,10 +368,10 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
   });
 
   it('does not arm .force-fresh — a rate limit does not poison the conversation', async () => {
-    writeRealStdout('overloaded_error: Overloaded\n');
-
+    seedPreExistingLog('');
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
+    appendDuringLifecycle('overloaded_error: Overloaded\n');
     capturedOnExit!(1, 0);
 
     expect(fsMocks.writeFileSync).not.toHaveBeenCalledWith(
@@ -368,10 +382,10 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
   });
 
   it('a genuine crash with no rate-limit signature in stdout still counts normally (no false exemption)', async () => {
-    writeRealStdout('TypeError: cannot read property of undefined\n    at somewhere.js:12\n');
-
+    seedPreExistingLog('');
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
+    appendDuringLifecycle('TypeError: cannot read property of undefined\n    at somewhere.js:12\n');
     capturedOnExit!(1, 0);
 
     expect(ap.getStatus().status).toBe('crashed');
@@ -380,26 +394,69 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
     expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
   });
 
-  it('a STALE rate-limit banner (recovered earlier, then crashed for an unrelated reason) does NOT exempt the later crash', async () => {
-    // Boss's boundary concern: a rate-limit signature that appears earlier
-    // in the captured tail — because Claude Code hit the limit, retried, and
-    // recovered — must not blanket-exempt an unrelated crash that happens
-    // afterward. Construct content where the banner is present, but pushed
-    // outside the narrower RATE_LIMIT_EXIT_TAIL_BYTES slice by enough
-    // intervening "normal" output, while the WHOLE thing still stays under
-    // the outer 16KB tailStdoutLog capture (so this specifically exercises
-    // the new inner slice, not just the pre-existing 16KB truncation).
+  it('a STALE rate-limit banner (recovered earlier THIS lifecycle, then crashed for an unrelated reason) does NOT exempt the later crash', async () => {
+    // Boss's first boundary concern: a rate-limit signature that appears
+    // earlier in the captured tail — because Claude Code hit the limit,
+    // retried, and recovered — must not blanket-exempt an unrelated crash
+    // that happens afterward. Construct content where the banner is
+    // present, but pushed outside the narrower RATE_LIMIT_EXIT_TAIL_BYTES
+    // slice by enough intervening "normal" output, all still produced
+    // within THIS lifecycle (after start()).
+    seedPreExistingLog('');
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
     const banner = 'API Error: rate_limit_error: Number of request tokens has exceeded your per-minute rate limit\n';
     const recoveredWorkOutput = 'x'.repeat(5000) + '\n'; // > RATE_LIMIT_EXIT_TAIL_BYTES (4096)
     const unrelatedCrashTail = 'TypeError: cannot read property of undefined\n    at somewhere.js:12\n';
     const content = banner + recoveredWorkOutput + unrelatedCrashTail;
     expect(content.length).toBeLessThan(16384); // still fully within tailStdoutLog's outer capture
     expect(content.length - banner.length).toBeGreaterThan(4096); // banner sits outside the inner slice
+    appendDuringLifecycle(content);
 
-    writeRealStdout(content);
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
+  });
+
+  it('a rate-limit banner left over from a PREVIOUS lifecycle does NOT exempt a fast repeat crash in the new lifecycle (Codex P1)', async () => {
+    // Codex's finding: stdout.log is append-only across restarts. Without
+    // the lifecycle-offset bound, a fast repeat crash-loop (dies again
+    // before writing much new output) would keep matching the SAME stale
+    // banner from a PRIOR lifecycle indefinitely, evading max_crashes_per_day.
+    seedPreExistingLog('API Error: rate_limit_error: hit the wall last lifecycle\n');
 
     const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start(); // stdoutLogSizeAtStart now captures the pre-existing banner's byte offset
+
+    // This lifecycle crashes again almost immediately, writing only a small
+    // amount of genuinely-new, unrelated output — the stale banner from
+    // before start() must not count.
+    appendDuringLifecycle('segfault or similar unrelated failure\n');
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
+  });
+
+  it('prose merely mentioning rate limits does NOT exempt an unrelated crash (Codex P1 — requires an actual API-error banner)', async () => {
+    // Codex's second finding: the shared hasRateLimitSignature() predicate
+    // matches plain phrases ("rate limit", "usage limit") that ordinary
+    // task output — including this very codebase's own source/docs — can
+    // legitimately contain. This call site requires a structured
+    // API-error-shaped token instead, so ordinary prose must NOT exempt.
+    seedPreExistingLog('');
+    const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
+    appendDuringLifecycle(
+      'Updated rate-limit-detector.ts to also match the weekly usage limit banner and quota exceeded errors.\n' +
+      'TypeError: cannot read property of undefined\n    at somewhere.js:12\n',
+    );
     capturedOnExit!(1, 0);
 
     expect(ap.getStatus().status).toBe('crashed');
