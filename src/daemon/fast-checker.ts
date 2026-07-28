@@ -19,6 +19,19 @@ import { agentHoldsContextHandoffLease, releaseContextHandoffLease, requestConte
 type LogFn = (msg: string) => void;
 
 /**
+ * Post-boot grace window (ms) during which soft context-handoff actions are
+ * suppressed. Runtime-aware: codex-app-server and opencode briefly report
+ * inflated prior prompt-cache context tokens, and that spurious spike can land
+ * ~6-8min after a fresh boot (observed double-handoffs ~6-8min apart on a codex
+ * agent), OUTSIDE a short grace. Those runtimes get a 10min window; all others
+ * keep the original 2min.
+ */
+export function handoffGraceMs(runtime: string | undefined): number {
+  if (runtime === 'codex-app-server' || runtime === 'opencode') return 600_000;
+  return 120_000;
+}
+
+/**
  * Fast message checker for a single agent.
  * Replaces fast-checker.sh: polls Telegram and inbox, injects into PTY.
  */
@@ -66,6 +79,7 @@ export class FastChecker {
   private ctxHandoffFiredAt: number = 0;    // fires once per session (0 = not yet)
   private ctxHandoffDeadlineAt: number = 0; // timestamp after which force-restart fires
   private ctxLastSessionId: string | null = null; // detects new session → clears stale deadline
+  private ctxSessionStartedAt: number = 0; // when current session_id was first observed — handoff grace window anchor
   private ctxHandoffLeaseId: string | null = null;
   private ctxHandoffQueuedLogAt: number = 0;
   // 2026-07-14 (freeze#4 fix): was a timestamp array capped by a 15min *window*
@@ -332,10 +346,7 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     // from prior external messages). Sanitize each so none can escape the fence
     // or forge a containment header. Unfenced context fields (reply/history) are
     // the weakest surface — they sit raw in [Replying to: "..."] / [Recent ...].
-    let replyCx = '';
-    if (replyToText) {
-      replyCx = `[Replying to: "${sanitizeForPtyInjection(replyToText.slice(0, 500))}"]\n`;
-    }
+    const replyCx = FastChecker.formatReplyContext(replyToText);
 
     let lastSentCtx = '';
     if (lastSentText) {
@@ -428,9 +439,10 @@ Reply using: cortextos slack send ${channel} '<your reply>' --as ${agentName}
     chatId: string | number,
     caption: string,
     imagePath: string,
+    replyToText?: string,
   ): string {
     return `=== TELEGRAM PHOTO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-caption:
+${FastChecker.formatReplyContext(replyToText)}caption:
 ${wrapFenceSafe(caption)}
 local_file: ${imagePath}
 Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
@@ -448,9 +460,10 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     caption: string,
     filePath: string,
     fileName: string,
+    replyToText?: string,
   ): string {
     return `=== TELEGRAM DOCUMENT from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-caption:
+${FastChecker.formatReplyContext(replyToText)}caption:
 ${wrapFenceSafe(caption)}
 local_file: ${filePath}
 file_name: ${sanitizeForPtyInjection(fileName)}
@@ -474,13 +487,14 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     filePath: string,
     duration: number | undefined,
     transcript?: string,
+    replyToText?: string,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     const transcriptBlock = transcript && transcript.trim()
       ? `transcript:\n${wrapFenceSafe(transcript.trim())}\n`
       : '';
     return `=== TELEGRAM VOICE from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-duration: ${dur}s
+${FastChecker.formatReplyContext(replyToText)}duration: ${dur}s
 local_file: ${filePath}
 ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
@@ -498,10 +512,11 @@ ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your repl
     filePath: string,
     fileName: string,
     duration: number | undefined,
+    replyToText?: string,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     return `=== TELEGRAM VIDEO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-caption:
+${FastChecker.formatReplyContext(replyToText)}caption:
 ${wrapFenceSafe(caption)}
 duration: ${dur}s
 local_file: ${filePath}
@@ -509,6 +524,12 @@ file_name: ${sanitizeForPtyInjection(fileName)}
 Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
 `;
+  }
+
+  private static formatReplyContext(replyToText?: string): string {
+    return replyToText
+      ? `[Replying to: "${sanitizeForPtyInjection(replyToText.slice(0, 500))}"]\n`
+      : '';
   }
 
   /**
@@ -1090,6 +1111,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
           this.log(`New session detected (${incomingSessionId.slice(0, 8)}…) — per-session ctx state reset`);
         }
         this.ctxLastSessionId = incomingSessionId;
+        // Anchor the handoff grace window. A freshly-started session begins at low
+        // context, so context-handoff actions are suppressed for HANDOFF_GRACE_MS to
+        // avoid acting on a transient/stale high reading (observed on fresh codex
+        // app-server threads that briefly report prior prompt-cache tokens) that
+        // would otherwise fire an immediate handoff → restart → fresh-session loop.
+        this.ctxSessionStartedAt = now;
       }
     } catch { return; }
 
@@ -1156,6 +1183,22 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       this.log('Released leaked context-handoff lease by name (fresh below-threshold session)');
     }
 
+    // Grace window after a fresh session start: suppress soft context actions
+    // (warning + handoff) while the session is younger than HANDOFF_GRACE_MS. A
+    // just-started session cannot legitimately be at genuine overflow, so a high
+    // reading inside this window is a transient/stale spike (e.g. a fresh codex
+    // app-server thread briefly reporting prior prompt-cache tokens). Without this,
+    // such a spike fired an immediate handoff → cooperative hard-restart → fresh
+    // session, repeating every ~1-2min. The window is runtime-aware: codex-app-server
+    // and opencode can emit that spurious spike ~6-8min after boot (observed
+    // double-handoffs ~6-8min apart on a codex agent), so they get a 10min grace
+    // while all other runtimes keep 2min — see handoffGraceMs(). Hard API-overflow
+    // detection above is NOT gated by grace, so a genuine overflow is still caught
+    // immediately.
+    const HANDOFF_GRACE_MS = handoffGraceMs(this.agent.getConfig().runtime);
+    const withinHandoffGrace =
+      this.ctxSessionStartedAt > 0 && now - this.ctxSessionStartedAt < HANDOFF_GRACE_MS;
+
     // Tier 3: deadline exceeded — force restart if agent ignored handoff prompt
     if (this.ctxHandoffDeadlineAt > 0 && now > this.ctxHandoffDeadlineAt) {
       this.log(`Handoff deadline exceeded (${Math.round(effectivePct)}%) — force restarting`);
@@ -1165,7 +1208,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     }
 
     // Tier 1: warning — PTY injection only, no Telegram ping (context management is internal)
-    if (effectivePct >= warn && now - this.ctxWarningFiredAt > 15 * 60_000) {
+    if (effectivePct >= warn && !withinHandoffGrace && now - this.ctxWarningFiredAt > 15 * 60_000) {
       this.ctxWarningFiredAt = now;
       const pctRound = Math.round(effectivePct);
       const statusSuffix = effectivePct >= handoff ? 'Handoff in progress.' : `Handoff triggers at ${handoff}%.`;
@@ -1174,7 +1217,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     }
 
     // Tier 2: handoff (fires once per session lifecycle)
-    if (effectivePct >= handoff && this.ctxHandoffFiredAt === 0) {
+    if (effectivePct >= handoff && this.ctxHandoffFiredAt === 0 && !withinHandoffGrace) {
       const lease = requestContextHandoffLease({
         ctxRoot: this.paths.ctxRoot,
         agentName: this.agent.name,
