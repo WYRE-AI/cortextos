@@ -499,6 +499,34 @@ describe('AgentProcess — organic rate-limit exit exemption (task_1785180731919
     const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
     expect(String(logLine)).toMatch(/] RATE_LIMIT_RECOVERY:/);
   });
+
+  it('a stale PREVIOUS-lifecycle banner is excluded even when this lifecycle emits multibyte UTF-8 output (Codex P1 round 3)', async () => {
+    // Codex's round-3 finding: an earlier version of this fix computed the
+    // lifecycle-bound byte window separately, then did
+    // `recentOutput.slice(-window)` on the already-UTF8-decoded string. JS
+    // string indices are UTF-16 code units, not bytes — for multibyte
+    // output (astral-plane emoji here: 4 bytes UTF-8, a 2-unit surrogate
+    // pair in JS), a byte-count slice on the decoded string covers FEWER
+    // bytes than intended, so `slice(-window)` can read all the way back
+    // past this lifecycle's start and re-include a stale banner. This test
+    // is sized to trigger that exact failure mode under the old logic (the
+    // combined string's UTF-16 length is well under the 4096-byte window,
+    // so the old `slice(-4096)` would return the ENTIRE string, banner
+    // included) and proves the byte-precise tailStdoutLog() read doesn't.
+    seedPreExistingLog('API Error: rate_limit_error: from a previous lifecycle\n');
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start(); // stdoutLogSizeAtStart = the banner's exact byte length
+
+    const multibyteOutput = '😀'.repeat(2000); // 8000 bytes UTF-8, 4000 UTF-16 units
+    appendDuringLifecycle(multibyteOutput + '\nTypeError: unrelated failure\n');
+    capturedOnExit!(1, 0);
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(fsMocks.appendFileSync).toHaveBeenCalledTimes(1);
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(/] CRASH: exit_code=1 crash_count=1 backoff_s=5\b/);
+  });
 });
 
 describe('AgentProcess.sessionRefresh — cross-path restart-in-flight lock (2026-07-13, revised scope)', () => {

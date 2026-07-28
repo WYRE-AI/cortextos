@@ -526,15 +526,28 @@ export class AgentProcess {
    * (e.g. the image-poison API 400 pattern) so it can decide whether the
    * exit is a real crash or a recoverable upstream artifact.
    *
-   * Returns an empty string if the log doesn't exist or can't be read.
+   * `sinceByte` (default 0) is an optional lower bound on the read: the tail
+   * never starts before this byte offset, even if that means reading fewer
+   * than `maxBytes`. Used by the organic rate-limit exit check to bound the
+   * read to bytes THIS lifecycle wrote (stdoutLogSizeAtStart) — byte-precise
+   * on purpose (reads the exact range via Buffer, same as the rest of this
+   * method) rather than reading the full tail and then slicing the decoded
+   * string: JS string indices are UTF-16 code units, not bytes, so slicing a
+   * decoded string by a byte-count length can read further back than
+   * intended once the log contains multibyte UTF-8 output, silently
+   * defeating the lifecycle bound.
+   *
+   * Returns an empty string if the log doesn't exist, can't be read, or the
+   * bounded range is empty.
    */
-  private tailStdoutLog(maxBytes: number): string {
+  private tailStdoutLog(maxBytes: number, sinceByte: number = 0): string {
     const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
     try {
       if (!existsSync(logPath)) return '';
       const stats = statSync(logPath);
-      const start = Math.max(0, stats.size - maxBytes);
+      const start = Math.max(sinceByte, stats.size - maxBytes, 0);
       const len = stats.size - start;
+      if (len <= 0) return '';
       // Synchronous read of the tail; small and bounded so the cost is fine
       // even in the exit handler.
       const fd = require('fs').openSync(logPath, 'r');
@@ -764,8 +777,9 @@ export class AgentProcess {
     // max_crashes_per_day entirely, so this uses two independent, deliberately
     // NARROWER checks instead of reusing the shared predicate outright:
     //
-    // 1. Bounded to bytes THIS lifecycle actually wrote (stdoutLogSizeAtStart),
-    //    capped further at RATE_LIMIT_EXIT_TAIL_BYTES. stdout.log is
+    // 1. Read via tailStdoutLog(RATE_LIMIT_EXIT_TAIL_BYTES, stdoutLogSizeAtStart)
+    //    — a fresh, byte-precise read bounded on BOTH sides, not a slice of
+    //    the already-decoded `recentOutput` string. stdout.log is
     //    append-only across restarts — without the lifecycle bound, a fast
     //    repeat crash-loop (dies again before writing much new output) would
     //    keep matching the SAME stale banner from a previous lifecycle and
@@ -775,7 +789,13 @@ export class AgentProcess {
     //    would wrongly exempt that later, unrelated crash — image-poison
     //    doesn't have this problem because its signature IS what kills the
     //    process, always the last thing printed; a rate-limit banner has no
-    //    such guarantee.
+    //    such guarantee. A prior version of this fix computed the byte
+    //    window separately and did `recentOutput.slice(-window)` — broken,
+    //    because JS string indices are UTF-16 code units, not bytes, so a
+    //    byte-count slice on a decoded string can read further back than
+    //    intended once multibyte UTF-8 output is involved, silently
+    //    defeating the lifecycle bound. tailStdoutLog's own byte-range read
+    //    doesn't have this problem.
     // 2. hasRateLimitExitBanner() (below), not the shared hasRateLimitSignature().
     //    The shared predicate is tuned for live-alert paths and matches
     //    plain English phrases ("rate limit", "usage limit", "quota
@@ -784,16 +804,9 @@ export class AgentProcess {
     //    own signature list, this very comment). An agent whose recent work
     //    happens to discuss rate limits could otherwise get any unrelated
     //    crash silently exempted. This call site requires an actual
-    //    API-error-shaped token instead.
-    const bytesThisLifecycle = (() => {
-      try {
-        return Math.max(0, statSync(join(this.env.ctxRoot, 'logs', this.name, 'stdout.log')).size - this.stdoutLogSizeAtStart);
-      } catch {
-        return 0;
-      }
-    })();
-    const rateLimitWindow = Math.min(RATE_LIMIT_EXIT_TAIL_BYTES, bytesThisLifecycle);
-    const rateLimitTail = rateLimitWindow > 0 ? recentOutput.slice(-rateLimitWindow) : '';
+    //    API-error-shaped token, or Claude Code's own confirmed usage-limit
+    //    banner text, instead.
+    const rateLimitTail = this.tailStdoutLog(RATE_LIMIT_EXIT_TAIL_BYTES, this.stdoutLogSizeAtStart);
     if (this.hasRateLimitExitBanner(rateLimitTail)) {
       this.log('Organic rate-limit exit detected (429/rate-limit signature in recent output). Restarting without counting against max_crashes_per_day.');
       this.appendCrashToRestartsLog(exitCode, 5000, 'RATE_LIMIT_RECOVERY');
