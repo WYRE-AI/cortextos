@@ -288,6 +288,7 @@ describe('CronScheduler', () => {
     mockReadCrons.mockReturnValue([
       makeCron({
         schedule:      '24h',
+        created_at:    new Date(Date.now() - 48 * 3_600_000).toISOString(),
         last_fired_at: new Date(Date.now() - 25 * 3_600_000).toISOString(),
       }),
     ]);
@@ -465,8 +466,9 @@ describe('CronScheduler', () => {
     // Two crons so the post-removal state is legitimately non-empty (avoiding
     // the empty-result fallback bug in this assertion).
     const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+    const twentyMinAgo = new Date(Date.now() - 20 * 60_000).toISOString();
     mockReadCrons.mockReturnValue([
-      makeCron({ name: 'doomed', schedule: '10m', last_fired_at: tenMinAgo, fire_count: 1 }),
+      makeCron({ name: 'doomed', schedule: '10m', created_at: twentyMinAgo, last_fired_at: tenMinAgo, fire_count: 1 }),
       makeCron({ name: 'survivor', schedule: '24h', last_fired_at: new Date(Date.now() - 1_000).toISOString() }),
     ]);
 
@@ -566,9 +568,10 @@ describe('CronScheduler', () => {
     });
 
     // Start with a cron that fires immediately (catch-up)
+    const twentyMinAgo = new Date(Date.now() - 20 * 60_000).toISOString();
     const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
     mockReadCrons.mockReturnValue([
-      makeCron({ name: 'racy', schedule: '10m', last_fired_at: tenMinAgo, fire_count: 1 }),
+      makeCron({ name: 'racy', schedule: '10m', created_at: twentyMinAgo, last_fired_at: tenMinAgo, fire_count: 1 }),
     ]);
 
     raceScheduler.start();
@@ -581,7 +584,7 @@ describe('CronScheduler', () => {
     // crons.json's last_fired_at is still the stale 10-min-ago value
     // because the in-flight fire's persist hasn't run yet.
     mockReadCrons.mockReturnValue([
-      makeCron({ name: 'racy', schedule: '1m', last_fired_at: tenMinAgo, fire_count: 1 }),
+      makeCron({ name: 'racy', schedule: '1m', created_at: twentyMinAgo, last_fired_at: tenMinAgo, fire_count: 1 }),
     ]);
     raceScheduler.reload();
 
@@ -629,6 +632,7 @@ describe('CronScheduler', () => {
     let diskCron = makeCron({
       name: 'daily-job',
       schedule: '1h',
+      created_at: new Date(Date.now() - 5 * 24 * 3_600_000).toISOString(),
       last_fired_at: oneHourAgo,
       fire_count: 5,
     });
@@ -696,6 +700,7 @@ describe('CronScheduler', () => {
       makeCron({
         name:          'overdue',
         schedule:      '1h',
+        created_at:    new Date(Date.now() - 5 * 3_600_000).toISOString(),
         last_fired_at: twoHoursAgo,
         fire_count:    5,
       }),
@@ -725,6 +730,50 @@ describe('CronScheduler', () => {
     await vi.advanceTimersByTimeAsync(TICK);
 
     expect(fired.some(c => c.name === 'fresh')).toBe(false);
+  });
+
+  it('a NEVER-fired cron created N days ago (N > interval) catch-up fires on a fresh load, anchored on created_at — not silently reset to now+interval', async () => {
+    // Regression for the never-fired-cron restart race: without last_fired_at,
+    // last_fire_attempted_at, or a cron-state.json entry, referenceMs used to
+    // fall straight back to "now" on every fresh CronScheduler construction
+    // (i.e. every daemon restart, not just a live crons.json reload) — so a
+    // never-fired cron's nextFireAt perpetually reset to now+interval and
+    // could never fire if restarts kept landing just inside that window.
+    // created_at anchors referenceMs the same way last_fired_at already does
+    // for crons that HAVE fired, so this behaves like any other overdue cron:
+    // one catch-up fire, then resumes normal cadence.
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 3_600_000).toISOString();
+    mockReadCrons.mockReturnValue([
+      makeCron({
+        name:       'never-fired-long-interval',
+        schedule:   '3d', // 72h — longer than the daemon's ~71h auto-rotation cadence
+        created_at: fourDaysAgo,
+        // No last_fired_at / last_fire_attempted_at / fire_count — genuinely never fired.
+      }),
+    ]);
+
+    scheduler.start(); // isReload=false — the exact "fresh construction" path this fixes
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(fired.some(c => c.name === 'never-fired-long-interval')).toBe(true);
+  });
+
+  it('a NEVER-fired cron created recently (created_at < interval ago) does NOT catch-up fire — symmetric with the fired-cron case', async () => {
+    const oneHourAgo = new Date(Date.now() - 3_600_000).toISOString();
+    mockReadCrons.mockReturnValue([
+      makeCron({
+        name:       'never-fired-fresh',
+        schedule:   '1d',
+        created_at: oneHourAgo,
+      }),
+    ]);
+
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(fired.some(c => c.name === 'never-fired-fresh')).toBe(false);
   });
 
   // -------------------------------------------------------------------------
