@@ -354,6 +354,7 @@ describe('AD-3: Failure audit', () => {
     const pastMs = Date.now() - 2 * 60 * 60 * 1000; // 2 hours ago
     addCron(AGENT, {
       ...makeCron('fail-cron', '30m'),
+      created_at: new Date(pastMs - 60_000).toISOString(),
       last_fired_at: new Date(pastMs).toISOString(),
     });
 

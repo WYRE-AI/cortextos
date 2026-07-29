@@ -800,6 +800,7 @@ describe('Scenario 7: Concurrent scheduler ticks don\'t corrupt crons.json', () 
     // set to fire 25h ago so they all catch-up fire on the first tick.
     const agentsUnderTest = ['boris-conc', 'paul-conc', 'sentinel-conc'] as const;
     const pastFiredAt = new Date(Date.now() - 25 * ONE_HOUR).toISOString();
+    const beforePastFiredAt = new Date(Date.now() - 26 * ONE_HOUR).toISOString();
 
     for (const agentName of agentsUnderTest) {
       ensureAgentStateDir(agentName);
@@ -809,7 +810,7 @@ describe('Scenario 7: Concurrent scheduler ticks don\'t corrupt crons.json', () 
         prompt: `Concurrent fire test for ${agentName}`,
         schedule: '24h',
         enabled: true,
-        created_at: new Date().toISOString(),
+        created_at: beforePastFiredAt,
         last_fired_at: pastFiredAt,
       });
     }
@@ -866,6 +867,7 @@ describe('Scenario 7: Concurrent scheduler ticks don\'t corrupt crons.json', () 
   it('5 agents each with 3 crons firing at same simulated minute: no lost updates', async () => {
     // Every cron starts 25h overdue so all 15 catch-up fire on tick 1
     const pastFiredAt = new Date(Date.now() - 25 * ONE_HOUR).toISOString();
+    const beforePastFiredAt = new Date(Date.now() - 26 * ONE_HOUR).toISOString();
 
     const testAgents = ['conc-a', 'conc-b', 'conc-c', 'conc-d', 'conc-e'] as const;
     const cronNamesPerAgent = ['alpha', 'beta', 'gamma'];
@@ -878,7 +880,7 @@ describe('Scenario 7: Concurrent scheduler ticks don\'t corrupt crons.json', () 
           prompt: `Concurrent cron ${cronName} for ${agentName}`,
           schedule: '24h',
           enabled: true,
-          created_at: new Date().toISOString(),
+          created_at: beforePastFiredAt,
           last_fired_at: pastFiredAt,
         });
       }
