@@ -210,7 +210,7 @@ cortextos bus update-task <task_id> in_progress
 When you CANNOT do something yourself (needs payment, physical access, login, sudo):
 
 ```bash
-cortextos bus create-task "[HUMAN] <what needs to be done>" --desc "<instructions>" --project human-tasks
+cortextos bus create-task "[HUMAN] <what needs to be done>" --desc "<instructions>" --assignee human --project human-tasks
 cortextos bus update-task <your_task_id> blocked
 cortextos bus log-event task task_blocked info --meta '{"task_id":"<your_task_id>","blocked_by":"<human_task_id>","reason":"human dependency"}'
 cortextos bus send-message $CTX_ORCHESTRATOR_AGENT normal "Human task created: [HUMAN] <title> — needed before I can proceed with <your task>"
