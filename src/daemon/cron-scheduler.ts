@@ -384,13 +384,22 @@ export class CronScheduler {
       }
 
       // New or modified cron — compute fresh nextFireAt.
-      // Base: take the most recent of crons.json.last_fired_at,
+      // Base: take the most recent of crons.json.created_at, crons.json.last_fired_at,
       // crons.json.last_fire_attempted_at (set pre-onFire to detect crash
       // mid-fire — iter 11), and cron-state.json.last_fire (either may be
       // more current depending on which write path recorded the fire).
-      // Fall back to now.
+      // created_at is included so a cron that has NEVER fired anchors on when it
+      // was created rather than falling back to "now" on every fresh
+      // CronScheduler construction (every restart, not just a live reload) — a
+      // never-fired cron with no last_fired_at/last_fire_attempted_at/stateFire
+      // anchor would otherwise have its nextFireAt perpetually reset to
+      // now+interval on every restart, so an interval close to (or longer than)
+      // the ~71h auto-rotation cadence could structurally never fire. Falls back
+      // to now only if created_at itself is missing/unparseable.
       const stateFire = stateLastFireByName.get(def.name);
       const candidates: number[] = [];
+      const createdMs = new Date(def.created_at).getTime();
+      if (!isNaN(createdMs)) candidates.push(createdMs);
       if (def.last_fired_at) candidates.push(new Date(def.last_fired_at).getTime());
       if (def.last_fire_attempted_at) candidates.push(new Date(def.last_fire_attempted_at).getTime());
       if (stateFire) candidates.push(new Date(stateFire).getTime());
