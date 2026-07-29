@@ -1113,6 +1113,19 @@ export class AgentManager {
     try {
       console.log(`[agent-manager] Restarting ${name}`);
       await this.stopAgent(name);
+      // Reset context_status.json so the fresh FastChecker this creates (startAgent
+      // below) doesn't read the dying session's last-written, possibly still-high
+      // percentage and immediately re-fire a Tier-2 context handoff in a session that
+      // hasn't used any context yet. forceContextRestart (fast-checker.ts) already does
+      // this for its own Tier-3 path; this path — the cooperative `hard-restart` an
+      // agent calls itself after a handoff — had no equivalent, so a fresh FastChecker's
+      // class-default ctxHandoffFiredAt=0 would pass Tier-2's guard against stale data.
+      try {
+        writeFileSync(
+          join(stateDir, 'context_status.json'),
+          JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }),
+        );
+      } catch { /* non-fatal */ }
       await this.startAgent(name, '');
       console.log(`[agent-manager] Restart complete for ${name}`);
     } finally {
@@ -1295,11 +1308,13 @@ export class AgentManager {
    * Inject text into an agent's PTY with structured outcome — issue #346.
    *
    * Returns NOT_FOUND if the agent isn't in the registry, NOT_RUNNING if
-   * registered but the PTY is gone, DEDUPED on a MessageDedup hash hit. The
+   * registered but the PTY is gone, DEDUPED on a MessageDedup hash hit,
+   * RESTARTING if a restart is in flight (silent-drop fix — see
+   * injectMessageDetailed's docblock in agent-process.ts). The
    * boolean-returning `injectAgent()` is preserved for callers (cron
    * scheduler, fast-checker, fire-cron) that only need pass/fail.
    */
-  injectAgentDetailed(agentName: string, text: string): { ok: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+  injectAgentDetailed(agentName: string, text: string): { ok: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING' | 'DEDUPED' | 'RESTARTING'; message: string } {
     const entry = this.agents.get(agentName);
     if (!entry) {
       return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };

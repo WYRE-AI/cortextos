@@ -11,7 +11,7 @@ import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
-import { tryAcquireRestartLock, releaseRestartLock } from './restart-lock.js';
+import { tryAcquireRestartLock, releaseRestartLock, isRestartInFlight } from './restart-lock.js';
 
 type LogFn = (msg: string) => void;
 
@@ -380,13 +380,36 @@ export class AgentProcess {
    * Inject a message into the agent's PTY — structured outcome.
    *
    * Distinguishes NOT_RUNNING (agent registered but no live PTY) from
-   * DEDUPED (content collapsed against the in-process MessageDedup window).
-   * See issue #346 — both used to surface as a bare `false` and got mistaken
-   * for "agent not found" by operators investigating restart/cron failures.
+   * DEDUPED (content collapsed against the in-process MessageDedup window)
+   * from RESTARTING (a restart is in flight — see below).
+   * See issue #346 — the first two used to surface as a bare `false` and
+   * got mistaken for "agent not found" by operators investigating
+   * restart/cron failures.
+   *
+   * RESTARTING check (silent-message-drop fix): `this.status === 'running'`
+   * is true for the entire window between a restart being DECIDED
+   * (sessionRefresh acquiring the restart-in-flight lock) and the PTY
+   * actually tearing down inside stop() — status only flips off 'running'
+   * partway through that teardown. A caller (fast-checker.ts's pollCycle)
+   * that sees `ok: true` here ACKs the message as delivered — moving it
+   * inbox -> inflight -> processed permanently — even though the bytes
+   * just written may land in a PTY that's about to die with nothing left
+   * to ever read them. That's genuine silent loss, not just a delay: the
+   * message never stays in inflight/ long enough for the 5-minute
+   * stale-inflight sweep to notice and redeliver it. Checking
+   * isRestartInFlight() here closes that window: fast-checker sees a
+   * failed injection (this new RESTARTING code, not NOT_RUNNING) and does
+   * NOT ack, so the message stays safely in inflight/ and gets swept back
+   * to the new session once the restart completes.
    */
-  injectMessageDetailed(content: string): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+  injectMessageDetailed(content: string): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED' | 'RESTARTING'; message: string } {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
+    }
+
+    const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
+    if (isRestartInFlight(paths.stateDir)) {
+      return { ok: false, code: 'RESTARTING', message: `agent "${this.name}" has a restart in flight — injection deferred to avoid a silent drop` };
     }
 
     if (this.dedup.isDuplicate(content)) {
