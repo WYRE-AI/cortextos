@@ -821,3 +821,54 @@ describe('AgentProcess — CrashLoopPauser (instar-inspired sliding window)', ()
     expect(ap.getStatus().status).not.toBe('halted');
   });
 });
+
+describe('AgentProcess.injectMessageDetailed — RESTARTING code (bus-message silent-drop race fix)', () => {
+  it('returns RESTARTING (not NOT_RUNNING, and does not write to the PTY) when a restart lock is held for this agent, even though status is still "running"', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    expect(ap.getStatus().status).toBe('running');
+
+    // Simulate the exact race this fix closes: sessionRefresh() has acquired the
+    // restart-in-flight lock but stop()'s PTY teardown hasn't run yet — status is
+    // still 'running' and this.pty is still set, so the pre-existing NOT_RUNNING
+    // check alone would not catch this window.
+    fsMocks.readFileSync.mockImplementation((path: unknown) => {
+      if (String(path).endsWith('.restart-in-flight')) {
+        return JSON.stringify({ source: 'hang-detector', at: Date.now() - 5_000 }); // fresh
+      }
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    const result = ap.injectMessageDetailed('hello');
+
+    expect(result).toEqual({
+      ok: false,
+      code: 'RESTARTING',
+      message: expect.stringContaining('restart in flight'),
+    });
+    expect(mockPty.write).not.toHaveBeenCalled();
+  });
+
+  it('returns ok:true and writes to the PTY when no restart lock is held', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    fsMocks.readFileSync.mockImplementation(() => {
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); // no lock file
+    });
+
+    const result = ap.injectMessageDetailed('hello');
+
+    expect(result).toEqual({ ok: true });
+  });
+
+  it('still returns NOT_RUNNING when the agent is not running, regardless of lock state', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    // Never started — this.pty is unset, this.status is not 'running'.
+
+    const result = ap.injectMessageDetailed('hello');
+
+    expect(result.ok).toBe(false);
+    expect((result as { code: string }).code).toBe('NOT_RUNNING');
+  });
+});

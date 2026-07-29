@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { tryAcquireRestartLock, releaseRestartLock } from '../../../src/daemon/restart-lock.js';
+import { tryAcquireRestartLock, releaseRestartLock, isRestartInFlight } from '../../../src/daemon/restart-lock.js';
 
 describe('restart-lock — cross-path restart-in-flight guard', () => {
   let stateDir: string;
@@ -98,5 +98,44 @@ describe('restart-lock — cross-path restart-in-flight guard', () => {
     // The concurrent writer's lock must be untouched — proves no blind overwrite happened.
     const data = JSON.parse(readFileSync(join(stateDir, '.restart-in-flight'), 'utf-8'));
     expect(data.source).toBe('concurrent-writer');
+  });
+});
+
+describe('isRestartInFlight — read-only peek used by injectMessageDetailed', () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'restart-lock-peek-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it('returns false when no lock file exists', () => {
+    expect(isRestartInFlight(stateDir)).toBe(false);
+  });
+
+  it('returns true for a fresh lock', () => {
+    tryAcquireRestartLock(stateDir, 'hang-detector');
+    expect(isRestartInFlight(stateDir)).toBe(true);
+  });
+
+  it('returns false for a stale lock (older than the staleness threshold)', () => {
+    const staleAt = Date.now() - 5 * 60_000; // 5min old
+    writeFileSync(join(stateDir, '.restart-in-flight'), JSON.stringify({ source: 'hang-detector', at: staleAt }), 'utf-8');
+    expect(isRestartInFlight(stateDir)).toBe(false);
+  });
+
+  it('returns false (fail-open) for a malformed/corrupt lock file', () => {
+    writeFileSync(join(stateDir, '.restart-in-flight'), 'not valid json{{{', 'utf-8');
+    expect(isRestartInFlight(stateDir)).toBe(false);
+  });
+
+  it('does not mutate or remove the lock file — a peek is non-destructive', () => {
+    tryAcquireRestartLock(stateDir, 'hang-detector');
+    isRestartInFlight(stateDir);
+    const data = JSON.parse(readFileSync(join(stateDir, '.restart-in-flight'), 'utf-8'));
+    expect(data.source).toBe('hang-detector');
   });
 });

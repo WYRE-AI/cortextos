@@ -775,7 +775,7 @@ export interface IPCResponse {
    * "agent does not exist" (NOT_FOUND) from "request collapsed against an
    * in-flight identical op" (DEDUPED). See issue #346.
    */
-  code?: 'NOT_FOUND' | 'DEDUPED' | 'INVALID_INPUT' | 'NOT_RUNNING';
+  code?: 'NOT_FOUND' | 'DEDUPED' | 'INVALID_INPUT' | 'NOT_RUNNING' | 'RESTARTING';
 }
 
 // Agent Discovery Types
