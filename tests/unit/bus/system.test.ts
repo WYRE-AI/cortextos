@@ -237,6 +237,47 @@ describe('Bus System', () => {
       expect(report.agents[0].stale).toBe(true);
     });
 
+    // goals.json actually writes the timestamp with a trailing "(by <agent>)"
+    // attribution suffix (e.g. "2026-07-28T12:03:06Z (by boss)") — Date()
+    // returns Invalid Date for that whole string, which previously fell
+    // through to 'parse_error'/stale=true fleet-wide even for goals updated
+    // minutes ago. Pins the fix: the suffix must be stripped before parsing.
+    it('parses a timestamp with the "(by <agent>)" attribution suffix goals.json writes (fresh)', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const recentDate = new Date().toISOString();
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${recentDate} (by boss)\n\nSome goal`);
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('fresh');
+      expect(report.agents[0].stale).toBe(false);
+    });
+
+    it('parses a timestamp with the "(by <agent>)" attribution suffix goals.json writes (stale)', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const oldDate = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${oldDate} (by boss)\n\nSome goal`);
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('stale');
+      expect(report.agents[0].stale).toBe(true);
+    });
+
+    it('still parses a bare ISO timestamp with no attribution suffix (no regression)', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const recentDate = new Date().toISOString();
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${recentDate}\n\nSome goal`);
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('fresh');
+      expect(report.agents[0].stale).toBe(false);
+    });
+
     it('returns empty report when no orgs directory', () => {
       const report = checkGoalStaleness(testDir);
       expect(report.summary.total).toBe(0);
