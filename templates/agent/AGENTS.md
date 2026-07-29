@@ -176,7 +176,7 @@ When you CANNOT do something yourself (needs payment, physical access, login, su
 
 ```bash
 # Create the human task with clear step-by-step instructions
-cortextos bus create-task "[HUMAN] <what needs to be done>" --desc "<instructions>" --project human-tasks
+cortextos bus create-task "[HUMAN] <what needs to be done>" --desc "<instructions>" --assignee human --project human-tasks
 
 # Block your own task pointing to it
 cortextos bus update-task <your_task_id> blocked

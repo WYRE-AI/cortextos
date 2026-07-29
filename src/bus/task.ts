@@ -854,7 +854,7 @@ export function checkHumanTasks(paths: BusPaths): Task[] {
 
   for (const task of tasks) {
     if (task.status === 'completed' || task.status === 'cancelled') continue;
-    if (task.assigned_to !== 'human' && task.assigned_to !== 'user') continue;
+    if (!['human', 'user'].includes(task.assigned_to ?? '') && task.project !== 'human-tasks') continue;
 
     const createdEpoch = Math.floor(new Date(task.created_at).getTime() / 1000);
     const age = nowEpoch - createdEpoch;
