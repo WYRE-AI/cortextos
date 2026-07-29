@@ -255,5 +255,26 @@ describe('Advanced Task Management', () => {
       const ids = humanTasks.map(t => t.id).sort();
       expect(ids).toEqual(['task_020_020', 'task_021_021']);
     });
+
+    it('finds project:human-tasks tasks assigned to the filing agent (not just assigned_to human/user) — matches checkStaleTasks OR-logic', () => {
+      // AGENTS.md's documented create-task pattern for human tasks
+      // (`create-task "[HUMAN] ..." --project human-tasks`) defaults assigned_to
+      // to the filing agent unless --assignee is explicitly overridden. A stale
+      // human task filed this way must still surface here, the same as it
+      // already does in checkStaleTasks' stale_human bucket.
+      createBackdatedTask(paths, {
+        id: 'task_024_024',
+        title: '[HUMAN] rotate compromised API key',
+        status: 'pending',
+        assigned_to: 'agent1', // filed by the agent itself, not "human"/"user"
+        project: 'human-tasks',
+        created_at: hoursAgo(25),
+        updated_at: hoursAgo(25),
+      });
+
+      const humanTasks = checkHumanTasks(paths);
+      const ids = humanTasks.map(t => t.id);
+      expect(ids).toContain('task_024_024');
+    });
   });
 });
