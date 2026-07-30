@@ -354,4 +354,45 @@ describe('wrapFenceSafe (dynamic-fence body wrapper)', () => {
     const out = wrapFenceSafe('a\x1b[31mb\x00c');
     expect(out).toBe('```\nabc\n```');
   });
+
+  describe('size cap (MAX_FENCED_BODY_BYTES tail-truncation)', () => {
+    it('leaves bodies at or under the cap byte-exact', () => {
+      const body = 'x'.repeat(16 * 1024);
+      const out = wrapFenceSafe(body);
+      expect(out).toContain(body);
+      expect(out).not.toContain('truncated by cortextos');
+    });
+
+    it('tail-truncates oversized bodies, keeping the head and naming the original size', () => {
+      const body = 'HEAD-MARKER ' + 'x'.repeat(20 * 1024) + ' TAIL-MARKER';
+      const out = wrapFenceSafe(body);
+      expect(out).toContain('HEAD-MARKER');
+      expect(out).not.toContain('TAIL-MARKER');
+      expect(out).toContain(`of ${Buffer.byteLength(body, 'utf-8')} bytes]`);
+      expect(out).toContain('[message truncated by cortextos: showing first ');
+    });
+
+    it('never splits a multibyte character at the cut', () => {
+      // 4-byte emoji repeated across the boundary: the cut must land on a
+      // character start, so the decoded output contains no U+FFFD.
+      const body = '🚀'.repeat(5000); // 20,000 bytes
+      const out = wrapFenceSafe(body);
+      expect(out).not.toContain('�');
+      expect(out).toContain('truncated by cortextos');
+    });
+
+    it('sizes the fence from the truncated body so it stays unescapable', () => {
+      // Longest backtick run sits in the KEPT head — wrapper must still exceed it.
+      const body = '`````\n' + 'x'.repeat(20 * 1024);
+      const out = wrapFenceSafe(body);
+      expect(openFence(out).length).toBe(6);
+    });
+
+    it('honors an explicit maxBytes override', () => {
+      const out = wrapFenceSafe('abcdefghij', 4);
+      expect(out).toContain('abcd');
+      expect(out).not.toContain('abcde');
+      expect(out).toContain('showing first 4 of 10 bytes');
+    });
+  });
 });

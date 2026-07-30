@@ -128,9 +128,31 @@ export function stripControlChars(input: string): string {
  *
  * Use for the FENCED body of an injection block (inbox text, Telegram text).
  * For unfenced context fields use sanitizeForPtyInjection instead.
+ *
+ * Bodies are additionally capped at MAX_FENCED_BODY_BYTES (tail-truncated,
+ * UTF-8-safe, with an in-fence marker naming the original size). Every fenced
+ * injection path — inbox messages, Telegram/Slack text, media captions, voice
+ * transcripts, the urgent signal — flows through here, and none of them had a
+ * size limit: one oversized `--body-file` send could eat most of the
+ * recipient's context window in a single 5s poll cycle. The cap is generous
+ * (~4k tokens) so real traffic, including pasted code blocks, passes
+ * untouched; only pathological payloads are trimmed. Head is kept over tail
+ * because a bus message leads with its intent and trails with pasted bulk.
  */
-export function wrapFenceSafe(input: string): string {
-  const body = stripControlChars(input);
+export const MAX_FENCED_BODY_BYTES = 16 * 1024;
+
+export function wrapFenceSafe(input: string, maxBytes: number = MAX_FENCED_BODY_BYTES): string {
+  let body = stripControlChars(input);
+  const totalBytes = Buffer.byteLength(body, 'utf-8');
+  if (totalBytes > maxBytes) {
+    const buf = Buffer.from(body, 'utf-8');
+    // Back off any trailing UTF-8 continuation bytes so the cut never splits
+    // a multibyte character (a split would decode as U+FFFD at the edge).
+    let end = maxBytes;
+    while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+    body = buf.toString('utf-8', 0, end)
+      + `\n[message truncated by cortextos: showing first ${end} of ${totalBytes} bytes]`;
+  }
   let longest = 0;
   const runs = body.match(/`+/g);
   if (runs) for (const r of runs) longest = Math.max(longest, r.length);

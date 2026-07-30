@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Fixed — fenced injection bodies capped at 16KB (tail-truncated)
+
+Every fenced PTY-injection path — inbox message bodies, Telegram/Slack text,
+media captions, voice transcripts, the urgent signal — flows through
+`wrapFenceSafe`, and none of them had a size limit: one oversized
+`--body-file` bus send could eat most of the recipient's context window in a
+single poll cycle. `wrapFenceSafe` now tail-truncates bodies over
+`MAX_FENCED_BODY_BYTES` (16 KB, ~4k tokens — generous enough that real
+traffic including pasted code blocks passes byte-exact) at a UTF-8-safe
+boundary, appending an in-fence marker naming the original size. Fence
+sizing still runs on the final body, so the unescapable-wrapper property is
+preserved. Unit tests cover the boundary, multibyte safety, fence sizing on
+truncated content, and the override parameter.
+
 ### Changed — merged upstream `grandamenium/cortextos` main (2026-07-27)
 
 Second upstream sync since the fork (247 upstream commits; upstream had
