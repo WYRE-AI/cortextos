@@ -32,3 +32,23 @@ npm test
 - No external runtime dependencies beyond what's in `package.json`
 - File operations use atomic writes (see `src/utils/atomic.ts`)
 - All bus operations go through `src/bus/` modules
+
+## Learnings - 2026-07-28
+
+- Upstream (grandamenium/cortextos) rewrote its published history for the
+  SEC-1 operator-metadata purge, so this fork's merge-base is pinned at the
+  initial release forever. Every upstream sync re-conflicts on shared files,
+  mostly "echo conflicts" (identical cherry-picked changes under different
+  SHAs). Scope syncs with `git merge-tree --write-tree` first, and after
+  resolving, grep for silently double-applied blocks outside conflict
+  markers — `tsc` caught duplicated methods in agent-manager.ts and
+  agent-pty.ts during the 2026-07-27 sync (merge 975a1e8c).
+- `.gitignore` blanket-ignores `docs/` (upstream SEC-1 posture). Curated
+  docs are deliberately force-added past it (`git add -f`), matching the
+  existing tracked runbooks. Run `.github/scripts/leak-guard.sh <files>` on
+  anything force-added; the `--tree HEAD` form is slow (minutes).
+- Known environment-flaky tests on the primary dev Mac (fail under load at
+  ANY commit, verified at pre-merge HEAD in a clean worktree): the four
+  fast-checker "heartbeat watchdog" fake-timer tests, phase4-performance p95
+  assertions, and phase5-performance SC-2. They pass on a quiet machine —
+  not regressions.
