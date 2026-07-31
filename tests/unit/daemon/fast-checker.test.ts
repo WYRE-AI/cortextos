@@ -966,6 +966,40 @@ describe('FastChecker', () => {
     });
   });
 
+  describe('checkHangStatus — triple-source liveness wiring (class-3 fix: PreToolUse activity-beat)', () => {
+    const GRACE_EXCEEDED_ISO = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+
+    it('does NOT restart (long-single-turn false-positive): no session-heartbeat AND no idle-flag since restart, but last_activity.flag proves a mid-turn tool call', () => {
+      writeFileSync(join(paths.stateDir, '.restart-time'), GRACE_EXCEEDED_ISO + '\n', 'utf-8');
+      // No heartbeat.json, no last_idle.flag — the turn that started right after
+      // restart is still running (a build / full test suite / long research pass),
+      // so the Stop hook hasn't fired yet either. Only the mid-turn PreToolUse beat
+      // proves the session is alive.
+      const activityBeatSeconds = Math.floor((Date.now() - 18 * 60 * 1000) / 1000);
+      writeFileSync(join(paths.stateDir, 'last_activity.flag'), String(activityBeatSeconds), 'utf-8');
+      const agent = createMockAgent('test-agent');
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      (checker as any).checkHangStatus();
+
+      expect(existsSync(join(paths.stateDir, '.force-fresh'))).toBe(false);
+      expect(agent.sessionRefresh).not.toHaveBeenCalled();
+    });
+
+    it('still force-fresh-restarts when last_activity.flag is ALSO stale/absent (genuine hang, no activity proof at all)', () => {
+      writeFileSync(join(paths.stateDir, '.restart-time'), GRACE_EXCEEDED_ISO + '\n', 'utf-8');
+      // No heartbeat.json, no last_idle.flag, no last_activity.flag — nothing proves
+      // this session ever did anything since the restart.
+      const agent = createMockAgent('test-agent');
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      (checker as any).checkHangStatus();
+
+      expect(existsSync(join(paths.stateDir, '.force-fresh'))).toBe(true);
+      expect(agent.sessionRefresh).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('checkHangStatus — storm-cannot-self-perpetuate (persisted hangLastRestartAt survives fresh-session construction)', () => {
     const GRACE_EXCEEDED_ISO = new Date(Date.now() - 20 * 60 * 1000).toISOString();
 

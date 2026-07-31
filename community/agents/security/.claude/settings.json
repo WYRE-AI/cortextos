@@ -42,6 +42,15 @@
         ]
       },
       {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cortextos bus hook-activity-beat",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "AskUserQuestion",
         "hooks": [
           {

@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Fixed — hang-detector class 3: PreToolUse activity beat as a third liveness source
+
+The Stop hook (`last_idle.flag`) only writes on turn COMPLETION, so a single
+work turn longer than the hang-detector's 15min grace window — a build, a
+full test suite, a long research pass — that spans a delivered cron fire
+read as beatless for the turn's entire duration, even though the session was
+actively working throughout. A healthy agent doing exactly that could
+force-fresh-restart mid-work.
+
+- **`src/hooks/hook-activity-beat.ts`** (new): PreToolUse hook, writes
+  `state/<agent>/last_activity.flag` on EVERY tool call — mid-turn, unlike
+  the Stop hook. Same minimal, fail-safe shape as `hook-idle-flag.ts`.
+- **`src/daemon/hang-detector.ts`**: `maxBeat` generalized from two inputs to
+  N; `evaluateHang`, `evaluateBootstrapHang`, and `hasBeatSinceRestart` now
+  take an optional third source, `lastActivityBeatAt`, combined the same way
+  `lastIdleFlagAt` was added in the 2026-07-13 dual-source fix.
+- **`src/daemon/fast-checker.ts`**: `checkHangStatus()` reads
+  `last_activity.flag` alongside the existing two sources and threads it
+  through both hang evaluators and the restart-loop-counter reset check.
+- **`src/cli/bus.ts`** / **`tsup.config.ts`**: wired `hook-activity-beat` as
+  a CLI subcommand and build entry point (the exact miss that caused
+  `hook-idle-flag` to ship silently-inert once before — see that commit).
+- Registered in the `PreToolUse` hook array of every `.claude/settings.json`
+  template (`templates/{agent,analyst,orchestrator}`,
+  `community/agents/{security,research-agent}`) — applies to newly created
+  agents. **Not** propagated to already-live agents' gitignored
+  `orgs/*/agents/*/.claude/settings.json` copies — that's a fleet-wide
+  runtime-behavior rollout decision left for a deliberate follow-up, not a
+  silent side effect of this fix.
+- Tests: `tests/unit/daemon/hang-detector.test.ts` (triple-source cases for
+  both `evaluateHang` and `evaluateBootstrapHang`, plus `hasBeatSinceRestart`)
+  and `tests/unit/daemon/fast-checker.test.ts` (`checkHangStatus` integration
+  coverage mirroring the existing dual-source wiring tests).
+
 ### Fixed — `bus complete-task` / `update-task` uncaught-exception crash
 
 An agent hit this live: `cortextos bus complete-task <id> --result "..."`
