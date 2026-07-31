@@ -2510,6 +2510,11 @@ busCommand
   .description('PreToolUse hook: detects and blocks repeated tool loops (same-args repetition + ping-pong alternation)')
   .action(() => runHook('hook-loop-detector'));
 
+busCommand
+  .command('hook-activity-beat')
+  .description('PreToolUse hook: writes last_activity.flag on every tool call — mid-turn liveness proof for hang-detector class 3')
+  .action(() => runHook('hook-activity-beat'));
+
 // --- OAuth token rotation commands ---
 
 busCommand

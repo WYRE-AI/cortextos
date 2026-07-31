@@ -91,6 +91,57 @@ describe('hang-detector — evaluateHang dual-source liveness (last_idle.flag as
   });
 });
 
+describe('hang-detector — evaluateHang triple-source liveness (last_activity.flag as a third, mid-turn beat source)', () => {
+  it('does NOT false-positive: a long single turn spanning the fire, with only a mid-turn activity-beat as proof', () => {
+    // The class-3 scenario: neither session-heartbeat nor idle-flag (Stop hook,
+    // turn-completion-only) has advanced because the turn hasn't finished yet —
+    // but a PreToolUse activity-beat landed mid-turn, after the fire.
+    const T = NOW - 20 * MIN;   // fire delivered 20min ago
+    const S = T - 30 * MIN;     // session-heartbeat stale, predates the fire
+    const idle = T - 10 * MIN;  // idle-flag ALSO predates the fire — turn still running
+    const activity = T + 5 * MIN; // but a tool call landed after the fire, mid-turn
+    const r = evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: T, lastSessionHeartbeat: S, lastIdleFlagAt: idle, lastActivityBeatAt: activity });
+    expect(r.hung).toBe(false);
+  });
+
+  it('still FIRES on a real hang when NONE of the three sources advanced since the fire', () => {
+    const T = NOW - 20 * MIN;
+    const S = T - 5 * MIN;
+    const idle = T - 2 * MIN;
+    const activity = T - 1 * MIN;
+    const r = evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: T, lastSessionHeartbeat: S, lastIdleFlagAt: idle, lastActivityBeatAt: activity });
+    expect(r.hung).toBe(true);
+  });
+
+  it('fail-safe unchanged: all three sources absent (no baseline yet — deploy-transition) does NOT fire', () => {
+    const T = NOW - 20 * MIN;
+    const r = evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: T, lastSessionHeartbeat: null, lastIdleFlagAt: null, lastActivityBeatAt: null });
+    expect(r.hung).toBe(false);
+    expect(r.reason).toMatch(/deploy-transition|fail-safe/);
+  });
+
+  it('omitting lastActivityBeatAt entirely behaves like the pre-class-3-fix dual-source check', () => {
+    const T = NOW - 20 * MIN;
+    const S = T - 30 * MIN;
+    const idle = T - 10 * MIN;
+    const r = evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: T, lastSessionHeartbeat: S, lastIdleFlagAt: idle });
+    expect(r.hung).toBe(true);
+  });
+
+  it('does NOT fire when activity-beat alone establishes the baseline (both other sources null)', () => {
+    const T = NOW - 20 * MIN;
+    const activity = T + 3 * MIN;
+    const r = evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: T, lastSessionHeartbeat: null, lastIdleFlagAt: null, lastActivityBeatAt: activity });
+    expect(r.hung).toBe(false);
+  });
+
+  it('boundary: activity-beat exactly at fire time (S == T) is healthy', () => {
+    const T = NOW - 20 * MIN;
+    const r = evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: T, lastSessionHeartbeat: null, lastIdleFlagAt: null, lastActivityBeatAt: T });
+    expect(r.hung).toBe(false);
+  });
+});
+
 describe('hang-detector — evaluateBootstrapHang (#19b: restart is an expected-beat anchor too)', () => {
   it('FIRES on a bootstrap hang: restart past grace, no session beat ever', () => {
     const R = NOW - 20 * MIN; // restarted 20min ago (> 15min grace)
@@ -145,6 +196,21 @@ describe('hang-detector — evaluateBootstrapHang (#19b: restart is an expected-
     const R = NOW - 20 * MIN;
     const idle = R - 30 * MIN; // stale idle-flag from a PRIOR session, before this restart
     const r = evaluateBootstrapHang({ now: NOW, graceMs: GRACE, restartAt: R, lastSessionHeartbeat: null, lastIdleFlagAt: idle });
+    expect(r.hung).toBe(true);
+  });
+
+  it('triple-source (class-3): does NOT fire when only a mid-turn activity-beat landed after the restart (long first turn, no Stop hook yet)', () => {
+    const R = NOW - 20 * MIN;
+    const activity = R + 4 * MIN; // a tool call fired mid-turn, after the restart
+    const r = evaluateBootstrapHang({ now: NOW, graceMs: GRACE, restartAt: R, lastSessionHeartbeat: null, lastIdleFlagAt: null, lastActivityBeatAt: activity });
+    expect(r.hung).toBe(false);
+  });
+
+  it('triple-source: still FIRES when all three sources predate the restart (genuine bootstrap hang)', () => {
+    const R = NOW - 20 * MIN;
+    const idle = R - 30 * MIN;
+    const activity = R - 25 * MIN;
+    const r = evaluateBootstrapHang({ now: NOW, graceMs: GRACE, restartAt: R, lastSessionHeartbeat: null, lastIdleFlagAt: idle, lastActivityBeatAt: activity });
     expect(r.hung).toBe(true);
   });
 });
@@ -206,5 +272,15 @@ describe('hang-detector — hasBeatSinceRestart (restart-loop-counter reset sign
 
   it('FALSE: restart-time itself is unknown (fail-safe — never claims recovery on an unknown anchor)', () => {
     expect(hasBeatSinceRestart(null, NOW, NOW)).toBe(false);
+  });
+
+  it('TRUE: only last_activity.flag (no session-heartbeat, no idle-flag) landed at/after the restart', () => {
+    const R = NOW - 20 * MIN;
+    expect(hasBeatSinceRestart(R, null, null, R + MIN)).toBe(true);
+  });
+
+  it('FALSE: all three beats predate the restart', () => {
+    const R = NOW - 20 * MIN;
+    expect(hasBeatSinceRestart(R, R - 5 * MIN, R - 3 * MIN, R - MIN)).toBe(false);
   });
 });
