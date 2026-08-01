@@ -1469,7 +1469,21 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     } catch { return; }
 
-    const fireVerdict = evaluateHang({ now, graceMs: 15 * 60_000, deliveredFireAt, lastSessionHeartbeat, lastIdleFlagAt });
+    // Class-3 fix: last_activity.flag is written by the PreToolUse hook on EVERY
+    // tool call, mid-turn — unlike last_idle.flag, which only advances when a turn
+    // COMPLETES. Without this, a single work turn longer than the grace window
+    // (a build, a full test suite) spanning a delivered fire reads as beatless for
+    // the turn's entire duration. See hang-detector.ts's triple-source doc comment.
+    let lastActivityBeatAt: number | null = null;
+    try {
+      const activityPath = join(this.paths.stateDir, 'last_activity.flag');
+      if (existsSync(activityPath)) {
+        const t = parseInt(readFileSync(activityPath, 'utf-8').trim(), 10) * 1000;
+        lastActivityBeatAt = Number.isFinite(t) ? t : null;
+      }
+    } catch { return; }
+
+    const fireVerdict = evaluateHang({ now, graceMs: 15 * 60_000, deliveredFireAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt });
     if (fireVerdict.hung) {
       if (this.hangSuppressedByLimit()) return;
       this.log(`Hang detected for ${this.agent.name}: ${fireVerdict.reason}`);
@@ -1490,14 +1504,14 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     } catch { return; }
 
-    const bootVerdict = evaluateBootstrapHang({ now, graceMs: 15 * 60_000, restartAt, lastSessionHeartbeat, lastIdleFlagAt });
+    const bootVerdict = evaluateBootstrapHang({ now, graceMs: 15 * 60_000, restartAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt });
 
     // Confirmed recovery: a genuine beat landed at/after this restart, so the loop
     // actually broke — reset the halt counter. Gated on hasBeatSinceRestart (not on
     // bootVerdict.hung being merely false) because "not hung this tick" also covers
     // fail-safe cases (unknown restart-time, still within grace) that say nothing
     // about whether a beat has actually occurred yet.
-    if (hasBeatSinceRestart(restartAt, lastSessionHeartbeat, lastIdleFlagAt) && this.consecutiveHangRestartsWithoutBeat > 0) {
+    if (hasBeatSinceRestart(restartAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt) && this.consecutiveHangRestartsWithoutBeat > 0) {
       this.consecutiveHangRestartsWithoutBeat = 0;
       this.saveHangCircuit();
       this.log(`Hang-restart loop counter reset for ${this.agent.name} — genuine beat confirmed since last restart`);

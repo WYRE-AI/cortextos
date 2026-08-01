@@ -22,6 +22,14 @@
 // baseline). last_idle.flag closes this: it can't lie about real turn-processing the
 // way an unfired heartbeat-cron can look like silence.
 //
+// TRIPLE-SOURCE (class-3 fix): last_idle.flag itself only writes on turn COMPLETION
+// (the Stop hook). A single work turn longer than the grace window — a build, a full
+// test suite, a long research pass — that spans a delivered cron fire is beatless on
+// BOTH prior sources for the turn's entire duration, even though the session is
+// actively working throughout. last_activity.flag (the PreToolUse hook, written on
+// EVERY tool call, mid-turn) closes this: it's proof of liveness that doesn't wait
+// for the turn to end.
+//
 // GOVERNING PRINCIPLE — FAIL SAFE TOWARD NOT-RESTARTING: a missed hang is cheap (the
 // next delivered fire re-catches it); a false restart disrupts a healthy agent and, at
 // fleet scale, is itself a mini-storm. So on ANY uncertainty — absent last_session
@@ -55,15 +63,26 @@ export interface HangEvalInput {
    * behavior for any caller that hasn't wired the new read yet.
    */
   lastIdleFlagAt?: number | null;
+  /**
+   * Class-3 fix: mtime-equivalent of `state/<agent>/last_activity.flag` (ms), or
+   * null/absent if never written. Written by the PreToolUse hook on EVERY tool
+   * call — unlike `lastIdleFlagAt`, which only advances when a turn COMPLETES.
+   * Without this, a single long work turn (build, full test suite, long research
+   * pass) spanning a delivered fire reads as beatless for the turn's whole
+   * duration. Optional (omit entirely) to preserve pre-fix behavior for any
+   * caller that hasn't wired the new read yet.
+   */
+  lastActivityBeatAt?: number | null;
 }
 
-/** The more recent of two beat timestamps, ignoring nulls/undefined; null if both absent. */
-function maxBeat(a: number | null | undefined, b: number | null | undefined): number | null {
-  const av = a ?? null;
-  const bv = b ?? null;
-  if (av === null) return bv;
-  if (bv === null) return av;
-  return Math.max(av, bv);
+/** The most recent of N beat timestamps, ignoring nulls/undefined; null if all absent. */
+function maxBeat(...beats: Array<number | null | undefined>): number | null {
+  let max: number | null = null;
+  for (const b of beats) {
+    if (b === null || b === undefined) continue;
+    if (max === null || b > max) max = b;
+  }
+  return max;
 }
 
 export interface HangEvalResult {
@@ -81,6 +100,8 @@ export interface BootstrapHangEvalInput {
   lastSessionHeartbeat: number | null;
   /** Same dual-source fix as HangEvalInput — see its doc comment. */
   lastIdleFlagAt?: number | null;
+  /** Same class-3 fix as HangEvalInput — see its doc comment. */
+  lastActivityBeatAt?: number | null;
 }
 
 /** Parse an ISO timestamp to epoch ms; null on absent/invalid (fail-safe). */
@@ -116,8 +137,8 @@ export function mostRecentDeliveredFireMs(crons: Cronish[]): number | null {
  * we key on delivered-fire-without-beat, not on last-seen age.
  */
 export function evaluateHang(input: HangEvalInput): HangEvalResult {
-  const { now, graceMs, deliveredFireAt: T, lastSessionHeartbeat, lastIdleFlagAt } = input;
-  const S = maxBeat(lastSessionHeartbeat, lastIdleFlagAt);
+  const { now, graceMs, deliveredFireAt: T, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt } = input;
+  const S = maxBeat(lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt);
 
   if (T === null) return { hung: false, reason: 'no delivered fire recorded — fail-safe' };
   if (now - T <= graceMs) {
@@ -156,8 +177,8 @@ export function evaluateHang(input: HangEvalInput): HangEvalResult {
  * governing principle as evaluateHang).
  */
 export function evaluateBootstrapHang(input: BootstrapHangEvalInput): HangEvalResult {
-  const { now, graceMs, restartAt: R, lastSessionHeartbeat, lastIdleFlagAt } = input;
-  const S = maxBeat(lastSessionHeartbeat, lastIdleFlagAt);
+  const { now, graceMs, restartAt: R, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt } = input;
+  const S = maxBeat(lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt);
 
   if (R === null) return { hung: false, reason: 'no restart-time recorded — fail-safe' };
   if (now - R <= graceMs) {
@@ -189,8 +210,9 @@ export function hasBeatSinceRestart(
   restartAt: number | null,
   lastSessionHeartbeat: number | null,
   lastIdleFlagAt?: number | null,
+  lastActivityBeatAt?: number | null,
 ): boolean {
   if (restartAt === null) return false;
-  const s = maxBeat(lastSessionHeartbeat, lastIdleFlagAt);
+  const s = maxBeat(lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt);
   return s !== null && s >= restartAt;
 }

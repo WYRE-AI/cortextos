@@ -11,6 +11,7 @@ export default defineConfig({
     'hooks/hook-compact-telegram': 'src/hooks/hook-compact-telegram.ts',
     'hooks/hook-extract-facts': 'src/hooks/hook-extract-facts.ts',
     'hooks/hook-idle-flag': 'src/hooks/hook-idle-flag.ts',
+    'hooks/hook-activity-beat': 'src/hooks/hook-activity-beat.ts',
     'hooks/hook-context-status': 'src/hooks/hook-context-status.ts',
     'hooks/hook-loop-detector': 'src/hooks/hook-loop-detector.ts',
   },
