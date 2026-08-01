@@ -17,7 +17,7 @@ import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
-import { nextFireFromCron } from '../daemon/cron-scheduler.js';
+import { nextFireFromCron, computeReferenceMs } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { mintInstallationToken, shouldRefuseInteractivePrint, redactForJson } from '../bus/github-app.js';
@@ -2073,17 +2073,26 @@ busCommand
       return;
     }
 
-    // Compute next_fire_at for each cron so the table is informative
+    // Compute next_fire_at for each cron so the table is informative. Uses
+    // the same shared candidate-max reference computation (computeReferenceMs)
+    // the live scheduler's loadCrons() uses — see its docblock — so a
+    // never-fired cron anchors on created_at instead of showing a misleading
+    // recomputed-every-query "now+interval" (task_1785589264937).
     const now = Date.now();
     const rows = crons.map(c => {
       const lastFire = mostRecent(c.last_fired_at, fireByName.get(c.name));
       let nextFire = '-';
+      const refMs = computeReferenceMs({
+        createdAt: c.created_at,
+        lastFiredAt: c.last_fired_at,
+        lastFireAttemptedAt: c.last_fire_attempted_at,
+        stateFire: fireByName.get(c.name),
+      }, now);
       const dms = parseDurationMs(c.schedule);
       if (!isNaN(dms)) {
-        const refMs = lastFire ? new Date(lastFire).getTime() : now;
         nextFire = fmtTs(new Date(refMs + dms).toISOString());
       } else {
-        const nf = nextFireFromCron(c.schedule, now);
+        const nf = nextFireFromCron(c.schedule, refMs);
         if (!isNaN(nf)) nextFire = fmtTs(new Date(nf).toISOString());
       }
       const promptPreview = c.prompt.length > 60 ? c.prompt.slice(0, 57) + '...' : c.prompt;
