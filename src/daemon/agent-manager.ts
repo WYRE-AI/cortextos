@@ -22,6 +22,9 @@ import { resolveAgentDir } from '../utils/agent-dir.js';
 import { stripBom } from '../utils/strip-bom.js';
 import { writeAgentPid, readAgentPid, clearAgentPid, reapOrphan, isPidAlive } from '../utils/agent-pidfile.js';
 import { tryAcquireRestartLock, releaseRestartLock } from './restart-lock.js';
+import { RotationManager } from './rotation-manager.js';
+import { LimitScanner } from './limit-detector.js';
+import { preflightAccount } from './account-preflight.js';
 
 type LogFn = (msg: string) => void;
 
@@ -62,6 +65,12 @@ export class AgentManager {
   // the orchestrator (e.g. a restart) while this daemon process is alive.
   private slackSocketStarted = false;
   private slackSocketClient: SlackSocketModeClient | null = null;
+
+  // Limit-rotation: one fleet-level RotationManager, lazily created at first
+  // agent registration; one LimitScanner per agent feeds it (see startAgent).
+  private rotationManager: RotationManager | null = null;
+  /** First registered agent's Telegram handle — fleet-level rotation alerts. */
+  private alertHandle: { api: TelegramAPI; chatId: string } | null = null;
 
   constructor(instanceId: string, ctxRoot: string, frameworkRoot: string, org: string) {
     this.instanceId = instanceId;
@@ -125,6 +134,32 @@ export class AgentManager {
     // restart, manual restartAgent) get the real BUG-011 alarm, not the
     // quieted post-crash variant.
     this.daemonJustCrashed = false;
+  }
+
+  /**
+   * Lazily create (and start) the fleet-level RotationManager. One instance
+   * serves every agent: concurrent limit events fold into a single rotation.
+   * ctxRoot/org come from the first registered agent's env (all agents in an
+   * instance share the same ctxRoot; org matches the daemon's startup org for
+   * the accounts.json-owning default instance).
+   */
+  private ensureRotationManager(env: CtxEnv): RotationManager {
+    if (!this.rotationManager) {
+      this.rotationManager = new RotationManager({
+        ctxRoot: env.ctxRoot,
+        frameworkRoot: this.frameworkRoot,
+        org: env.org,
+        preflight: preflightAccount,
+        restartAgent: (name) => this.restartAgent(name),
+        sendAlert: (text) => {
+          const handle = this.alertHandle;
+          if (handle) handle.api.sendMessage(handle.chatId, text).catch(() => {});
+        },
+        log: (msg) => console.log(`[agent-manager] ${msg}`),
+      });
+      this.rotationManager.start();
+    }
+    return this.rotationManager;
   }
 
   /**
@@ -458,6 +493,17 @@ export class AgentManager {
     if (telegramApi && chatId) {
       agentProcess.setTelegramHandle(telegramApi, chatId);
     }
+
+    // Limit-rotation wiring: feed this agent's raw PTY output through a
+    // per-agent LimitScanner; a detected rate-limit banner hands recovery to
+    // the fleet-level RotationManager (which restarts only blocked agents).
+    if (telegramApi && chatId && !this.alertHandle) this.alertHandle = { api: telegramApi, chatId };
+    const rotation = this.ensureRotationManager(env);
+    const scanner = new LimitScanner();
+    agentProcess.setOutputChunkHandler((data) => {
+      const ev = scanner.push(data);
+      if (ev) void rotation.onLimitEvent(name, ev);
+    });
     const checker = new FastChecker(agentProcess, paths, this.frameworkRoot, {
       log,
       telegramApi,
@@ -1156,6 +1202,9 @@ export class AgentManager {
     this.slackSocketClient?.stop();
     this.slackSocketClient = null;
     this.slackSocketStarted = false;
+    // Stop the rotation tick first — a rotation-triggered restartAgent()
+    // firing mid-shutdown would resurrect an agent straight into process.exit().
+    this.rotationManager?.stop();
     const names = [...this.agents.keys()];
 
     for (const name of names) {

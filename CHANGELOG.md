@@ -72,6 +72,35 @@ SP3a (outbound-only: `src/slack/api.ts`, `identity.ts`).
   "Reply using:" line invokes. `test-send` is unchanged.
 - Setup runbook: `docs/runbook/sp3b-slack-socket-mode-setup.md`.
 
+### Added — daemon-side rate-limit detection + OAuth auto-rotation
+
+Twice in 28 hours (2026-07-14 weekly limit, 2026-07-15 5-hour session limit) the
+whole fleet blocked on Claude Code's interactive rate-limit dialog; the hang
+detector saw no-beat-after-fire and restart-looped agents into the same wall.
+Recovery is now automatic:
+
+- **`src/daemon/limit-detector.ts`** — pure banner detection over ANSI-stripped,
+  whitespace-normalized PTY output (cursor-positioning escapes sit between words).
+  Fires only on limit phrase + blocking-dialog marker together, so an agent merely
+  quoting a limit message never triggers it. Parses `(UTC)` reset hints.
+- **`src/daemon/rotation-manager.ts`** — reacts to limit events: marks the agent
+  limit-blocked (`state/oauth/rotation-state.json`), preflights bench accounts,
+  flips `accounts.json` active, rewrites agent `.env` tokens, restarts only the
+  blocked agents, and Telegram-alerts once. All-dry → halt with a single alert and
+  auto-retry at the earliest known reset. Recovered-in-place active accounts are
+  detected and reused without a flip. 10-min rotation cooldown; 30-min proactive
+  preflight of the active account rotates ahead of exhaustion.
+- **`src/daemon/account-preflight.ts`** — preflight is a one-word **Opus**
+  inference ping in an isolated `CLAUDE_CONFIG_DIR` (limits are model-bucketed,
+  and setup-tokens lack the `user:profile` scope the usage API requires).
+- **FastChecker** suppresses hang-restarts for limit-blocked agents — the
+  rotation manager owns that recovery.
+- **`src/bus/oauth.ts`** — new `setActiveAccount` helper; `writeTokenToAgents`
+  exported for the daemon.
+
+Verified live end-to-end (PTY banner → detection → rotation → targeted restart →
+alert → cooldown) via a shimmed agent binary on 2026-07-16.
+
 ### Fixed — freeze-cure: context-handoff default-ON + fleet-wide bridge wiring
 
 The daemon shipped a full context-handoff mechanism (thresholds, tiers, handoff

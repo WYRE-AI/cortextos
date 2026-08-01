@@ -1,13 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('child_process', () => ({ execFile: vi.fn() }));
-vi.mock('../../../src/bus/oauth.js', () => ({ rotateOAuth: vi.fn() }));
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { FastChecker } from '../../../src/daemon/fast-checker';
-import { rotateOAuth } from '../../../src/bus/oauth.js';
 import type { BusPaths, TelegramCallbackQuery } from '../../../src/types';
+
+function writeLimitBlocked(ctxRoot: string, agent: string) {
+  const dir = join(ctxRoot, 'state', 'oauth');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'rotation-state.json'), JSON.stringify({
+    limitBlocked: { [agent]: { detectedAt: Date.now(), kind: 'weekly', resetAt: null } },
+    exhausted: {}, lastRotationAt: 0, retryAt: null, lastPreflightAt: 0, alertedHalt: false,
+  }), 'utf-8');
+}
 
 // Minimal mock for AgentProcess
 function createMockAgent(name = 'test-agent') {
@@ -1102,91 +1109,42 @@ describe('FastChecker', () => {
     });
   });
 
-  describe('forceHangRestart — rate-limit-aware restart (freeze#4 Fix 2: skip blind restart, rotate OAuth account first)', () => {
-    beforeEach(() => {
-      vi.mocked(rotateOAuth).mockReset();
-    });
+  describe('checkHangStatus — limit-blocked suppression (rotation manager owns recovery, not a blind hang-restart)', () => {
+    const GRACE_EXCEEDED_ISO = new Date(Date.now() - 20 * 60 * 1000).toISOString();
 
-    function writeStdout(text: string) {
-      writeFileSync(join(paths.logDir, 'stdout.log'), text, 'utf-8');
-    }
-
-    it('rotates the OAuth account and restarts fresh when stdout.log shows a rate-limit signature', async () => {
-      writeStdout("You've hit your weekly limit for Claude.\n");
-      vi.mocked(rotateOAuth).mockResolvedValue({ rotated: true, reason: '5h utilization at 100%', from: 'acct-a', to: 'acct-b' });
-
-      const agent = createMockAgent('test-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
-      // Pre-existing streak — rotation success should reset this, not just leave it be.
-      (checker as any).consecutiveHangRestartsWithoutBeat = 2;
-
-      await (checker as any).forceHangRestart('bootstrap hang, no beat since restart');
-
-      expect(rotateOAuth).toHaveBeenCalledWith(paths.ctxRoot, '/tmp/framework', 'test-org', expect.objectContaining({
-        reason: expect.stringContaining('bootstrap hang'),
-        // force:true — a live stdout.log signature is unambiguous evidence; rotateOAuth's
-        // own needsRotation gate checks accounts.json's CACHED utilization, which nothing
-        // keeps live for the currently-active account and can sit at stale/zero
-        // placeholders even while genuinely exhausted (analyst-caught, PR #28 review).
-        force: true,
-      }));
-      expect(existsSync(join(paths.stateDir, '.force-fresh'))).toBe(true);
-      expect(agent.sessionRefresh).toHaveBeenCalledTimes(1);
-      expect((checker as any).hangHaltedAt).toBeNull();
-
-      const circuit = JSON.parse(readFileSync(join(paths.stateDir, '.hang-circuit.json'), 'utf-8'));
-      expect(circuit.consecutiveWithoutBeat).toBe(0); // reset by the successful rotation, not left at 2
-    });
-
-    it('halts immediately (does NOT loop) when rotation fails — no healthy account to rotate to', async () => {
-      writeStdout("You've hit your weekly limit for Claude.\n");
-      vi.mocked(rotateOAuth).mockResolvedValue({ rotated: false, reason: 'No alternate accounts available for rotation' });
-
+    it('suppresses the bootstrap-hang restart when the agent is limit-blocked in rotation-state.json', () => {
+      writeFileSync(join(paths.stateDir, '.restart-time'), GRACE_EXCEEDED_ISO + '\n', 'utf-8');
+      // No heartbeat.json at all — would ordinarily force-fresh-restart (see the
+      // #19b describe block's identical setup), but the agent is limit-blocked.
+      writeLimitBlocked(paths.ctxRoot, 'test-agent');
       const agent = createMockAgent('test-agent');
       const checker = new FastChecker(agent, paths, '/tmp/framework');
 
-      await (checker as any).forceHangRestart('bootstrap hang, no beat since restart');
+      (checker as any).checkHangStatus();
 
-      expect(rotateOAuth).toHaveBeenCalledTimes(1);
       expect(existsSync(join(paths.stateDir, '.force-fresh'))).toBe(false);
       expect(agent.sessionRefresh).not.toHaveBeenCalled();
-      expect((checker as any).hangHaltedAt).not.toBeNull();
     });
 
-    it('halts immediately when rotation THROWS (e.g. network error) — never lets the exception escape into a blind restart', async () => {
-      writeStdout("You've hit your weekly limit for Claude.\n");
-      vi.mocked(rotateOAuth).mockRejectedValue(new Error('fetch failed'));
-
+    it('the suppression gate itself (hangSuppressedByLimit) reflects rotation-state.json directly', () => {
       const agent = createMockAgent('test-agent');
       const checker = new FastChecker(agent, paths, '/tmp/framework');
 
-      await (checker as any).forceHangRestart('bootstrap hang, no beat since restart');
+      expect((checker as any).hangSuppressedByLimit()).toBe(false);
 
-      expect(agent.sessionRefresh).not.toHaveBeenCalled();
-      expect((checker as any).hangHaltedAt).not.toBeNull();
+      writeLimitBlocked(paths.ctxRoot, 'test-agent');
+      expect((checker as any).hangSuppressedByLimit()).toBe(true);
     });
 
-    it('does NOT check rotation and takes the normal blind-restart path when stdout.log has no rate-limit signature', async () => {
-      writeStdout('ordinary session output, nothing unusual\n');
-
+    it('still restarts normally (not suppressed) when the agent is NOT limit-blocked', () => {
+      writeFileSync(join(paths.stateDir, '.restart-time'), GRACE_EXCEEDED_ISO + '\n', 'utf-8');
+      // No rotation-state.json at all — isLimitBlocked() must fail-safe to false.
       const agent = createMockAgent('test-agent');
       const checker = new FastChecker(agent, paths, '/tmp/framework');
 
-      await (checker as any).forceHangRestart('bootstrap hang, no beat since restart');
+      (checker as any).checkHangStatus();
 
-      expect(rotateOAuth).not.toHaveBeenCalled();
       expect(existsSync(join(paths.stateDir, '.force-fresh'))).toBe(true);
-      expect(agent.sessionRefresh).toHaveBeenCalledTimes(1);
-    });
-
-    it('does NOT check rotation when stdout.log is absent entirely (fail-safe)', async () => {
-      // No stdout.log written at all.
-      const agent = createMockAgent('test-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
-
-      await (checker as any).forceHangRestart('bootstrap hang, no beat since restart');
-
-      expect(rotateOAuth).not.toHaveBeenCalled();
       expect(agent.sessionRefresh).toHaveBeenCalledTimes(1);
     });
   });

@@ -69,6 +69,10 @@ export class AgentProcess {
   // (each start() recreates the PTY, but the Telegram handle persists).
   private telegramApi: TelegramAPI | null = null;
   private telegramChatId: string | null = null;
+  // Limit-rotation wiring: secondary raw-output consumer re-applied on every
+  // AgentPTY (re)spawn (session refresh recreates the PTY, like the Telegram
+  // handle above).
+  private outputChunkHandler: ((data: string) => void) | null = null;
   // Issue #392: tracks whether the most recently built startup prompt consumed
   // a handoff doc marker. start() reads this after spawn to decide whether the
   // daemon should fire the codex-app-server back-online Telegram directly
@@ -162,6 +166,14 @@ export class AgentProcess {
       : this.config.runtime === 'codex-app-server'
         ? new CodexAppServerPTY(this.env, this.config, logPath)
         : new AgentPTY(this.env, this.config, logPath);
+
+    // Limit-rotation: re-apply the output-chunk handler on every PTY creation
+    // (this ternary is the SINGLE creation site — sessionRefresh delegates to
+    // stop()+start()). Guarded: CodexAppServerPTY has no onOutputChunk;
+    // HermesPTY inherits it from AgentPTY.
+    if (this.pty instanceof AgentPTY && this.outputChunkHandler) {
+      this.pty.onOutputChunk = this.outputChunkHandler;
+    }
 
     // Issue #330: re-wire the Telegram handle on every start() (session refresh
     // creates a fresh CodexAppServerPTY). Only CodexAppServerPTY uses this — Claude / Hermes
@@ -500,6 +512,12 @@ export class AgentProcess {
     if (this.config.runtime === 'codex-app-server' && this.pty) {
       (this.pty as CodexAppServerPTY).setTelegramHandle(api, chatId);
     }
+  }
+
+  /** Secondary PTY output consumer (survives session refresh re-spawns). */
+  setOutputChunkHandler(cb: (data: string) => void): void {
+    this.outputChunkHandler = cb;
+    if (this.pty instanceof AgentPTY) this.pty.onOutputChunk = cb;
   }
 
   /**
