@@ -149,4 +149,58 @@ describe('RotationManager', () => {
     const accounts = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/accounts.json'), 'utf-8'));
     expect(accounts.active).toBe('a');
   });
+
+  describe('preflight-infra vs genuine-exhaustion alerting (PR #54 review, F2)', () => {
+    it('every candidate erroring (never limiting) fires a distinct, recurring infra alert alongside the one-time exhaustion halt', async () => {
+      preflight.mockResolvedValue('error');
+      await rm.onLimitEvent('boss', EV); // attempt 1: consecutiveInfraTicks 0->1 (below threshold=2)
+      expect(sendAlert).toHaveBeenCalledTimes(1);
+      expect(sendAlert.mock.calls[0][0]).toContain('ALL OAuth accounts exhausted');
+
+      await rm.onLimitEvent('dev', EV); // attempt 2: consecutiveInfraTicks 1->2 (meets threshold)
+      expect(sendAlert).toHaveBeenCalledTimes(2); // halt alert suppressed (already alerted); infra alert is new
+      expect(sendAlert.mock.calls[1][0]).toMatch(/preflight is returning ERROR/i);
+      expect(sendAlert.mock.calls[1][0]).not.toContain('ALL OAuth accounts exhausted');
+
+      const state = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/rotation-state.json'), 'utf-8'));
+      expect(state.consecutiveInfraTicks).toBe(2);
+      // A mere 'error' must never be mistaken for genuine exhaustion.
+      expect(state.exhausted.b).toBeUndefined();
+      expect(state.exhausted.c).toBeUndefined();
+    });
+
+    it('a confirmed "limit" result never counts as an infra error, even mixed with errors elsewhere', async () => {
+      preflight.mockImplementation(async (tok: string) => (tok === 'tok-b' ? 'limit' : 'error'));
+      await rm.onLimitEvent('boss', EV);
+      const state = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/rotation-state.json'), 'utf-8'));
+      expect(state.consecutiveInfraTicks).toBe(0); // one real 'limit' this invocation clears the streak
+    });
+
+    it('tick()\'s proactive path: 2 consecutive errors trigger the infra alert; a subsequent ok clears the streak', async () => {
+      preflight.mockResolvedValue('error');
+      t += 30 * 60_000 + 1;
+      await rm.tick(); // tick 1: consecutiveInfraTicks -> 1
+      expect(sendAlert).not.toHaveBeenCalled();
+
+      t += 30 * 60_000 + 1;
+      await rm.tick(); // tick 2: consecutiveInfraTicks -> 2, threshold met
+      expect(sendAlert).toHaveBeenCalledTimes(1);
+      expect(sendAlert.mock.calls[0][0]).toMatch(/preflight is returning ERROR/i);
+
+      preflight.mockResolvedValue('ok');
+      t += 30 * 60_000 + 1;
+      await rm.tick(); // tick 3: a real 'ok' clears the streak
+      const state = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/rotation-state.json'), 'utf-8'));
+      expect(state.consecutiveInfraTicks).toBe(0);
+    });
+
+    it('infra alert respects its own cooldown — does not re-fire on every subsequent all-error attempt', async () => {
+      preflight.mockResolvedValue('error');
+      await rm.onLimitEvent('boss', EV);           // tick->1
+      await rm.onLimitEvent('dev', EV);            // tick->2, fires (sendAlert count 2: halt + infra)
+      expect(sendAlert).toHaveBeenCalledTimes(2);
+      await rm.onLimitEvent('boss', EV);           // tick->3, still all-error, but within 30min infra cooldown
+      expect(sendAlert).toHaveBeenCalledTimes(2);  // no third alert yet
+    });
+  });
 });

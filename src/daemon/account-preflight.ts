@@ -9,9 +9,14 @@ import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type { PreflightResult } from './rotation-manager.js';
+import { resolveClaudeBinary } from '../bus/oauth.js';
 
 const PREFLIGHT_TIMEOUT_MS = 3 * 60_000;
-const FLEET_MODEL = 'claude-opus-4-8';
+// Overridable so a retired alias doesn't need a code change to recover — see
+// F2 in the PR #54 review: a hardcoded model that goes invalid fails EVERY
+// preflight identically, which rotation-manager.ts's doRotation/tick classify
+// as a distinct infra alert (not exhaustion) precisely so this is caught.
+const FLEET_MODEL = process.env.CTX_PREFLIGHT_MODEL || 'claude-opus-4-8';
 
 export function classifyPreflightOutput(exitCode: number, output: string): PreflightResult {
   if (/hit your .*limit/i.test(output)) return 'limit';
@@ -23,7 +28,7 @@ export function preflightAccount(accessToken: string): Promise<PreflightResult> 
     // Isolated config dir: never let the daemon's keychain login answer for the token.
     const configDir = mkdtempSync(join(tmpdir(), 'ctx-preflight-'));
     const env = { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: accessToken, CLAUDE_CONFIG_DIR: configDir };
-    execFile('claude', ['-p', 'reply with exactly: ok', '--model', FLEET_MODEL],
+    execFile(resolveClaudeBinary(), ['-p', 'reply with exactly: ok', '--model', FLEET_MODEL],
       { env, timeout: PREFLIGHT_TIMEOUT_MS },
       (err, stdout, stderr) => {
         try { rmSync(configDir, { recursive: true, force: true }); } catch { /* ignore */ }

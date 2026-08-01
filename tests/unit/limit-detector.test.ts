@@ -58,6 +58,39 @@ describe('scanForLimit', () => {
   });
 });
 
+describe('scanForLimit — golden sample, live-captured 2026-08-01 (PR #54 review, F4)', () => {
+  // Pulled directly from murph's own fleet filesystem
+  // (~/.cortextos/wyre-gateway/logs/boss/stdout.log) — a REAL banner that
+  // fired in boss's actual running session, not a hand-typed guess at
+  // current wording. Confirms the regexes above (captured 07-14/07-15,
+  // 2.5 weeks earlier) still match the live TUI as of today: same
+  // "You've hit your ... limit · resets ..." phrase, same "What do you want
+  // to do?" dialog marker, same "/rate-limit-options" echo. No wording
+  // drift found. Includes the surrounding statusline noise (model/cwd/cost)
+  // untouched, exactly as captured, to prove the scanner tolerates real
+  // session chrome around the banner, not just a hand-trimmed excerpt.
+  const LIVE_2026_08_01 = `ion\x07\x1b[?25l\x1b[2D\x1b[5B\x0d\x1b[9A\x1b[38;5;246m  ⎿  \x1b[38;5;211mYou've hit your session limit · resets 4am (America/New_York)\x0d\x1b[1B\x1b[39m\x1b[K\x0d\x1b[1B\x1b[38;5;246m✻\x1b[3GCooked for 0s\x0d\x1b[1B\x1b[39m\x1b[K\x0d\x1b[1B\x1b[38;5;244m` + '─'.repeat(200) +
+    `\x0d\x1b[1B\x1b[39m❯ \x1b[K\x0d\x1b[1B\x1b[38;5;244m` + '─'.repeat(200) +
+    `\x0d\x1b[3C\x1b[1B\x1b[48;5;73m\x1b[38;5;16mMo\x1b[7Gel: Opu\x1b[15G 4.8 \x1b[48;5;239m\x1b[38;5;73m\x1b[38;5;254m Ctx: 211.2k \x1b[48;5;25m\x1b[38;5;239m\x1b[38;5;231m ⎇ main \x1b[48;5;96m\x1b[38;5;25m\x1b[38;5;231m (+0,-0) \x1b[49m\x1b[38;5;96m\x1b[39m\x1b[K\x0d\x1b[2C\x1b[1B\x1b[48;5;73m\x1b[38;5;16m cwd: /Users/asachs/cortextos/orgs/wyre-gateway/agents/boss \x1b[48;5;239m\x1b[38;5;73m\x1b[38;5;254m Cost: $9.74 \x1b[49m\x1b[38;5;239m\x1b[39m\x0d\x0d\x0a\x1b[3G\x1b[38;5;211m⏵⏵\x1b[6Gbypass\x1b[13Gpermissions\x1b[25Gon\x1b[38;5;246m (shift+tab\x1b[39Gto\x1b[42Gcycle)\x1b[49G·\x1b[51G←\x1b[53Gfor\x1b[57Gagents\x1b[39m\x0d\x0d\x0a\x1b[2C\x1b[5A\x1b[?25h\x1b[?25l\x1b[2D\x1b[5B\x0d\x1b[6A\x1b[48;5;237m\x1b[38;5;239m❯ \x1b[38;5;231m/rate-limit-options\x1b[39m` + ' '.repeat(180) +
+    `\x0d\x1b[1B\x1b[49m\x1b[K\x0d\x1b[1B\x1b[38;5;153m` + '─'.repeat(200) +
+    `\x0d\x1b[2C\x1b[1B\x1b[1mWhat do you want to do?\x1b[22m\x1b[39m\x1b[K\x0d\x1b[2C\x1b[1B\x1b[K\x0d\x1b[2C\x1b[1B\x1b[38;5;153m❯\x1b[39m \x1b[38;5;246m1. \x1b[38;5;153mStop and wait for limit to reset\x1b[39m\x1b[K\x0d\x0d\x0a\x1b[5G\x1b[38;5;246m2.\x1b[8G\x1b[39mAdd\x1b[12Gfunds\x1b[18Gto\x1b[21Gcontinue\x1b[30Gwith\x1b[35Gusage\x1b[41Gcredits\x0d\x0d`;
+
+  it('detects the live-captured banner, dialog marker intact, no wording drift from the 07-14/07-15 samples above', () => {
+    const ev = scanForLimit(stripAnsi(LIVE_2026_08_01), NOW);
+    expect(ev).not.toBeNull();
+    expect(ev!.kind).toBe('session');
+    expect(ev!.matchedText.replace(/\s+/g, '').toLowerCase()).toBe("you'vehityoursessionlimit");
+    // Non-UTC (America/New_York) — correctly unparsed, same as the existing
+    // non-UTC test above; this is a real instance of that same shape.
+    expect(ev!.resetAt).toBeNull();
+  });
+
+  it('LimitScanner fires exactly once on the live-captured banner, same as the synthetic fixtures', () => {
+    const s = new LimitScanner(() => NOW);
+    expect(s.push(LIVE_2026_08_01)).not.toBeNull();
+  });
+});
+
 describe('LimitScanner', () => {
   it('fires once, then suppresses re-fires for 5 minutes', () => {
     let t = NOW;
