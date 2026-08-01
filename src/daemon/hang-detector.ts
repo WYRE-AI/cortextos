@@ -30,6 +30,37 @@
 // EVERY tool call, mid-turn) closes this: it's proof of liveness that doesn't wait
 // for the turn to end.
 //
+// CONFIRMED INTERACTION — loop-detector can keep an agent reading "not hung" while it
+// is genuinely stuck spinning (PR #55 review, 2026-08-01). hook-loop-detector.ts (a
+// SEPARATE PreToolUse hook, registered as its own array entry alongside this one) can
+// actively BLOCK a repeated-tool-call loop. Per Claude Code's documented hook-execution
+// model, PreToolUse hooks in different array entries run in PARALLEL with NO
+// short-circuit on block (verified against the official hooks reference, not
+// inferred) — so hook-activity-beat's subprocess still runs and still writes
+// last_activity.flag on EVERY tool-call ATTEMPT, including ones loop-detector denies.
+// The masking is therefore CONTINUOUS for as long as the agent keeps attempting calls,
+// not just on loop-detector's periodic 30-min emergency-escape allowance.
+//
+// This is INTENTIONAL, not a bug to fix here: a tool-call loop is a different failure
+// class than a hang — the agent is alive and actively trying things, just unproductively
+// — and that class belongs to loop-detector (alert + block), not this module (blind
+// restart). A --continue restart of a loop-stuck agent would just resume it back into
+// the same loop, since the loop lives in the conversation/tool-call pattern, not in a
+// frozen process. So last_activity.flag correctly staying fresh here, and hang-detector
+// correctly NOT firing, is the right behavior IF AND ONLY IF loop-detector's own
+// block/escape signal reliably reaches a human for diagnosis+intervention — see the
+// loop-detector-alert-routing follow-up this pin depends on. Two ways to close the gap
+// if that routing ever proves unreliable: (a) make the alert-routing itself reliable
+// (preferred — it's the more precise signal, purpose-built for this exact failure), or
+// (b) bound activity-beat's masking here in hang-detector.ts: don't let it suppress a
+// hang indefinitely when BOTH last_idle_flag AND last_session_heartbeat are stale
+// beyond a larger secondary threshold (that combination — lots of tool activity, zero
+// turn completions, zero heartbeats — IS the loop signature; a legitimately long-but-
+// healthy turn still completes or heartbeats eventually, so it stays protected either
+// way). Pick one path before this fix is allowed to activate (i.e. before it ships in a
+// coordinated restart) — see docs/runbook/daemon-restart-2026-08.md's pre-restart
+// checklist.
+//
 // GOVERNING PRINCIPLE — FAIL SAFE TOWARD NOT-RESTARTING: a missed hang is cheap (the
 // next delivered fire re-catches it); a false restart disrupts a healthy agent and, at
 // fleet scale, is itself a mini-storm. So on ANY uncertainty — absent last_session
