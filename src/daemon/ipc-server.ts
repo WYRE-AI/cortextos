@@ -6,8 +6,8 @@ import { AgentManager } from './agent-manager.js';
 import { getIpcPath } from '../utils/paths.js';
 import { readCrons, getExecutionLog, getExecutionLogPage, addCron, updateCron, removeCron, getCronByName } from '../bus/crons.js';
 import type { ExecutionLogStatusFilter } from '../bus/crons.js';
-import { nextFireFromCron } from './cron-scheduler.js';
-import { parseDurationMs } from '../bus/cron-state.js';
+import { nextFireFromCron, computeReferenceMs } from './cron-scheduler.js';
+import { parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { computeHealth, aggregateFleetHealth } from '../utils/cron-health.js';
 
 const WORKER_NAME_REGEX = /^[a-z0-9_-]+$/;
@@ -115,19 +115,30 @@ export function handleFireCron(
 
 /**
  * Compute the next fire timestamp (ISO string) for a cron definition.
- * Reuses the same parser logic as CronScheduler (nextFireFromCron + parseDurationMs)
- * without duplicating the parser.
+ * Reuses the same parser logic as CronScheduler (nextFireFromCron +
+ * parseDurationMs) AND the same candidate-max reference-time computation
+ * (computeReferenceMs) the live scheduler uses in loadCrons() — see that
+ * function's docblock. Previously this only considered lastFiredAt, so a
+ * never-fired cron always showed a misleading recomputed-every-query
+ * "now+interval" here even after 10e3011f fixed the scheduler's actual
+ * firing behavior (task_1785589264937).
  *
- * @param schedule    - Interval shorthand or 5-field cron expression.
- * @param lastFiredAt - ISO 8601 of last fire; if absent uses `now`.
- * @param now         - Epoch ms for "now" (injectable for testing).
+ * @param schedule            - Interval shorthand or 5-field cron expression.
+ * @param createdAt           - ISO 8601 cron creation time (anchors never-fired crons).
+ * @param lastFiredAt         - ISO 8601 of last fire, if any.
+ * @param lastFireAttemptedAt - ISO 8601 of last fire attempt (pre-dispatch), if any.
+ * @param stateFire           - cron-state.json's last_fire for this cron, if any.
+ * @param now                 - Epoch ms for "now" (injectable for testing).
  */
 export function computeNextFire(
   schedule: string,
+  createdAt: string | undefined,
   lastFiredAt: string | undefined,
+  lastFireAttemptedAt: string | undefined,
+  stateFire: string | undefined,
   now = Date.now(),
 ): string {
-  const referenceMs = lastFiredAt ? new Date(lastFiredAt).getTime() : now;
+  const referenceMs = computeReferenceMs({ createdAt, lastFiredAt, lastFireAttemptedAt, stateFire }, now);
 
   const durationMs = parseDurationMs(schedule);
   if (!isNaN(durationMs)) {
@@ -137,7 +148,7 @@ export function computeNextFire(
   }
 
   // Try as a 5-field cron expression
-  const nextMs = nextFireFromCron(schedule, now);
+  const nextMs = nextFireFromCron(schedule, referenceMs);
   if (!isNaN(nextMs)) {
     return new Date(nextMs).toISOString();
   }
@@ -172,6 +183,18 @@ function listAllCrons(): CronSummaryRow[] {
     const org = entry.org ?? '';
     const crons = readCrons(agentName);
 
+    // cron-state.json's last_fire records (e.g. from `bus update-cron-fire`
+    // agent skills) — same stateFire source the live scheduler's loadCrons()
+    // and the CLI's list-crons already fold in, so this display path doesn't
+    // miss a fire that only landed in cron-state.json.
+    const stateFireByName = new Map<string, string>();
+    try {
+      const stateDir = join(ctxRoot, 'state', agentName);
+      for (const rec of readCronState(stateDir).crons) stateFireByName.set(rec.name, rec.last_fire);
+    } catch {
+      // Malformed file / missing dir — fall back to crons.json fields only
+    }
+
     for (const cron of crons) {
       // Read the last execution log entry for this cron
       const logEntries = getExecutionLog(agentName, cron.name, 1);
@@ -183,7 +206,14 @@ function listAllCrons(): CronSummaryRow[] {
         cron,
         lastFire: lastEntry?.ts ?? null,
         lastStatus: lastEntry?.status ?? null,
-        nextFire: computeNextFire(cron.schedule, cron.last_fired_at, now),
+        nextFire: computeNextFire(
+          cron.schedule,
+          cron.created_at,
+          cron.last_fired_at,
+          cron.last_fire_attempted_at,
+          stateFireByName.get(cron.name),
+          now,
+        ),
       });
     }
   }

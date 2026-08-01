@@ -145,6 +145,51 @@ function changeKeyFor(c: CronDefinition): string {
 }
 
 /**
+ * Inputs to computeReferenceMs — plain values, not a CronDefinition, so
+ * every caller (live scheduler, CLI, dashboard) supplies its own already-
+ * available fields without this module reaching into their I/O.
+ */
+export interface NextFireReferenceInputs {
+  createdAt?: string;
+  lastFiredAt?: string;
+  lastFireAttemptedAt?: string;
+  /** cron-state.json's last_fire for this cron, if the caller has read it. */
+  stateFire?: string;
+}
+
+/**
+ * Shared candidate-max reference-time computation — the single source of
+ * truth for "what time should a cron's next-fire be computed FROM," used
+ * identically by the live scheduler (loadCrons, below), the CLI's
+ * list-crons display, and the dashboard's list-all-crons API. Previously
+ * each of the three reimplemented this independently and only the
+ * scheduler's copy included created_at, so a never-fired cron displayed a
+ * misleading recomputed-every-query "now+interval" in the CLI/dashboard
+ * even after 10e3011f fixed the scheduler's own actual firing behavior —
+ * DRY violation, not three independent bugs (task_1785589264937).
+ *
+ * created_at anchors a cron that has NEVER fired on when it was created,
+ * rather than "now" — without it, a never-fired cron's computed next-fire
+ * silently resets forward every time this is called (every restart for the
+ * scheduler, every query for the CLI/dashboard), which can make an interval
+ * close to (or longer than) how often this gets recomputed structurally
+ * never actually arrive.
+ */
+export function computeReferenceMs(inputs: NextFireReferenceInputs, now: number): number {
+  const candidates: number[] = [];
+  const push = (iso: string | undefined) => {
+    if (!iso) return;
+    const ms = new Date(iso).getTime();
+    if (!isNaN(ms)) candidates.push(ms);
+  };
+  push(inputs.createdAt);
+  push(inputs.lastFiredAt);
+  push(inputs.lastFireAttemptedAt);
+  push(inputs.stateFire);
+  return candidates.length > 0 ? Math.max(...candidates) : now;
+}
+
+/**
  * Compute the next fire time for a cron definition.
  *
  * For interval shorthands ("6h", "30m") we count forward from the
@@ -153,7 +198,7 @@ function changeKeyFor(c: CronDefinition): string {
  * @param cron        - The cron definition.
  * @param referenceMs - Epoch ms to count forward from (usually now or lastFiredAt).
  */
-function computeNextFireAt(cron: CronDefinition, referenceMs: number): number {
+export function computeNextFireAt(cron: CronDefinition, referenceMs: number): number {
   const durationMs = parseDurationMs(cron.schedule);
   if (!isNaN(durationMs)) {
     return referenceMs + durationMs;
@@ -383,27 +428,15 @@ export class CronScheduler {
         continue;
       }
 
-      // New or modified cron — compute fresh nextFireAt.
-      // Base: take the most recent of crons.json.created_at, crons.json.last_fired_at,
-      // crons.json.last_fire_attempted_at (set pre-onFire to detect crash
-      // mid-fire — iter 11), and cron-state.json.last_fire (either may be
-      // more current depending on which write path recorded the fire).
-      // created_at is included so a cron that has NEVER fired anchors on when it
-      // was created rather than falling back to "now" on every fresh
-      // CronScheduler construction (every restart, not just a live reload) — a
-      // never-fired cron with no last_fired_at/last_fire_attempted_at/stateFire
-      // anchor would otherwise have its nextFireAt perpetually reset to
-      // now+interval on every restart, so an interval close to (or longer than)
-      // the ~71h auto-rotation cadence could structurally never fire. Falls back
-      // to now only if created_at itself is missing/unparseable.
-      const stateFire = stateLastFireByName.get(def.name);
-      const candidates: number[] = [];
-      const createdMs = new Date(def.created_at).getTime();
-      if (!isNaN(createdMs)) candidates.push(createdMs);
-      if (def.last_fired_at) candidates.push(new Date(def.last_fired_at).getTime());
-      if (def.last_fire_attempted_at) candidates.push(new Date(def.last_fire_attempted_at).getTime());
-      if (stateFire) candidates.push(new Date(stateFire).getTime());
-      const referenceMs = candidates.length > 0 ? Math.max(...candidates) : now;
+      // New or modified cron — compute fresh nextFireAt via the shared
+      // candidate-max reference computation (computeReferenceMs, above) —
+      // see its docblock for why created_at must anchor a never-fired cron.
+      const referenceMs = computeReferenceMs({
+        createdAt: def.created_at,
+        lastFiredAt: def.last_fired_at,
+        lastFireAttemptedAt: def.last_fire_attempted_at,
+        stateFire: stateLastFireByName.get(def.name),
+      }, now);
 
       let nextFireAt = computeNextFireAt(def, referenceMs);
 
