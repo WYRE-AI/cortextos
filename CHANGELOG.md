@@ -157,6 +157,18 @@ alert → cooldown) via a shimmed agent binary on 2026-07-16.
   stop-then-start, NEVER `pm2 reload` — reload spawns-new-before-kill-old, so
   this guard structurally refuses it by design.
 
+### Fixed — cron scheduler: infeasible dom+month expressions rejected before the minute scan
+
+- `nextFireFromCron` now pre-checks that at least one expanded month admits at
+  least one expanded day-of-month. An impossible-but-per-field-valid expression
+  (`0 0 31 2 *` — Feb 31) previously walked the entire 366-day scan window —
+  527K `formatToParts` calls, ~1.2s measured against ~3.5ms for a normal
+  expression — just to return NaN, on every schedule reload and every
+  `list-crons` next-fire preview. The pre-check rejects in O(fields) before the
+  Intl formatter is built. `29 2` (Feb 29) deliberately remains feasible; leap
+  years are the scan's question. Fast-follow to the timezone fix below, which
+  introduced the per-minute Intl cost.
+
 ### Fixed — freeze-cure: context-handoff default-ON + fleet-wide bridge wiring
 
 The daemon shipped a full context-handoff mechanism (thresholds, tiers, handoff

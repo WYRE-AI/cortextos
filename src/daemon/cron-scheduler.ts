@@ -137,6 +137,18 @@ export function nextFireFromCron(expr: string, fromMs: number, timezone: string 
     return NaN;
   }
 
+  // Feasibility pre-check: a dom+month combination that exists in NO month
+  // (e.g. "0 0 31 2 *" — Feb 31) passes per-field expansion but can never
+  // match, so the scan below would walk all MAX_MINUTES candidates — 527K
+  // formatToParts calls, ~1.2s measured — just to return NaN. Reject it in
+  // O(fields) instead. Feb counts as 29 deliberately: "29 2" is feasible
+  // (leap years), and whether the NEXT Feb 29 falls inside the 1-year scan
+  // window is the scan's question, not this check's.
+  const MAX_DOM_BY_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (!months.some((mo) => doms.some((d) => d <= MAX_DOM_BY_MONTH[mo - 1]))) {
+    return NaN;
+  }
+
   // Build the Intl formatter once (throws RangeError on an invalid IANA
   // timezone string — caught here so an invalid cron.timezone in crons.json
   // fails safe as NaN rather than crashing the daemon's scheduler tick).

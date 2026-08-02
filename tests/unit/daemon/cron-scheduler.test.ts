@@ -257,6 +257,48 @@ describe('nextFireFromCron — timezone-aware evaluation', () => {
 });
 
 // ---------------------------------------------------------------------------
+// nextFireFromCron — infeasible dom+month pre-check (PR #21 fast-follow)
+//
+// A dom+month combination that exists in no month ("0 0 31 2 *" — Feb 31)
+// passes per-field expansion, so without a pre-check the minute scan walks
+// the entire 366-day window (527K formatToParts calls, ~1.2s measured on
+// this branch) just to return NaN — per reload and per list-crons preview.
+// The pre-check rejects in O(fields). Feb deliberately counts 29 days:
+// "29 2" stays feasible (leap years) and is answered by the real scan.
+// ---------------------------------------------------------------------------
+describe('nextFireFromCron — infeasible dom+month pre-check', () => {
+  it('returns NaN for impossible calendar dates without scanning (Feb 31, Apr 31)', () => {
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    const t0 = performance.now();
+    expect(nextFireFromCron('0 0 31 2 *', fromMs)).toBeNaN();
+    expect(nextFireFromCron('0 0 31 4 *', fromMs)).toBeNaN();
+    expect(nextFireFromCron('30 6 30 2 *', fromMs, 'America/New_York')).toBeNaN();
+    const elapsed = performance.now() - t0;
+    // Pre-check is O(fields) (<1ms). The bound is ~100x headroom for CI
+    // jitter while still failing loudly on any full-window scan (~1.2s each).
+    expect(elapsed).toBeLessThan(120);
+  });
+
+  it('still finds a date when ANY expanded month admits an expanded day (31 in "1,2" months)', () => {
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    // Feb 31 is impossible but Jan 31 is real — expression stays feasible.
+    const next = nextFireFromCron('0 0 31 1,2 *', fromMs);
+    expect(next).toBe(Date.parse('2027-01-31T00:00:00.000Z'));
+  });
+
+  it('keeps "0 0 29 2 *" feasible and resolves it to a real Feb 29 when one is in the window', () => {
+    // From mid-2027 the next Feb 29 (2028) is within the 366-day scan window.
+    const fromMs = Date.parse('2027-06-01T00:00:00.000Z');
+    expect(nextFireFromCron('0 0 29 2 *', fromMs)).toBe(Date.parse('2028-02-29T00:00:00.000Z'));
+  });
+
+  it('leaves ordinary expressions untouched (Jan 31 exact date)', () => {
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    expect(nextFireFromCron('15 4 31 1 *', fromMs)).toBe(Date.parse('2027-01-31T04:15:00.000Z'));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CronScheduler behaviour tests (fake timers)
 // ---------------------------------------------------------------------------
 
