@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added — canonical branch protection on `main`
+
+`main` previously had zero branch protection (no required status checks, no
+required reviews, no rulesets) — the only thing standing between a push and
+`main` was individual discipline. Added, matching `conduit`'s live shape:
+
+- Required status checks: `Build & Type Check`, `Dashboard Build`,
+  `Unit Tests`, `Operational-leak scan` (all `github-actions`, app id 15368).
+- 1 required approving review (`require_code_owner_reviews: false` — no
+  `CODEOWNERS` file exists yet; can layer that on separately if one is added).
+- `enforce_admins: false` — preserves the existing admin/agent squash-merge
+  path (used throughout tonight's PR triage) for cases with no second
+  reviewer available, same pattern already proven on `conduit`.
+- No force-pushes, no deletions.
+
+Step 0 of the low-risk auto-merge lane design
+(`task_1785685546659`) — the lane should merge through required-checks, not
+around an unprotected `main`.
+
 ### Fixed — hang-detector class 3: PreToolUse activity beat as a third liveness source
 
 The Stop hook (`last_idle.flag`) only writes on turn COMPLETION, so a single
