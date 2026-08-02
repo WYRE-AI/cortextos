@@ -1,7 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+
+const execFileMock = vi.fn();
+vi.mock('child_process', () => ({
+  execFile: (...args: unknown[]) => execFileMock(...args),
+}));
+
 import {
   HISTORY_SIZE,
   REPETITION_BLOCK,
@@ -14,6 +20,7 @@ import {
   detectPingPong,
   decideHookAction,
   loadState,
+  notifyOrchestrator,
   type ToolCallRecord,
   type LoopDetectorState,
 } from '../../../src/hooks/hook-loop-detector';
@@ -308,5 +315,73 @@ describe('hook-loop-detector state loading', () => {
     const state = loadState(tmpDir);
     expect(state.history).toHaveLength(2);
     expect(state.history.map(r => r.toolName)).toEqual(['Read', 'Bash']);
+  });
+});
+
+describe('notifyOrchestrator', () => {
+  // Same CTX_FRAMEWORK_ROOT-branching determinism concern as hook-crash-alert's
+  // notifyAgents tests — pin it unset so the execFile args shape (cortextos vs
+  // execPath+cliPath) doesn't depend on the shell this test happens to run in.
+  let originalFrameworkRoot: string | undefined;
+  let originalOrchestrator: string | undefined;
+
+  beforeEach(() => {
+    execFileMock.mockReset();
+    originalFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    originalOrchestrator = process.env.CTX_ORCHESTRATOR_AGENT;
+    delete process.env.CTX_FRAMEWORK_ROOT;
+    delete process.env.CTX_ORCHESTRATOR_AGENT;
+  });
+
+  afterEach(() => {
+    if (originalFrameworkRoot === undefined) delete process.env.CTX_FRAMEWORK_ROOT;
+    else process.env.CTX_FRAMEWORK_ROOT = originalFrameworkRoot;
+    if (originalOrchestrator === undefined) delete process.env.CTX_ORCHESTRATOR_AGENT;
+    else process.env.CTX_ORCHESTRATOR_AGENT = originalOrchestrator;
+  });
+
+  it('no-ops when CTX_ORCHESTRATOR_AGENT is unset', () => {
+    notifyOrchestrator('dev', 'Emergency escape granted after 30 min blocked.');
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('no-ops when the orchestrator is the agent itself', () => {
+    process.env.CTX_ORCHESTRATOR_AGENT = 'boss';
+    notifyOrchestrator('boss', 'Emergency escape granted after 30 min blocked.');
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('sends a high-priority bus message to the configured orchestrator', () => {
+    process.env.CTX_ORCHESTRATOR_AGENT = 'boss';
+    notifyOrchestrator('dev', 'Emergency escape granted after 30 min blocked.');
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+    const [cmd, args] = execFileMock.mock.calls[0];
+    expect(cmd).toBe('cortextos');
+    expect(args.slice(0, 4)).toEqual(['bus', 'send-message', 'boss', 'high']);
+  });
+
+  it('body names the stuck agent and includes the escape message', () => {
+    process.env.CTX_ORCHESTRATOR_AGENT = 'boss';
+    notifyOrchestrator('dev', 'Emergency escape granted after 42 min blocked.');
+    const body: string = execFileMock.mock.calls[0][1][4];
+    expect(body).toContain('dev');
+    expect(body).toContain('stuck in a blocked tool-call loop');
+    expect(body).toContain('Emergency escape granted after 42 min blocked.');
+  });
+
+  it('routes via execPath+cliPath when CTX_FRAMEWORK_ROOT is set', () => {
+    process.env.CTX_ORCHESTRATOR_AGENT = 'boss';
+    process.env.CTX_FRAMEWORK_ROOT = '/opt/cortextos';
+    notifyOrchestrator('dev', 'Emergency escape granted after 30 min blocked.');
+    const [cmd, args] = execFileMock.mock.calls[0];
+    expect(cmd).toBe(process.execPath);
+    expect(args[0]).toBe('/opt/cortextos/dist/cli.js');
+    expect(args.slice(1, 5)).toEqual(['bus', 'send-message', 'boss', 'high']);
+  });
+
+  it('does not throw when execFile throws synchronously', () => {
+    process.env.CTX_ORCHESTRATOR_AGENT = 'boss';
+    execFileMock.mockImplementationOnce(() => { throw new Error('exec failed'); });
+    expect(() => notifyOrchestrator('dev', 'Emergency escape granted after 30 min blocked.')).not.toThrow();
   });
 });
