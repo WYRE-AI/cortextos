@@ -110,6 +110,27 @@ export function writeDaemonCrashedMarkers(ctxRoot: string): void {
   }
 }
 
+export interface BuildManifest { gitSha: string; builtAt: string; }
+
+/**
+ * Read dist/build-manifest.json (written by tsup's onSuccess hook — see
+ * tsup.config.ts). Returns null on any failure: missing file (build
+ * predates this feature, or dist/ isn't built yet), malformed JSON, or a
+ * shape that doesn't match. Never throws — this is provenance logging, not
+ * something that should be able to block daemon startup.
+ */
+export function readBuildManifest(frameworkRoot: string): BuildManifest | null {
+  try {
+    const manifestPath = join(frameworkRoot, 'dist', 'build-manifest.json');
+    if (!existsSync(manifestPath)) return null;
+    const parsed = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+    if (typeof parsed?.gitSha !== 'string' || typeof parsed?.builtAt !== 'string') return null;
+    return { gitSha: parsed.gitSha, builtAt: parsed.builtAt };
+  } catch {
+    return null;
+  }
+}
+
 function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken: string } | null {
   // Priority 1: explicit operator env (recommended for production).
   const envChat = process.env.CTX_OPERATOR_CHAT_ID;
@@ -244,6 +265,13 @@ class Daemon {
     if (!frameworkRoot) {
       console.error('[daemon] CTX_FRAMEWORK_ROOT not set');
       process.exit(1);
+    }
+
+    const buildManifest = readBuildManifest(frameworkRoot);
+    if (buildManifest) {
+      console.log(`[daemon] Build provenance: sha=${buildManifest.gitSha} builtAt=${buildManifest.builtAt}`);
+    } else {
+      console.log('[daemon] Build provenance: no build-manifest.json found (build predates this feature, or dist/ is unbuilt)');
     }
 
     // Write PID file
