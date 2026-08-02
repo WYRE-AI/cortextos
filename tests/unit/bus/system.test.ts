@@ -116,6 +116,31 @@ describe('Bus System', () => {
       expect(report.staged).toContain('readme.md');
     });
 
+    // 2026-07-15 (analyst root-cause): the pre-fix sk- branch was a bare
+    // substring match, so prose merely DOCUMENTING a token format (no real
+    // secret value) tripped it — e.g. CLAUDE.md's "Setup-tokens (sk-ant-oat01)
+    // lack the user:profile scope" blocked the daily auto-commit for a week.
+    it('does NOT false-positive on prose documenting a token FORMAT, not a real value (regression guard)', () => {
+      writeFileSync(
+        join(gitDir, 'CLAUDE.md'),
+        '- Setup-tokens (`sk-ant-oat01`) lack the `user:profile` scope, so preflight 403s with them.',
+      );
+
+      const report = autoCommit(gitDir, true);
+      expect(report.staged).toContain('CLAUDE.md');
+      expect(report.blocked.some(b => b.includes('CLAUDE.md'))).toBe(false);
+    });
+
+    it('STILL blocks a real sk- shaped token — the false-positive fix must not weaken real leak detection', () => {
+      writeFileSync(
+        join(gitDir, 'oops.json'),
+        '{"key":"sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-ABCDEF"}',
+      );
+
+      const report = autoCommit(gitDir, true);
+      expect(report.blocked.some(b => b.includes('oops.json') && b.includes('credential'))).toBe(true);
+    });
+
     it('allows script files even with credential-like patterns', () => {
       writeFileSync(join(gitDir, 'deploy.sh'), '#!/bin/bash\ntoken=get_from_env');
       writeFileSync(join(gitDir, 'app.py'), 'password=input("Enter:")');

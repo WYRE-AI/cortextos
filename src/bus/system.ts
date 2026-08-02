@@ -43,7 +43,15 @@ const EXCLUDED_DIR_PREFIXES = [
   '.venv/',
 ];
 
-const CREDENTIAL_PATTERNS = /(?:token=|key=|password=|secret=|sk-|ghp_|xoxb-|AKIA)/;
+// sk- requires a real-token-shaped tail (20+ alphanumeric/_/- chars), not a
+// bare substring match. Pre-fix, prose merely DOCUMENTING a token format —
+// e.g. CLAUDE.md's "Setup-tokens (sk-ant-oat01) lack the user:profile
+// scope" — tripped the sk- branch (analyst root-cause, 2026-07-15) and
+// silently blocked the daily auto-commit snapshot for a week. Real
+// Anthropic/OpenAI-shaped keys are 40-100+ chars after the prefix, so 20 is
+// a wide safety margin below any real key while comfortably excluding short
+// format-name mentions like "sk-ant-oat01" (9 chars after "sk-").
+const CREDENTIAL_PATTERNS = /(?:token=|key=|password=|secret=|sk-[a-zA-Z0-9_-]{20,}|ghp_|xoxb-|AKIA)/;
 
 const SCRIPT_EXTENSIONS = new Set(['.sh', '.py', '.js']);
 
