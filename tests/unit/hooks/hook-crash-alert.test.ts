@@ -8,7 +8,7 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { notifyAgents, classifyFromMarkers, detectRateLimitWithRetry } from '../../../src/hooks/hook-crash-alert';
+import { notifyAgents, classifyFromMarkers, detectRateLimitWithRetry, resolveCrashAlertRecipients } from '../../../src/hooks/hook-crash-alert';
 import { clearEndMarkers } from '../../../src/bus/heartbeat';
 
 describe('notifyAgents', () => {
@@ -109,6 +109,24 @@ describe('notifyAgents', () => {
     })).not.toThrow();
     // Second recipient still attempted
     expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('resolveCrashAlertRecipients', () => {
+  it('uses CTX_ORCHESTRATOR_AGENT when set, plus analyst', () => {
+    expect(resolveCrashAlertRecipients('boss')).toEqual(['boss', 'analyst']);
+  });
+
+  it('falls back to chief when the env var is unset', () => {
+    expect(resolveCrashAlertRecipients(undefined)).toEqual(['chief', 'analyst']);
+  });
+
+  it('falls back to chief for an empty-string env var', () => {
+    expect(resolveCrashAlertRecipients('')).toEqual(['chief', 'analyst']);
+  });
+
+  it('dedupes when the orchestrator is already named analyst', () => {
+    expect(resolveCrashAlertRecipients('analyst')).toEqual(['analyst']);
   });
 });
 
