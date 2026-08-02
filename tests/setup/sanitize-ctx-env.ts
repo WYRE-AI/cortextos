@@ -25,20 +25,11 @@
  * CI runner) regardless of which shell happens to invoke it, so behavior
  * doesn't depend on whether that shell happens to be a live agent's own
  * session env.
+ *
+ * Swept by prefix rather than an explicit var list, so a future CTX_* var
+ * (e.g. something added alongside a new hook) is covered automatically
+ * instead of silently leaking through an outdated list.
  */
-const CTX_VARS = [
-  'CTX_INSTANCE_ID',
-  'CTX_ROOT',
-  'CTX_FRAMEWORK_ROOT',
-  'CTX_AGENT_NAME',
-  'CTX_AGENT_DIR',
-  'CTX_ORG',
-  'CTX_PROJECT_ROOT',
-  'CTX_TIMEZONE',
-  'CTX_ORCHESTRATOR',
-  'CTX_ORCHESTRATOR_AGENT',
-];
-
-for (const key of CTX_VARS) {
-  delete process.env[key];
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith('CTX_')) delete process.env[key];
 }
