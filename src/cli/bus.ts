@@ -1935,6 +1935,23 @@ function validateSchedule(raw: string): string {
 }
 
 /**
+ * Validate an IANA timezone string (e.g. "America/New_York"). Returns the
+ * string unchanged on success, or throws an Error with a human-readable
+ * message on failure. Delegates to Intl.DateTimeFormat, which throws
+ * RangeError on any string it doesn't recognise as a real IANA zone.
+ */
+function validateTimezone(raw: string): string {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: raw });
+  } catch {
+    throw new Error(
+      `Invalid timezone '${raw}'. Expected an IANA timezone name (e.g. "America/New_York", "UTC", "Asia/Tokyo").`
+    );
+  }
+  return raw;
+}
+
+/**
  * Check whether an agent exists in the current framework root.
  * Returns false if the framework root is unknown (graceful degradation).
  */
@@ -1980,7 +1997,8 @@ busCommand
   .argument('<interval>', 'Schedule: interval ("6h", "30m", "1d") or 5-field cron expr ("0 8 * * *")')
   .argument('<prompt...>', 'Prompt text injected when the cron fires (all remaining words joined)')
   .option('--desc <description>', 'Human-readable description (optional)')
-  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string }) => {
+  .option('--timezone <tz>', 'IANA timezone for a cron-expression schedule (default: UTC). No effect on interval schedules.')
+  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string; timezone?: string }) => {
     // Validate agent name format
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
@@ -1996,6 +2014,12 @@ busCommand
     let schedule: string;
     try { schedule = validateSchedule(interval); } catch (err) { console.error(String(err)); process.exit(1); }
 
+    // Validate timezone (optional)
+    let timezone: string | undefined;
+    if (opts.timezone !== undefined) {
+      try { timezone = validateTimezone(opts.timezone); } catch (err) { console.error(String(err)); process.exit(1); }
+    }
+
     const prompt = promptWords.join(' ');
     const cron: CronDefinition = {
       name,
@@ -2004,6 +2028,7 @@ busCommand
       enabled: true,
       created_at: new Date().toISOString(),
       ...(opts.desc ? { description: opts.desc } : {}),
+      ...(timezone ? { timezone } : {}),
     };
 
     try {
@@ -2096,7 +2121,7 @@ busCommand
       if (!isNaN(dms)) {
         nextFire = fmtTs(new Date(refMs + dms).toISOString());
       } else {
-        const nf = nextFireFromCron(c.schedule, refMs);
+        const nf = nextFireFromCron(c.schedule, refMs, c.timezone);
         if (!isNaN(nf)) nextFire = fmtTs(new Date(nf).toISOString());
       }
       const promptPreview = c.prompt.length > 60 ? c.prompt.slice(0, 57) + '...' : c.prompt;
@@ -2139,12 +2164,13 @@ busCommand
   .option('--prompt <p>', 'New prompt text')
   .option('--enabled <bool>', 'Enable (true) or disable (false) the cron')
   .option('--desc <d>', 'New description')
-  .action(async (agent: string, name: string, opts: { interval?: string; cronExpr?: string; prompt?: string; enabled?: string; desc?: string }) => {
+  .option('--timezone <tz>', 'IANA timezone for a cron-expression schedule (default: UTC)')
+  .action(async (agent: string, name: string, opts: { interval?: string; cronExpr?: string; prompt?: string; enabled?: string; desc?: string; timezone?: string }) => {
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
     const rawSchedule = opts.interval ?? opts.cronExpr;
-    if (!rawSchedule && opts.prompt === undefined && opts.enabled === undefined && opts.desc === undefined) {
-      console.error('Error: at least one of --interval, --cron-expr, --prompt, --enabled, or --desc is required.');
+    if (!rawSchedule && opts.prompt === undefined && opts.enabled === undefined && opts.desc === undefined && opts.timezone === undefined) {
+      console.error('Error: at least one of --interval, --cron-expr, --prompt, --enabled, --desc, or --timezone is required.');
       process.exit(1);
     }
 
@@ -2165,6 +2191,9 @@ busCommand
     }
     if (opts.desc !== undefined) {
       patch.description = opts.desc;
+    }
+    if (opts.timezone !== undefined) {
+      try { patch.timezone = validateTimezone(opts.timezone); } catch (err) { console.error(String(err)); process.exit(1); }
     }
 
     const ok = updateCronDef(agent, name, patch);
