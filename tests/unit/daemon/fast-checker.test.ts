@@ -796,6 +796,13 @@ describe('FastChecker', () => {
     });
   });
 
+  // task_1785176939193: 30s per-test timeout (vs the suite's 10s default) —
+  // these tests advance a fake clock by simulated hours in milliseconds of
+  // real time, but under concurrent fleet load the real wall-clock scheduler
+  // can starve the process long enough to blow the default 10s even though
+  // no fake-timer logic is actually slow. Reproduced directly: 4/4 failures
+  // (including a bare mkdtempSync in beforeEach) at load average 464 on a
+  // 14-core box, 0 failures across 7 consecutive runs at load average ~32.
   describe('heartbeat watchdog', () => {
     beforeEach(() => { vi.useFakeTimers(); });
     afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
@@ -814,7 +821,7 @@ describe('FastChecker', () => {
       );
       checker.stop();
       checker.wake();
-    });
+    }, 30000);
 
     // task_1785174835840: the daemon is a SINGLE PM2 process shared by every
     // agent (one FastChecker per agent, all children of the same daemon PID).
@@ -845,7 +852,7 @@ describe('FastChecker', () => {
       );
       checker.stop();
       checker.wake();
-    });
+    }, 30000);
 
     it('clears timer on stop — no further exec calls after stop', async () => {
       const { execFile } = await import('child_process');
@@ -860,7 +867,7 @@ describe('FastChecker', () => {
       checker.wake();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       expect(execMock.mock.calls.length).toBe(callsBefore);
-    });
+    }, 30000);
 
     it('does not fire before bootstrap completes', async () => {
       const { execFile } = await import('child_process');
@@ -877,7 +884,7 @@ describe('FastChecker', () => {
       );
       checker.stop();
       checker.wake();
-    });
+    }, 30000);
   });
 
   describe('checkHangStatus — #19b bootstrap-hang wiring (restart as expected-beat anchor)', () => {
