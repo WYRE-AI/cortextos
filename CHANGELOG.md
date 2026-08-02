@@ -207,6 +207,12 @@ context-% threshold can see (this is what took out several fleet agents).
 
 ### Fixed — daemon agent-registry ↔ PTY-liveness reconcile
 
+- **reapOrphan accretion guard** (follow-up to the reconcile below): `reapOrphan`
+  now clears the pidfile and reports `reaped: true` ONLY when the process is
+  actually gone (exited on SIGTERM, or a confirmed-ownership SIGKILL). On the
+  fail-closed skip path — alive but no longer ownership-verified before SIGKILL —
+  it leaves the pidfile in place so the orphan is retried by the next boot-reap
+  instead of becoming untracked (accretion), and returns `reaped: false`.
 - **Restart-tooling divergence**: `cortextos stop <agent>` could silently no-op
   while the agent stayed alive ("stop didn't kill it"), and `cortextos start`
   could return "deduped — already in registry" on a *dead* agent. Root cause: the

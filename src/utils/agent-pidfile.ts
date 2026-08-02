@@ -168,33 +168,39 @@ export async function reapOrphan(
     return { reaped: false, verdict, pid: record.pid };
   }
   // verdict === 'owned' — safe to signal.
+  let ended = false;
   try {
     process.kill(record.pid, 'SIGTERM');
     const deadline = Date.now() + sigkillDelayMs;
     while (Date.now() < deadline && isPidAlive(record.pid)) {
       await sleep(50); // async grace wait — does not serialize other boot reaps
     }
-    if (isPidAlive(record.pid)) {
-      // TOCTOU guard: the pid may have exited on SIGTERM and been RECYCLED to an
-      // unrelated process during the grace window. Re-verify ownership
-      // IMMEDIATELY before the SIGKILL — only escalate if it is STILL provably
-      // our process. This makes the never-kill-a-wrong-process invariant hold
-      // literally, not just statistically.
-      if (verifyOwnership(record) === 'owned') {
-        process.kill(record.pid, 'SIGKILL');
-        log(`[reap] SIGKILLed orphaned PTY pid ${record.pid} for ${record.agentName} (ownership re-confirmed).`);
-      } else {
-        log(
-          `[reap] pid ${record.pid} for ${record.agentName} is no longer ownership-verified before SIGKILL ` +
-            `(exited on SIGTERM then recycled?) — NOT sending SIGKILL.`,
-        );
-      }
-    } else {
+    if (!isPidAlive(record.pid)) {
+      ended = true;
       log(`[reap] reaped orphaned PTY pid ${record.pid} for ${record.agentName} (exited on SIGTERM).`);
+    } else if (verifyOwnership(record) === 'owned') {
+      // TOCTOU guard: the pid may have exited on SIGTERM and been RECYCLED to an
+      // unrelated process during the grace window. We only reach here when it is
+      // STILL provably our process — so escalating is safe.
+      process.kill(record.pid, 'SIGKILL');
+      ended = true;
+      log(`[reap] SIGKILLed orphaned PTY pid ${record.pid} for ${record.agentName} (ownership re-confirmed).`);
+    } else {
+      // Alive but no longer ownership-verified (exited on SIGTERM then recycled?,
+      // or a transient ps failure). Fail closed: do NOT SIGKILL. ACCRETION GUARD:
+      // leave `ended` false so the pidfile is NOT cleared below — otherwise a
+      // still-alive orphan would become untracked and evade the next boot-reap.
+      log(
+        `[reap] pid ${record.pid} for ${record.agentName} is no longer ownership-verified before SIGKILL ` +
+          `— NOT sending SIGKILL and LEAVING the pidfile for the next boot-reap.`,
+      );
     }
   } catch (err) {
     log(`[reap] error reaping pid ${record.pid} for ${record.agentName}: ${(err as Error).message}`);
   }
-  clearAgentPid(stateDir);
-  return { reaped: true, verdict, pid: record.pid };
+  // Only clear the pidfile when the process is actually gone. Clearing it while
+  // the process is still alive (the fail-closed skip above) would orphan it from
+  // the next boot-reap (accretion) and make `reaped` dishonest.
+  if (ended) clearAgentPid(stateDir);
+  return { reaped: ended, verdict, pid: record.pid };
 }
