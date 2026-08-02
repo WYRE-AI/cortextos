@@ -43,7 +43,7 @@ export interface AgentPidRecord {
 /** How far apart the recorded and observed process start times may be and still
  *  be considered the same process. lstart granularity is 1s; allow generous slack
  *  for clock/parse jitter. A recycled pid is off by many seconds-to-days. */
-const START_TIME_TOLERANCE_MS = 5_000;
+export const START_TIME_TOLERANCE_MS = 5_000;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 

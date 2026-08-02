@@ -135,6 +135,28 @@ Recovery is now automatic:
 Verified live end-to-end (PTY banner → detection → rotation → targeted restart →
 alert → cooldown) via a shimmed agent binary on 2026-07-16.
 
+### Fixed — topology guard: argv/env instance agreement + single-daemon-per-instance boot guard
+
+- **The daemon now parses `--instance` argv and refuses to start when it
+  disagrees with env `CTX_INSTANCE_ID`** (new `src/daemon/instance-guard.ts`).
+  Env-only resolution was the 2026-07-13 two-daemon root cause: a
+  `pm2 start --update-env` from a shell without `CTX_INSTANCE_ID` re-baked the
+  gateway-named app onto instance `default` — duplicate fleet, bus
+  double-delivery. The mismatch error names both values and the exact operator
+  fix.
+- **Single-daemon-per-instance boot guard**: the daemon refuses to boot when
+  its instance's `daemon.pid` already points at a live process that isn't
+  itself, instead of silently overwriting the pidfile and joining a
+  split-brain. Unknown states (missing/stale/corrupt pidfile) boot normally —
+  it only refuses on a positively-indicated live daemon. Ownership is
+  verified via a new `daemon.start-time` anchor (epoch-ms process start time,
+  written anchor-first/atomically): a live pid whose start time mismatches
+  the anchor is a **recycled pid** (crash-orphaned pidfile) and boots instead
+  of false-refusing; `daemon.pid` itself stays bare-int for operator `cat`s
+  and the deploy-runbook invariant. NOTE: the daemon uses pm2 restart /
+  stop-then-start, NEVER `pm2 reload` — reload spawns-new-before-kill-old, so
+  this guard structurally refuses it by design.
+
 ### Fixed — freeze-cure: context-handoff default-ON + fleet-wide bridge wiring
 
 The daemon shipped a full context-handoff mechanism (thresholds, tiers, handoff
