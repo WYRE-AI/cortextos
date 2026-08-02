@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed — flaky heartbeat-watchdog tests under fleet load
+
+`tests/unit/daemon/fast-checker.test.ts`'s "heartbeat watchdog" tests only
+advance a fake clock, but the suite's 10s default real-wall-clock timeout
+could still be blown under heavy concurrent fleet load (reproduced: 4/4
+failures at load average 464 on a 14-core box, 0 failures across 7 runs at
+load average ~32). Bumped these 4 tests to a 30s per-test timeout rather
+than loosening the suite-wide default.
+
 ### Fixed — hang-detector class 3: PreToolUse activity beat as a third liveness source
 
 The Stop hook (`last_idle.flag`) only writes on turn COMPLETION, so a single
