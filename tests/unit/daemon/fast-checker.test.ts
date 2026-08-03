@@ -803,7 +803,13 @@ describe('FastChecker', () => {
     it('fires exec after bootstrap at 50-min interval', async () => {
       const { execFile } = await import('child_process');
       const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      // pollInterval widened to 60s (vs. the 1s production default): advancing fake
+      // time by 50min at a 1s poll cadence forces vitest to simulate ~3000 poll-loop
+      // iterations, which is real CPU-bound work that can exceed this test's 10s
+      // wall-clock timeout under load — the exact source of this test's flakiness.
+      // The watchdog-fires-at-50min behavior under test is independent of poll
+      // cadence, so widening it here doesn't weaken the assertion.
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: 60_000 });
       checker.start();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       expect(execFile).toHaveBeenCalledWith(
@@ -834,7 +840,8 @@ describe('FastChecker', () => {
     it('passes the WATCHED agent name via explicit env (task_1785174835840)', async () => {
       const { execFile } = await import('child_process');
       const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      // pollInterval widened, see the identical note on the preceding test.
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: 60_000 });
       checker.start();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       expect(execFile).toHaveBeenCalledWith(
@@ -851,7 +858,8 @@ describe('FastChecker', () => {
       const { execFile } = await import('child_process');
       const execMock = execFile as ReturnType<typeof vi.fn>;
       const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      // pollInterval widened, see the identical note on the earlier watchdog tests.
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: 60_000 });
       checker.start();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       const callsBefore = execMock.mock.calls.length;
