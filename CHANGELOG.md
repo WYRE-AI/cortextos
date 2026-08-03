@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Fixed — `list-experiments` and `checkGoalStaleness` silently scoped to a subset, not the whole fleet
+
+`bus list-experiments` with no `--agent` fell back to the caller's own
+agentDir instead of scanning every agent — a completeness scan silently
+returning a subset with no error. `checkGoalStaleness` had its own inline
+`orgs/*/agents/*` scan that never covered namespaced personal agents
+(`orgs/ORG/engineers/ENGINEER/agents/*`). Both were independent
+reimplementations of "enumerate every agent" (a third being `list-agents`'s
+own inline version) already drifting apart.
+
+- **`src/utils/agent-dir.ts`**: new `discoverAllAgents()` — the single
+  canonical fleet enumerator (enabled-agents.json + shared org agents +
+  namespaced personal agents), extracted from `list-agents`'s inline logic.
+- **`src/bus/experiment.ts`**: new `listAllExperiments()` — fleet-wide
+  orchestration over `discoverAllAgents()`, independently testable.
+- **`src/bus/system.ts`**: `checkGoalStaleness` migrated onto
+  `discoverAllAgents()`, closing the namespaced-agent gap as a side effect
+  of the same fix.
+- `list-agents`, `list-experiments`, `check-goal-staleness` (bus CLI) all
+  now share one enumerator — this class of drift is structurally closed,
+  not just patched at two call sites.
+
 ### Added — canonical branch protection on `main`
 
 `main` previously had zero branch protection (no required status checks, no
