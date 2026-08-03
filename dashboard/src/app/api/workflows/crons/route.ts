@@ -124,6 +124,7 @@ export async function GET(request: NextRequest) {
 
     for (const agent of agents) {
       const crons = readAgentCrons(agent.name);
+      if (crons.length === 0) continue;
       const lastByCron = readAgentExecutionLog(agent.name);
       for (const cron of crons) {
         if (searchFilter && !cron.name.toLowerCase().includes(searchFilter)) continue;
