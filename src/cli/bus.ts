@@ -2,7 +2,7 @@ import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { resolveAgentDir, parseQualifiedName } from '../utils/agent-dir.js';
+import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
@@ -10,7 +10,7 @@ import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
-import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
+import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
@@ -698,7 +698,7 @@ busCommand
   .action((opts: { threshold: string }) => {
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
-    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10));
+    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10), env.ctxRoot);
     console.log(JSON.stringify(report, null, 2));
   });
 
@@ -786,18 +786,39 @@ busCommand
 
 busCommand
   .command('list-experiments')
-  .description('List experiments with optional filters')
+  .description('List experiments with optional filters. With no --agent, scans fleet-wide across every agent (like read-all-heartbeats) rather than just the caller.')
   .option('--agent <name>', 'Filter by agent')
   .option('--status <s>', 'Filter by status')
   .option('--metric <m>', 'Filter by metric')
   .option('--json', 'Output as JSON')
   .action((opts: { agent?: string; status?: string; metric?: string; json?: boolean }) => {
     const env = resolveEnv();
-    const agentDir = opts.agent && env.frameworkRoot
-      ? resolveAgentDir(env.frameworkRoot, env.org, opts.agent)
-      : (env.agentDir || process.cwd());
-    const experiments = listExperiments(agentDir, {
-      agent: opts.agent,
+
+    if (opts.agent) {
+      const agentDir = env.frameworkRoot
+        ? resolveAgentDir(env.frameworkRoot, env.org, opts.agent)
+        : (env.agentDir || process.cwd());
+      const experiments = listExperiments(agentDir, {
+        agent: opts.agent,
+        status: opts.status,
+        metric: opts.metric,
+      });
+      console.log(JSON.stringify(experiments, null, 2));
+      return;
+    }
+
+    // task_1785723303692: no --agent given — silently scoping to the caller's
+    // own agentDir here (as this used to) means a "list every experiment"
+    // scan silently returns a subset with no error. Iterate the whole fleet
+    // instead, same discovery source list-agents/checkGoalStaleness use.
+    if (!env.frameworkRoot) {
+      console.log(JSON.stringify(
+        listExperiments(env.agentDir || process.cwd(), { status: opts.status, metric: opts.metric }),
+        null, 2,
+      ));
+      return;
+    }
+    const experiments = listAllExperiments(env.frameworkRoot, env.ctxRoot, {
       status: opts.status,
       metric: opts.metric,
     });
@@ -1418,43 +1439,11 @@ busCommand
     const ctxRoot = require('path').join(require('os').homedir(), '.cortextos', env.instanceId);
     const frameworkRoot = env.frameworkRoot || process.cwd();
 
-    // Collect agents from enabled-agents.json + filesystem scan
-    const enabledFile = join(ctxRoot, 'config', 'enabled-agents.json');
+    // Collect agents from enabled-agents.json + filesystem scan (shared with
+    // any other fleet-wide scan — see discoverAllAgents's docblock).
     const agentMap: Record<string, { org: string; enabled: boolean }> = {};
-
-    if (existsSync(enabledFile)) {
-      try {
-        const data = JSON.parse(readFileSync(enabledFile, 'utf-8'));
-        for (const [name, cfg] of Object.entries(data as Record<string, any>)) {
-          agentMap[name] = { org: cfg.org ?? '', enabled: cfg.enabled !== false };
-        }
-      } catch { /* skip corrupt */ }
-    }
-
-    // Also scan org agent directories (shared and namespaced)
-    const orgsDir = join(frameworkRoot, 'orgs');
-    if (existsSync(orgsDir)) {
-      for (const org of readdirSync(orgsDir)) {
-        // Shared agents: orgs/<org>/agents/<name>
-        const agentsDir = join(orgsDir, org, 'agents');
-        if (existsSync(agentsDir)) {
-          for (const name of readdirSync(agentsDir)) {
-            if (!agentMap[name]) agentMap[name] = { org, enabled: true };
-          }
-        }
-        // Namespaced agents: orgs/<org>/engineers/<eng>/agents/<name>
-        const engineersDir = join(orgsDir, org, 'engineers');
-        if (existsSync(engineersDir)) {
-          for (const engineer of readdirSync(engineersDir)) {
-            const nsAgentsDir = join(engineersDir, engineer, 'agents');
-            if (!existsSync(nsAgentsDir)) continue;
-            for (const name of readdirSync(nsAgentsDir)) {
-              const qualified = `${engineer}/${name}`;
-              if (!agentMap[qualified]) agentMap[qualified] = { org, enabled: true };
-            }
-          }
-        }
-      }
+    for (const a of discoverAllAgents(frameworkRoot, ctxRoot)) {
+      agentMap[a.name] = { org: a.org, enabled: a.enabled };
     }
 
     // Determine running agents via IPC daemon.

@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, existsSync, appendFileSync, unlinkSync } fro
 import { join } from 'path';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomString } from '../utils/random.js';
+import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
 
 // --- Types ---
 
@@ -398,6 +399,28 @@ export function listExperiments(
   // Sort by created_at desc
   experiments.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
+  return experiments;
+}
+
+/**
+ * List experiments across every agent in the system, not just one directory.
+ *
+ * task_1785723303692: `bus list-experiments` with no --agent used to silently
+ * fall back to the caller's own agentDir — a "list every experiment" scan
+ * quietly returning a subset with no error. Uses the same canonical fleet
+ * enumerator as list-agents/checkGoalStaleness so the definition of "every
+ * agent" can't drift between callers.
+ */
+export function listAllExperiments(
+  frameworkRoot: string,
+  ctxRoot: string,
+  filters?: Pick<ExperimentFilters, 'status' | 'metric'>,
+): Experiment[] {
+  const agents = discoverAllAgents(frameworkRoot, ctxRoot);
+  const experiments = agents.flatMap(a =>
+    listExperiments(resolveAgentDir(frameworkRoot, a.org, a.name), filters),
+  );
+  experiments.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
   return experiments;
 }
 
