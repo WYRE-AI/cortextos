@@ -2,6 +2,83 @@
 
 ## [Unreleased]
 
+### Fixed — dashboard showed cron next-fire times 4-5h off from when they actually fire
+
+PR #21 (`1e24108d`) moved cron-expression evaluation off ambient local time to
+the cron's `timezone` (default UTC) — but only in the daemon.
+`dashboard/src/lib/cron-utils.ts` is a deliberate duplicate of that logic (the
+dashboard is a separate Next.js app that cannot import daemon modules) and its
+own header says *"any changes to the core parsing logic should be reflected
+here as well"*. That never happened.
+
+Worse, the dashboard held **two** inline copies of the evaluator — in
+`crons/route.ts` and `health/route.ts` — both matching fields with local
+getters (`getHours()`/`getDate()`/`getDay()`) and both ignoring `cron.timezone`
+entirely. The daemon fired `0 9 * * *` at 09:00 UTC while the dashboard
+displayed its next fire as 09:00 *local* — a 4-5h lie in the UI on the EDT
+fleet host, and the exact bug #21 set out to kill.
+
+- Both inline copies replaced by a single `nextFireFromCronExpr` in
+  `cron-utils.ts` with the daemon's semantics: UTC default, explicit IANA
+  timezone support, infeasible-`dom+month` pre-check, and NaN fail-safe on an
+  invalid zone.
+- `cron.timezone` is now threaded through `computeNextFire` in both routes
+  (mirroring the daemon's `computeNextFireAt`), and added to both routes'
+  mirrored `CronDefinition`.
+- New `tests/unit/dashboard/cron-utils-nextfire.test.ts` imports BOTH
+  implementations and asserts they agree across every cron field, including
+  EST-vs-EDT and `Asia/Tokyo`. It lives in the root test tree deliberately —
+  importing root `src/` from a dashboard test drags root files into the
+  dashboard's lower-ES-target TS program and breaks its typecheck.
+
+### Fixed — GET /api/workflows/crons was O(crons) full log reads per request
+
+`readLastExecution(agent, cronName)` re-read and re-parsed the agent's entire
+`cron-execution.log` once **per cron**. At 10 crons per agent that is ten full
+reads of the same file per request, which made `/crons` the slowest route the
+dashboard serves — while `/health`, which already read each log once, was 5x
+faster over the same dataset.
+
+Replaced with a single backward pass per agent building a `Map<cronName,
+lastEntry>` (keeping the first hit per name preserves "last entry in file order
+wins" exactly). Measured on the phase-4 benchmark:
+
+| dataset | p50 before | p50 after | p95 before | p95 after |
+|---|---|---|---|---|
+| 50 crons  | 1980ms | **166ms** | 2676ms | **373ms** |
+| 100 crons | 1749ms | **270ms** | 2706ms | **400ms** |
+
+`tests/integration/phase4-performance.test.ts` had been failing its
+`p95 < 2000ms` budget on this route; it now passes 6/6 and runs 3x faster.
+
+### Fixed — cron next-fire scan cost seconds of CPU per computation
+
+`nextFireFromCron` walks candidate minutes one at a time, and since #21 every
+candidate went through `Intl.DateTimeFormat.formatToParts()`. A sparse
+expression like `0 0 31 1,2 *` scans ~291K minutes — measured **9,382ms** per
+call, on every schedule computation the daemon makes.
+
+UTC (the default, so essentially every cron) now extracts fields with native
+`Date` getters: semantically identical, since UTC has no DST for the Intl path
+to be DST-native about. Same scan measured **340ms** — 27.6x. Non-UTC zones
+still use `Intl` and are unchanged. `tests/unit/daemon/cron-scheduler.test.ts`
+gained an equivalence test (`UTC` vs the equivalent `Etc/UTC`, which takes the
+Intl branch) plus a timing regression guard; the file went from ~200s to 9s.
+
+### Fixed — fast-checker watchdog tests leaked poll loops and timed out
+
+The heartbeat-watchdog tests drive `start()`, which runs an unawaited infinite
+poll loop. At the 1s default `pollInterval`, advancing 50 minutes of fake time
+replayed ~3,000 poll cycles of real fs work purely as overhead — enough to blow
+the 10s timeout under load. Worse, `stop()`/`wake()` sat at the END of each test
+body, so a test that timed out never ran it and leaked a live loop, which
+`afterEach`'s `useRealTimers()` then converted into a REAL 1s fs-polling loop
+for the rest of the file. That cascade is why *which* watchdog test failed
+varied run to run.
+
+Coarse `pollInterval` for these tests plus teardown moved into `afterEach`.
+File went from 42s with 3-4 flaky failures to 6.8s, 75/75 stable.
+
 ### Fixed — FM-8 cron tests still asserted the pre-#21 local-time contract
 
 PR #21 (`1e24108d`) deliberately moved cron-expression evaluation off the
