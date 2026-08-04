@@ -15,7 +15,7 @@ export interface Experiment {
   window: string;
   measurement: string;
   status: 'proposed' | 'running' | 'completed';
-  baseline_value: number;
+  baseline_value: number | null;
   result_value: number | null;
   decision: 'keep' | 'discard' | null;
   learning: string;
@@ -35,6 +35,7 @@ export interface ExperimentCreateOptions {
   measurement?: string;
   approval_required?: boolean;
   kind?: 'intervention' | 'snapshot';
+  baseline?: number;
 }
 
 export interface ExperimentEvaluateOptions {
@@ -173,7 +174,7 @@ export function createExperiment(
     window: options?.window ?? cycleDefaults.window ?? '24h',
     measurement: options?.measurement ?? cycleDefaults.measurement ?? '',
     status: 'proposed',
-    baseline_value: 0,
+    baseline_value: options?.baseline ?? null,
     result_value: null,
     decision: null,
     learning: '',
@@ -265,12 +266,22 @@ export function evaluateExperiment(
     throw new Error(`Experiment ${experimentId} is '${experiment.status}', expected 'running'`);
   }
 
+  if (experiment.baseline_value === null) {
+    throw new Error(
+      `Experiment ${experimentId} has no baseline_value — it was created without --baseline. ` +
+      `Refusing to evaluate: comparing against an implicit 0 baseline structurally forces ` +
+      `every 'direction=higher' result to KEEP, which is a measurement-integrity bug, not a ` +
+      `valid measurement. Re-create the experiment with --baseline <n>.`,
+    );
+  }
+  const baseline = experiment.baseline_value;
+
   // Compare measured vs baseline using direction
   let decision: 'keep' | 'discard';
   if (experiment.direction === 'higher') {
-    decision = measuredValue > experiment.baseline_value ? 'keep' : 'discard';
+    decision = measuredValue > baseline ? 'keep' : 'discard';
   } else {
-    decision = measuredValue < experiment.baseline_value ? 'keep' : 'discard';
+    decision = measuredValue < baseline ? 'keep' : 'discard';
   }
 
   experiment.status = 'completed';
@@ -284,9 +295,9 @@ export function evaluateExperiment(
     measuredValue = options.score;
     // Re-evaluate decision with the correct measured value
     if (experiment.direction === 'higher') {
-      decision = measuredValue > experiment.baseline_value ? 'keep' : 'discard';
+      decision = measuredValue > baseline ? 'keep' : 'discard';
     } else {
-      decision = measuredValue < experiment.baseline_value ? 'keep' : 'discard';
+      decision = measuredValue < baseline ? 'keep' : 'discard';
     }
     experiment.result_value = measuredValue;
     experiment.decision = decision;
@@ -323,7 +334,7 @@ export function evaluateExperiment(
     experiment.agent,
     experiment.metric,
     String(measuredValue),
-    String(decision === 'keep' ? measuredValue : experiment.baseline_value),
+    String(decision === 'keep' ? measuredValue : baseline),
     decision,
     experiment.hypothesis,
     experiment.completed_at,
@@ -339,7 +350,7 @@ export function evaluateExperiment(
     `## ${experiment.id} (${decision})`,
     `- **Metric:** ${experiment.metric}`,
     `- **Hypothesis:** ${experiment.hypothesis}`,
-    `- **Result:** ${measuredValue} (baseline: ${decision === 'keep' ? measuredValue : experiment.baseline_value})`,
+    `- **Result:** ${measuredValue} (baseline: ${decision === 'keep' ? measuredValue : baseline})`,
     experiment.learning ? `- **Learning:** ${experiment.learning}` : '',
     '',
   ]

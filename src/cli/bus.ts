@@ -726,7 +726,8 @@ busCommand
   .option('--direction <dir>', 'Direction: higher or lower', 'higher')
   .option('--window <dur>', 'Measurement window', '24h')
   .option('--kind <kind>', 'intervention or snapshot', 'intervention')
-  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string }) => {
+  .option('--baseline <n>', 'Baseline value to compare the measured result against (required before evaluate-experiment will accept this experiment)')
+  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string; baseline?: string }) => {
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     const id = createExperiment(agentDir, env.agentName, metric, hypothesis, {
@@ -734,6 +735,7 @@ busCommand
       direction: opts.direction as 'higher' | 'lower',
       window: opts.window,
       kind: opts.kind as 'intervention' | 'snapshot',
+      baseline: opts.baseline !== undefined ? parseFloat(opts.baseline) : undefined,
     });
     console.log(id);
 
@@ -778,7 +780,7 @@ busCommand
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     const experiment = evaluateExperiment(agentDir, id, parseFloat(value), {
-      score: opts.score ? parseInt(opts.score, 10) : undefined,
+      score: opts.score ? parseFloat(opts.score) : undefined,
       justification: opts.justification,
     });
     console.log(JSON.stringify(experiment, null, 2));
