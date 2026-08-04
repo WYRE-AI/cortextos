@@ -981,6 +981,15 @@ unnoticed because the hang-detector happened to rescue it.
   conditions must hold, so a genuine crash that merely coincides with an
   install window still counts. *(Resilience — also covers any other cause of a
   vanished runtime: botched upgrade, unmounted volume, bad PATH.)*
+- **Retry cadence** is two-tier, keyed on how long the binary has been gone:
+  30s for the first 15 minutes of an outage (a real install window is minutes,
+  and a failed exec costs ~1ms, so polling is effectively free), then 5min
+  after that — an outage that long is a broken runtime needing a human, not an
+  in-flight install, and the slower tier bounds `restarts.log` growth without
+  ever giving up (nothing else would bring the agent back). Outage age is
+  derived from timestamps rather than an attempt counter, so no reset has to
+  stay in sync with `start()`: a gap longer than the slow tier is itself the
+  signal that the previous outage ended, and the next failure starts fresh.
 
 ### Added — canonical branch protection on `main`
 

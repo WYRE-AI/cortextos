@@ -172,6 +172,35 @@ describe('AgentProcess — binary-unavailable exemption (2026-08-04 shared-binar
     expect(String(logLine)).not.toContain('BINARY_UNAVAILABLE_RECOVERY');
   });
 
+  it('polls fast during a fresh outage, then backs off once it is clearly not an install', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    const delayFor = () =>
+      (ap as unknown as { binaryUnavailableRetryDelayMs(): number }).binaryUnavailableRetryDelayMs();
+    const nowSpy = vi.spyOn(Date, 'now');
+
+    // t=0 — outage begins. Fast tier: a real install window is minutes, and
+    // 30s keeps downtime within a minute of the binary reappearing.
+    nowSpy.mockReturnValue(1_000_000);
+    expect(delayFor()).toBe(30_000);
+
+    // t=+10min — still inside the fast window (the real outage was ~12min).
+    nowSpy.mockReturnValue(1_000_000 + 10 * 60_000);
+    expect(delayFor()).toBe(30_000);
+
+    // t=+20min — past the fast window. No longer an in-flight install, so
+    // slow down to bound restarts.log growth without ever giving up.
+    nowSpy.mockReturnValue(1_000_000 + 20 * 60_000);
+    expect(delayFor()).toBe(5 * 60_000);
+
+    // A gap longer than the slow tier means the previous outage ended and the
+    // agent recovered — a later failure is a NEW outage and starts fast again,
+    // rather than inheriting the old one's backoff.
+    nowSpy.mockReturnValue(1_000_000 + 20 * 60_000 + 60 * 60_000);
+    expect(delayFor()).toBe(30_000);
+
+    nowSpy.mockRestore();
+  });
+
   it('does not exempt a clean exit(0) even while the binary is missing (narrowness guard)', async () => {
     // A missing binary explains exit 1 (exec failure), not a graceful exit 0.
     // Without the exit-code condition this branch would swallow unrelated

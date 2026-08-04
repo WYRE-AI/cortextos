@@ -20,6 +20,13 @@ type LogFn = (msg: string) => void;
 // deliberately narrower than the 16KB image-poison capture it slices from.
 const RATE_LIMIT_EXIT_TAIL_BYTES = 4096;
 
+// Binary-unavailable retry tiers. See binaryUnavailableRetryDelayMs().
+// Fast tier covers an in-flight install (the 2026-08-04 outage was ~12min);
+// the slow tier is for a runtime that is broken rather than mid-update.
+const BINARY_UNAVAILABLE_FAST_MS = 30_000;
+const BINARY_UNAVAILABLE_FAST_WINDOW_MS = 15 * 60_000;
+const BINARY_UNAVAILABLE_SLOW_MS = 5 * 60_000;
+
 /**
  * Manages a single agent's lifecycle.
  * Replaces agent-wrapper.sh for one agent.
@@ -38,6 +45,11 @@ export class AgentProcess {
   private crashTimestamps: number[] = [];
   private crashWindowMs: number = 0;
   private crashWindowMax: number = 0;
+  // Binary-unavailable outage tracking (see binaryUnavailableRetryDelayMs).
+  // Timestamps, not an attempt counter, so no reset has to stay in sync with
+  // start() — a long enough gap is itself the signal that the outage ended.
+  private binaryUnavailableSince: number = 0;
+  private lastBinaryUnavailableAt: number = 0;
   private sessionStart: Date | null = null;
   private status: AgentStatus['status'] = 'stopped';
   private stopping: boolean = false;
@@ -764,28 +776,43 @@ export class AgentProcess {
   /**
    * How long to wait before re-spawning an agent whose binary is missing.
    *
-   * Called only from handleExit()'s binary-unavailable branch — the runtime is
-   * gone from PATH and the retry does NOT count against max_crashes_per_day,
-   * so this loop is the agent's only route back to life. That makes the delay
-   * a real availability/noise trade-off rather than a tuning constant:
+   * Called only from handleExit()'s binary-unavailable branch. The retry does
+   * NOT count against max_crashes_per_day, so this loop is the agent's only
+   * route back to life — the delay is an availability trade-off, not a tuning
+   * constant. Too short and the daemon spins against a torn-down install; too
+   * long and the fleet stays dark after the installer already finished,
+   * missing cron fires and inbox messages the whole time.
    *
-   *   - Too short  → tight respawn loop against a torn-down install; log spam,
-   *                  and a wasted spawn every interval for the whole window
-   *                  (the 2026-08-04 gap was ~12 minutes).
-   *   - Too long   → the fleet stays dark well after the installer finishes.
-   *                  Agents miss cron fires and inbox messages the entire time.
+   * Two tiers, keyed on how long the binary has been gone:
    *
-   * Consider also whether this should stay flat or back off: a flat delay
-   * recovers fastest and is trivial to reason about, while backing off costs
-   * recovery latency but survives a permanently-removed binary without
-   * spinning forever. `this.crashCount` is deliberately NOT incremented on
-   * this path, so if you want escalation you need your own counter — and if
-   * you want a giving-up point, note that nothing else will halt this loop.
+   *   - First BINARY_UNAVAILABLE_FAST_WINDOW_MS of an outage: poll every 30s.
+   *     A real install window is minutes (the 2026-08-04 outage was ~12), so
+   *     this is the case that actually happens, and 30s keeps the agent's
+   *     downtime within a minute of the binary reappearing. A failed exec
+   *     costs ~1ms, so the polling itself is free.
+   *   - After that: back off to 5min. An outage this long is no longer an
+   *     in-flight install — it's a broken or removed runtime needing a human.
+   *     Slowing down bounds restarts.log growth (30s forever would append
+   *     ~2,880 lines/agent/day) without ever giving up, since nothing else
+   *     would bring the agent back if we did.
    *
-   * TODO(aaron): implement the retry policy. Return the delay in milliseconds.
+   * Outage age is derived from timestamps rather than an attempt counter so
+   * there is no reset to keep in sync with start(): a gap longer than the slow
+   * tier means the previous outage ended and recovery already happened, so the
+   * next failure starts a fresh outage at the fast tier.
    */
   private binaryUnavailableRetryDelayMs(): number {
-    return 30_000; // placeholder — flat 30s
+    const now = Date.now();
+    const gapSinceLast = now - this.lastBinaryUnavailableAt;
+    if (gapSinceLast > BINARY_UNAVAILABLE_SLOW_MS * 2) {
+      this.binaryUnavailableSince = now;
+    }
+    this.lastBinaryUnavailableAt = now;
+
+    const outageAge = now - this.binaryUnavailableSince;
+    return outageAge < BINARY_UNAVAILABLE_FAST_WINDOW_MS
+      ? BINARY_UNAVAILABLE_FAST_MS
+      : BINARY_UNAVAILABLE_SLOW_MS;
   }
 
   private handleExit(exitCode: number): void {
