@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Fixed — FM-8 cron tests still asserted the pre-#21 local-time contract
+
+PR #21 (`1e24108d`) deliberately moved cron-expression evaluation off the
+daemon's ambient timezone and into the cron's `timezone` field, defaulting to
+UTC. It updated the `nextFireFromCron` unit tests but missed the FM-8
+integration block in `tests/integration/phase5-failure-modes.test.ts`, which
+kept asserting the superseded contract — its comment still read *"The scheduler
+uses `Date.getHours()` (local wall clock)"*.
+
+The block only passed on a host whose local time was UTC: on the fleet host
+(EDT) `fixed-hour cron expression fires at the correct local hour` failed, and
+under `TZ=Pacific/Auckland` the weekday case failed too — it had been passing
+under EDT by coincidence, not because it was timezone-agnostic.
+
+- Rewritten against pinned absolute UTC instants (`Date.UTC`), so the tests
+  assert the real contract and pass identically on any host timezone —
+  verified green under `Pacific/Auckland` (UTC+12), `UTC`, and `Asia/Kolkata`
+  (UTC+5:30).
+- Added a declared-timezone case: `0 3 * * *` with
+  `timezone: "America/New_York"` must NOT fire at 03:00 UTC and must fire at
+  07:00 UTC (EDT). This is the half of #21's contract that had no
+  scheduler-level integration coverage — it proves `timezone` threads through
+  `CronScheduler`, not just `nextFireFromCron`.
+
 ### Fixed — auto-updater race on the shared `claude` binary took the fleet down
 
 Every agent runs under its own `CLAUDE_CONFIG_DIR`, so every Claude Code
