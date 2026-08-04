@@ -939,6 +939,49 @@ own inline version) already drifting apart.
   now share one enumerator — this class of drift is structurally closed,
   not just patched at two call sites.
 
+### Fixed — auto-updater race on the shared `claude` binary took the fleet down
+
+Every agent runs under its own `CLAUDE_CONFIG_DIR`, so every Claude Code
+instance believes it is a standalone install and independently schedules its
+own auto-update — but all agents share ONE binary
+(`~/.local/bin/claude -> versions/<version>`). N private updaters, one shared
+file, no lock.
+
+On 2026-08-04 two agents' updaters fired 250ms apart (`14:05:30.564Z` and
+`14:05:30.812Z`), both reported `install_failed`, and left
+`~/.local/bin/claude` dangling at an already-deleted `2.1.220` for ~12
+minutes. node-pty hands back a pid for a dangling symlink, then the child
+exits 1 having written zero bytes — verified directly:
+
+```
+pid assigned: 69035
+exitCode: 1  signal: 0
+output bytes: 0 ""
+```
+
+The daemon could not distinguish that from an agent crash, so it charged the
+daily crash budget with exponential backoff: `boss` burned 8 of 10, `analyst`
+hit the cap and HALTED. The same shape had already fired 13 hours earlier
+(analyst updated 00:46Z, crash-looped 01:08–01:28Z, HALTED) and went
+unnoticed because the hang-detector happened to rescue it.
+
+- **`src/pty/agent-pty.ts`** — `getBaseEnv()` now sets `DISABLE_AUTOUPDATER=1`
+  for every agent PTY. Updating the runtime is an operator action taken when
+  the fleet is quiet, not something N unsupervised agents each attempt against
+  one shared file. *(Prevention.)*
+- **`src/pty/agent-pty.ts`** — new exported `isBinaryAvailable(binary)`:
+  resolves against PATH and checks `X_OK`. `existsSync` follows symlinks, so a
+  dangling symlink and a partially-written binary both report unavailable.
+- **`src/daemon/agent-process.ts`** — `handleExit()` gained a third
+  "upstream condition, not agent malfunction" exemption alongside the
+  image-poison and rate-limit blocks: an exit that is (1) code 1, (2) zero
+  bytes written this lifecycle, and (3) accompanied by a binary that is not
+  executable on PATH right now is retried WITHOUT charging
+  `max_crashes_per_day`, logged as `BINARY_UNAVAILABLE_RECOVERY`. All three
+  conditions must hold, so a genuine crash that merely coincides with an
+  install window still counts. *(Resilience — also covers any other cause of a
+  vanished runtime: botched upgrade, unmounted volume, bad PATH.)*
+
 ### Added — canonical branch protection on `main`
 
 `main` previously had zero branch protection (no required status checks, no

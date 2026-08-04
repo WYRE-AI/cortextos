@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFi
 import { join, sep } from 'path';
 import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
-import { AgentPTY } from '../pty/agent-pty.js';
+import { AgentPTY, isBinaryAvailable } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { MessageDedup, injectMessage } from '../pty/inject.js';
@@ -750,6 +750,44 @@ export class AgentProcess {
     }
   }
 
+  /**
+   * The binary this agent's PTY execs, mirroring the runtime switch in start().
+   * Kept in sync with that ternary — the two are the only places runtime maps
+   * to a concrete executable.
+   */
+  private agentBinaryName(): string {
+    if (this.config.runtime === 'hermes') return 'hermes';
+    if (this.config.runtime === 'codex-app-server') return 'codex';
+    return 'claude';
+  }
+
+  /**
+   * How long to wait before re-spawning an agent whose binary is missing.
+   *
+   * Called only from handleExit()'s binary-unavailable branch — the runtime is
+   * gone from PATH and the retry does NOT count against max_crashes_per_day,
+   * so this loop is the agent's only route back to life. That makes the delay
+   * a real availability/noise trade-off rather than a tuning constant:
+   *
+   *   - Too short  → tight respawn loop against a torn-down install; log spam,
+   *                  and a wasted spawn every interval for the whole window
+   *                  (the 2026-08-04 gap was ~12 minutes).
+   *   - Too long   → the fleet stays dark well after the installer finishes.
+   *                  Agents miss cron fires and inbox messages the entire time.
+   *
+   * Consider also whether this should stay flat or back off: a flat delay
+   * recovers fastest and is trivial to reason about, while backing off costs
+   * recovery latency but survives a permanently-removed binary without
+   * spinning forever. `this.crashCount` is deliberately NOT incremented on
+   * this path, so if you want escalation you need your own counter — and if
+   * you want a giving-up point, note that nothing else will halt this loop.
+   *
+   * TODO(aaron): implement the retry policy. Return the delay in milliseconds.
+   */
+  private binaryUnavailableRetryDelayMs(): number {
+    return 30_000; // placeholder — flat 30s
+  }
+
   private handleExit(exitCode: number): void {
     // Capture last 16KB of the agent's stdout BEFORE nulling pty.
     // Used by the image-poison auto-recovery check below — reads the log
@@ -908,6 +946,49 @@ export class AgentProcess {
           this.start().catch(err => this.log(`Rate-limit restart failed: ${err}`));
         }
       }, 5000);
+      return;
+    }
+
+    // Binary-unavailable exemption (2026-08-04 fleet incident). Third member
+    // of the "upstream condition, not agent malfunction" family, alongside the
+    // image-poison and rate-limit blocks above.
+    //
+    // Every agent runs its own Claude Code auto-updater (private
+    // CLAUDE_CONFIG_DIR) against ONE shared binary. When two updaters raced,
+    // the install was left torn down — ~/.local/bin/claude dangling at a
+    // deleted version for ~12 minutes. node-pty happily returns a pid for a
+    // dangling symlink, then the child exits 1 having written nothing at all.
+    // Indistinguishable from a crash at the daemon's altitude, so the daemon
+    // charged the daily budget with exponential backoff and halted agents at
+    // the cap. AgentPTY's DISABLE_AUTOUPDATER pin is the prevention half; this
+    // is the resilience half, and it stands on its own for any other cause of
+    // a vanished runtime (botched upgrade, unmounted volume, bad PATH).
+    //
+    // Deliberately narrow — three independent conditions must all hold, so a
+    // genuine crash that merely coincides with an update window still counts:
+    //   1. exitCode === 1        — exec failure, not a clean exit
+    //   2. zero bytes written    — a real agent crash emits SOMETHING first.
+    //                              Bounded at stdoutLogSizeAtStart because
+    //                              stdout.log is append-only across restarts.
+    //   3. binary missing NOW    — the decisive check; without it (1)+(2) would
+    //                              exempt any fast silent failure.
+    const wroteNothingThisLifecycle =
+      this.tailStdoutLog(1, this.stdoutLogSizeAtStart).length === 0;
+    if (exitCode === 1 && wroteNothingThisLifecycle && !isBinaryAvailable(this.agentBinaryName())) {
+      const retryMs = this.binaryUnavailableRetryDelayMs();
+      this.log(
+        `Agent binary "${this.agentBinaryName()}" is not executable on PATH — runtime is missing or ` +
+        `mid-install, not an agent fault. Retrying in ${retryMs / 1000}s without counting against ` +
+        `max_crashes_per_day.`,
+      );
+      this.appendCrashToRestartsLog(exitCode, retryMs, 'BINARY_UNAVAILABLE_RECOVERY');
+      this.status = 'crashed';
+      this.notifyStatusChange();
+      setTimeout(() => {
+        if (this.status === 'crashed') {
+          this.start().catch(err => this.log(`Binary-unavailable restart failed: ${err}`));
+        }
+      }, retryMs);
       return;
     }
 
@@ -1273,13 +1354,15 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'RATE_LIMIT_RECOVERY',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'RATE_LIMIT_RECOVERY'
+      | 'BINARY_UNAVAILABLE_RECOVERY',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
       ensureDir(logDir);
       const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-      const notCountedTowardMaxCrashes = kind === 'IMAGE_POISON_RECOVERY' || kind === 'RATE_LIMIT_RECOVERY';
+      const notCountedTowardMaxCrashes = kind === 'IMAGE_POISON_RECOVERY' || kind === 'RATE_LIMIT_RECOVERY'
+        || kind === 'BINARY_UNAVAILABLE_RECOVERY';
       const details =
         kind === 'HALTED'
           ? `exit_code=${exitCode} crash_count=${this.crashCount} max_crashes=${this.maxCrashesPerDay}`
