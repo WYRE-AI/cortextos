@@ -797,14 +797,41 @@ describe('FastChecker', () => {
   });
 
   describe('heartbeat watchdog', () => {
-    beforeEach(() => { vi.useFakeTimers(); });
-    afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
+    // These tests only exercise the 50-min heartbeat timer, but start() also
+    // drives an unawaited infinite poll loop. At the 1s default pollInterval,
+    // advancing 50 minutes of fake time replays ~3,000 poll cycles — each doing
+    // real fs work — purely as overhead, which is enough to blow the 10s test
+    // timeout on a busy machine. A coarse interval leaves the loop nearly idle
+    // without changing anything these tests assert.
+    const WATCHDOG_POLL_MS = 5 * 60 * 1000;
+    const startedCheckers: FastChecker[] = [];
+
+    function startWatchdog(agent: ReturnType<typeof createMockAgent>): FastChecker {
+      const checker = new FastChecker(agent, paths, '/tmp/framework', {
+        pollInterval: WATCHDOG_POLL_MS,
+      });
+      startedCheckers.push(checker);
+      checker.start();
+      return checker;
+    }
+
+    beforeEach(() => { vi.useFakeTimers(); startedCheckers.length = 0; });
+    afterEach(() => {
+      // Teardown lives here rather than at the end of each test body. A test
+      // that fails or times out never reaches its own stop()/wake(), leaking a
+      // still-running poll loop — which the useRealTimers() below then converts
+      // into a REAL 1s-interval loop doing fs I/O for the remainder of the
+      // file, slowing later tests until they time out in turn. That cascade is
+      // why WHICH watchdog test failed varied from run to run.
+      for (const checker of startedCheckers) { checker.stop(); checker.wake(); }
+      startedCheckers.length = 0;
+      vi.useRealTimers();
+      vi.clearAllMocks();
+    });
 
     it('fires exec after bootstrap at 50-min interval', async () => {
       const { execFile } = await import('child_process');
-      const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
-      checker.start();
+      startWatchdog(createMockAgent('my-agent'));
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       expect(execFile).toHaveBeenCalledWith(
         'cortextos',
@@ -812,8 +839,6 @@ describe('FastChecker', () => {
         expect.objectContaining({ env: expect.any(Object) }),
         expect.any(Function),
       );
-      checker.stop();
-      checker.wake();
     });
 
     // task_1785174835840: the daemon is a SINGLE PM2 process shared by every
@@ -833,9 +858,7 @@ describe('FastChecker', () => {
     // state.
     it('passes the WATCHED agent name via explicit env (task_1785174835840)', async () => {
       const { execFile } = await import('child_process');
-      const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
-      checker.start();
+      startWatchdog(createMockAgent('my-agent'));
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       expect(execFile).toHaveBeenCalledWith(
         'cortextos',
@@ -843,19 +866,17 @@ describe('FastChecker', () => {
         expect.objectContaining({ env: expect.objectContaining({ CTX_AGENT_NAME: 'my-agent' }) }),
         expect.any(Function),
       );
-      checker.stop();
-      checker.wake();
     });
 
     it('clears timer on stop — no further exec calls after stop', async () => {
       const { execFile } = await import('child_process');
       const execMock = execFile as ReturnType<typeof vi.fn>;
-      const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
-      checker.start();
+      const checker = startWatchdog(createMockAgent('my-agent'));
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
       const callsBefore = execMock.mock.calls.length;
       expect(callsBefore).toBeGreaterThan(0);
+      // Stopping mid-test is the behavior under test here (not teardown —
+      // afterEach still stops it again, which is idempotent).
       checker.stop();
       checker.wake();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
@@ -866,8 +887,7 @@ describe('FastChecker', () => {
       const { execFile } = await import('child_process');
       const agent = createMockAgent('my-agent');
       agent.isBootstrapped.mockReturnValue(false);
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
-      checker.start();
+      startWatchdog(agent);
       await vi.advanceTimersByTimeAsync(20 * 1000);
       expect(execFile).not.toHaveBeenCalledWith(
         'cortextos',
@@ -875,8 +895,6 @@ describe('FastChecker', () => {
         expect.objectContaining({ env: expect.any(Object) }),
         expect.any(Function),
       );
-      checker.stop();
-      checker.wake();
     });
   });
 
