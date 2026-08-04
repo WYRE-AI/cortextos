@@ -24,7 +24,7 @@ import fs from 'fs';
 import path from 'path';
 import { NextRequest } from 'next/server';
 import { CTX_ROOT, getAllAgents } from '@/lib/config';
-import { parseDurationMs } from '@/lib/cron-utils';
+import { parseDurationMs, nextFireFromCronExpr } from '@/lib/cron-utils';
 
 export const dynamic = 'force-dynamic';
 
@@ -42,6 +42,8 @@ interface CronDefinition {
   fire_count?: number;
   description?: string;
   fire_at?: string;
+  /** IANA zone a cron EXPRESSION is evaluated in; default UTC (mirrors CronDefinition). */
+  timezone?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -143,64 +145,20 @@ function readExecutionLog(agentName: string): CronExecutionLogEntry[] {
 // Next-fire computation (mirrors /api/workflows/crons logic)
 // ---------------------------------------------------------------------------
 
-function computeNextFire(schedule: string, lastFiredAt: string | undefined, now: number): string {
+function computeNextFire(schedule: string, lastFiredAt: string | undefined, now: number, timezone?: string): string {
   const referenceMs = lastFiredAt ? new Date(lastFiredAt).getTime() : now;
   const durationMs = parseDurationMs(schedule);
   if (!isNaN(durationMs)) {
     const next = referenceMs + durationMs;
     return new Date(next <= now ? now + durationMs : next).toISOString();
   }
-  const nextMs = nextFireFromCronExpr(schedule, now);
+  // Thread the cron's own timezone, matching the daemon's computeNextFireAt.
+  const nextMs = nextFireFromCronExpr(schedule, now, timezone || undefined);
   if (!isNaN(nextMs)) return new Date(nextMs).toISOString();
   return 'unknown';
 }
 
-function nextFireFromCronExpr(expr: string, fromMs: number): number {
-  const parts = expr.trim().split(/\s+/);
-  if (parts.length !== 5) return NaN;
-  const [minuteStr, hourStr, domStr, monthStr, dowStr] = parts;
 
-  function expand(field: string, min: number, max: number): number[] {
-    const result = new Set<number>();
-    for (const part of field.split(',')) {
-      if (part === '*') { for (let i = min; i <= max; i++) result.add(i); }
-      else if (part.startsWith('*/')) {
-        const step = parseInt(part.slice(2), 10);
-        if (isNaN(step) || step <= 0) throw new Error('bad step');
-        for (let i = min; i <= max; i += step) result.add(i);
-      } else if (part.includes('-')) {
-        const [lo, hi] = part.split('-').map(s => parseInt(s, 10));
-        if (isNaN(lo) || isNaN(hi) || lo > hi) throw new Error('bad range');
-        for (let i = lo; i <= hi; i++) result.add(i);
-      } else {
-        const n = parseInt(part, 10);
-        if (isNaN(n)) throw new Error('bad value');
-        result.add(n);
-      }
-    }
-    return [...result].sort((a, b) => a - b);
-  }
-
-  let minutes: number[], hours: number[], doms: number[], months: number[], dows: number[];
-  try {
-    minutes = expand(minuteStr, 0, 59);
-    hours   = expand(hourStr, 0, 23);
-    doms    = expand(domStr, 1, 31);
-    months  = expand(monthStr, 1, 12);
-    dows    = expand(dowStr, 0, 6);
-  } catch { return NaN; }
-
-  const startMs = Math.floor(fromMs / 60_000) * 60_000 + 60_000;
-  let candidate = startMs;
-  for (let i = 0; i < 366 * 24 * 60; i++) {
-    const d = new Date(candidate);
-    if (months.includes(d.getMonth() + 1) && doms.includes(d.getDate()) &&
-        dows.includes(d.getDay()) && hours.includes(d.getHours()) &&
-        minutes.includes(d.getMinutes())) return candidate;
-    candidate += 60_000;
-  }
-  return NaN;
-}
 
 // ---------------------------------------------------------------------------
 // Health computation (pure, mirrors src/utils/cron-health.ts)
@@ -305,7 +263,7 @@ export async function GET(request: NextRequest) {
           e => e.cron === cron.name && new Date(e.ts).getTime() >= cutoff24h
         );
 
-        const nextFire = computeNextFire(cron.schedule, cron.last_fired_at, nowMs);
+        const nextFire = computeNextFire(cron.schedule, cron.last_fired_at, nowMs, cron.timezone);
 
         healthRows.push(computeHealth(
           agent.name,
