@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Fixed — GET /api/workflows/crons was O(crons) full log reads per request
+
+`readLastExecution(agent, cronName)` re-read and re-parsed the agent's entire
+`cron-execution.log` once **per cron**. At 10 crons per agent that is ten full
+reads of the same file per request, which made `/crons` the slowest route the
+dashboard serves — while `/health`, which already read each log once, was 5x
+faster over the same dataset.
+
+Replaced with a single backward pass per agent building a `Map<cronName,
+lastEntry>` (keeping the first hit per name preserves "last entry in file order
+wins" exactly). Measured on the phase-4 benchmark:
+
+| dataset | p50 before | p50 after | p95 before | p95 after |
+|---|---|---|---|---|
+| 50 crons  | 1980ms | **166ms** | 2676ms | **373ms** |
+| 100 crons | 1749ms | **270ms** | 2706ms | **400ms** |
+
+`tests/integration/phase4-performance.test.ts` had been failing its
+`p95 < 2000ms` budget on this route; it now passes 6/6 and runs 3x faster.
 ### Added — canonical branch protection on `main`
 
 `main` previously had zero branch protection (no required status checks, no

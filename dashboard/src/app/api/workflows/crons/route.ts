@@ -17,7 +17,7 @@ import fs from 'fs';
 import path from 'path';
 import { NextRequest } from 'next/server';
 import { CTX_ROOT, getAllAgents } from '@/lib/config';
-import { parseDurationMs } from '@/lib/cron-utils';
+import { parseDurationMs, nextFireFromCronExpr } from '@/lib/cron-utils';
 import { IPCClient } from '@/lib/ipc-client';
 
 export const dynamic = 'force-dynamic';
@@ -35,6 +35,8 @@ interface CronDefinition {
   last_fired_at?: string;
   fire_count?: number;
   description?: string;
+  /** IANA zone a cron EXPRESSION is evaluated in; default UTC (mirrors CronDefinition). */
+  timezone?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -75,28 +77,40 @@ function readAgentCrons(agentName: string): CronDefinition[] {
   }
 }
 
-function readLastExecution(
-  agentName: string,
-  cronName: string,
-): CronExecutionLogEntry | null {
+/**
+ * Last execution entry for EVERY cron of an agent, from ONE pass over the log.
+ *
+ * This replaced a per-cron `readLastExecution(agent, cronName)`, which re-read
+ * and re-parsed the agent's entire cron-execution.log on every call — with 10
+ * crons per agent, ten full reads of the same file per request. That made GET
+ * /crons the slowest route the dashboard serves: ~2s p50 over 50 crons, versus
+ * ~400ms for /health across the same dataset, which already read each agent's
+ * log exactly once. Cost is now O(agents) reads instead of O(crons).
+ *
+ * Walking backwards and keeping the FIRST hit per cron name preserves the old
+ * "last entry in file order wins" semantics exactly.
+ */
+function readLastExecutions(agentName: string): Map<string, CronExecutionLogEntry> {
+  const byCron = new Map<string, CronExecutionLogEntry>();
   const logPath = path.join(CTX_ROOT, CRONS_DIR, agentName, 'cron-execution.log');
-  if (!fs.existsSync(logPath)) return null;
+  if (!fs.existsSync(logPath)) return byCron;
   try {
     const raw = fs.readFileSync(logPath, 'utf-8');
-    const lines = raw.split('\n').filter(l => l.trim());
-    // Walk backwards to find last entry for this cron
+    const lines = raw.split('\n');
     for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
       try {
-        const entry = JSON.parse(lines[i]) as CronExecutionLogEntry;
-        if (entry.cron === cronName) return entry;
+        const entry = JSON.parse(line) as CronExecutionLogEntry;
+        if (!byCron.has(entry.cron)) byCron.set(entry.cron, entry);
       } catch {
         // skip malformed line
       }
     }
-    return null;
   } catch {
-    return null;
+    // unreadable log → no history, same as the previous null return
   }
+  return byCron;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,10 +133,12 @@ export async function GET(request: NextRequest) {
 
     for (const agent of agents) {
       const crons = readAgentCrons(agent.name);
+      // One log read per AGENT, reused across that agent's crons.
+      const lastExecutions = readLastExecutions(agent.name);
       for (const cron of crons) {
         if (searchFilter && !cron.name.toLowerCase().includes(searchFilter)) continue;
 
-        const lastEntry = readLastExecution(agent.name, cron.name);
+        const lastEntry = lastExecutions.get(cron.name) ?? null;
 
         rows.push({
           agent: agent.name,
@@ -130,7 +146,7 @@ export async function GET(request: NextRequest) {
           cron,
           lastFire: lastEntry?.ts ?? null,
           lastStatus: lastEntry?.status ?? null,
-          nextFire: computeNextFire(cron.schedule, cron.last_fired_at, now),
+          nextFire: computeNextFire(cron.schedule, cron.last_fired_at, now, cron.timezone),
         });
       }
     }
@@ -150,6 +166,7 @@ function computeNextFire(
   schedule: string,
   lastFiredAt: string | undefined,
   now: number,
+  timezone?: string,
 ): string {
   const referenceMs = lastFiredAt ? new Date(lastFiredAt).getTime() : now;
 
@@ -159,8 +176,10 @@ function computeNextFire(
     return new Date(next <= now ? now + durationMs : next).toISOString();
   }
 
-  // Try as a 5-field cron expression
-  const nextMs = nextFireFromCronExpr(schedule, now);
+  // Try as a 5-field cron expression. The cron's own timezone must be threaded
+  // through (the daemon's computeNextFireAt does the same) — otherwise a cron
+  // declared "America/New_York" is displayed as if it were UTC.
+  const nextMs = nextFireFromCronExpr(schedule, now, timezone || undefined);
   if (!isNaN(nextMs)) {
     return new Date(nextMs).toISOString();
   }
@@ -168,72 +187,7 @@ function computeNextFire(
   return 'unknown';
 }
 
-/**
- * Minimal 5-field cron expression evaluator (duplicate-free: references the
- * same algorithm as src/daemon/cron-scheduler.ts but runs in the Next.js
- * server process which cannot import daemon-side Node.js modules).
- *
- * Fields: minute hour dom month dow
- */
-function nextFireFromCronExpr(expr: string, fromMs: number): number {
-  const parts = expr.trim().split(/\s+/);
-  if (parts.length !== 5) return NaN;
 
-  const [minuteStr, hourStr, domStr, monthStr, dowStr] = parts;
-
-  function expand(field: string, min: number, max: number): number[] {
-    const result = new Set<number>();
-    for (const part of field.split(',')) {
-      if (part === '*') {
-        for (let i = min; i <= max; i++) result.add(i);
-      } else if (part.startsWith('*/')) {
-        const step = parseInt(part.slice(2), 10);
-        if (isNaN(step) || step <= 0) throw new Error(`Invalid step: ${part}`);
-        for (let i = min; i <= max; i += step) result.add(i);
-      } else if (part.includes('-')) {
-        const [lo, hi] = part.split('-').map(s => parseInt(s, 10));
-        if (isNaN(lo) || isNaN(hi) || lo > hi) throw new Error(`Invalid range: ${part}`);
-        for (let i = lo; i <= hi; i++) result.add(i);
-      } else {
-        const n = parseInt(part, 10);
-        if (isNaN(n)) throw new Error(`Invalid value: ${part}`);
-        result.add(n);
-      }
-    }
-    return [...result].sort((a, b) => a - b);
-  }
-
-  let minutes: number[], hours: number[], doms: number[], months: number[], dows: number[];
-  try {
-    minutes = expand(minuteStr, 0, 59);
-    hours   = expand(hourStr, 0, 23);
-    doms    = expand(domStr, 1, 31);
-    months  = expand(monthStr, 1, 12);
-    dows    = expand(dowStr, 0, 6);
-  } catch {
-    return NaN;
-  }
-
-  const startMs = Math.floor(fromMs / 60_000) * 60_000 + 60_000;
-  const MAX_MINUTES = 366 * 24 * 60;
-  let candidate = startMs;
-
-  for (let i = 0; i < MAX_MINUTES; i++) {
-    const d = new Date(candidate);
-    if (
-      months.includes(d.getMonth() + 1) &&
-      doms.includes(d.getDate()) &&
-      dows.includes(d.getDay()) &&
-      hours.includes(d.getHours()) &&
-      minutes.includes(d.getMinutes())
-    ) {
-      return candidate;
-    }
-    candidate += 60_000;
-  }
-
-  return NaN;
-}
 
 // ---------------------------------------------------------------------------
 // POST /api/workflows/crons — create a new cron via IPC add-cron
