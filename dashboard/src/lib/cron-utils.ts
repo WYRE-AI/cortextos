@@ -179,3 +179,152 @@ export function formatRelative(isoTs: string | null | undefined): string {
 
   return past ? `${label} ago` : `in ${label}`;
 }
+
+// ---------------------------------------------------------------------------
+// 5-field cron expression evaluator
+//
+// Mirrors src/daemon/cron-scheduler.ts's nextFireFromCron. It lives here rather
+// than being imported because the dashboard is a separate Next.js app that
+// cannot pull in daemon-side modules — the duplication this file's header
+// warns about. It previously existed as TWO inline copies (crons/route.ts and
+// health/route.ts), both of which matched cron fields with LOCAL Date getters
+// (getHours/getDate/getDay). PR #21 (1e24108d) fixed exactly that bug in the
+// daemon — moving evaluation to the cron's `timezone`, default UTC — but only
+// on the daemon side.
+//
+// The result was a live divergence: the daemon fired "0 9 * * *" at 09:00 UTC
+// while the dashboard displayed its next fire as 09:00 LOCAL (13:00 UTC on the
+// EDT fleet host), a 4-5h lie in the UI, and `cron.timezone` was ignored
+// outright. Consolidated to one implementation with the daemon's semantics.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_CRON_TIMEZONE = 'UTC';
+
+const WEEKDAY_ABBR_TO_NUM: Record<string, number> = {
+  Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+};
+
+interface CronFields { minute: number; hour: number; day: number; month: number; weekday: number }
+
+function expandCronField(field: string, min: number, max: number): number[] {
+  const result = new Set<number>();
+  for (const part of field.split(',')) {
+    if (part === '*') {
+      for (let i = min; i <= max; i++) result.add(i);
+    } else if (part.startsWith('*/')) {
+      const step = parseInt(part.slice(2), 10);
+      if (isNaN(step) || step <= 0) throw new Error(`Invalid step: ${part}`);
+      for (let i = min; i <= max; i += step) result.add(i);
+    } else if (part.includes('-')) {
+      const [lo, hi] = part.split('-').map(s => parseInt(s, 10));
+      if (isNaN(lo) || isNaN(hi) || lo > hi) throw new Error(`Invalid range: ${part}`);
+      for (let i = lo; i <= hi; i++) result.add(i);
+    } else {
+      const n = parseInt(part, 10);
+      if (isNaN(n)) throw new Error(`Invalid value: ${part}`);
+      result.add(n);
+    }
+  }
+  return [...result].sort((a, b) => a - b);
+}
+
+/**
+ * UTC fast path — native getters instead of Intl. Semantically identical (UTC
+ * has no DST) but measured ~27x cheaper across the minute-by-minute scan below,
+ * which is what made the dashboard's /crons endpoint the slowest route it
+ * serves. UTC is the default, so this is the path nearly every cron takes.
+ */
+function utcCronFields(ms: number): CronFields {
+  const d = new Date(ms);
+  return {
+    minute: d.getUTCMinutes(),
+    hour: d.getUTCHours(),
+    day: d.getUTCDate(),
+    month: d.getUTCMonth() + 1, // getUTCMonth is 0-11; cron months are 1-12
+    weekday: d.getUTCDay(),
+  };
+}
+
+/**
+ * Next fire time (epoch ms) for a 5-field cron expression, strictly after
+ * `fromMs`, or NaN if the expression is unparseable or can never match.
+ *
+ * @param timezone IANA zone the expression's fields are evaluated in.
+ *                 Defaults to UTC — never the ambient timezone of whatever
+ *                 process renders the dashboard.
+ */
+export function nextFireFromCronExpr(
+  expr: string,
+  fromMs: number,
+  timezone: string = DEFAULT_CRON_TIMEZONE,
+): number {
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) return NaN;
+  const [minuteStr, hourStr, domStr, monthStr, dowStr] = parts;
+
+  let minutes: number[], hours: number[], doms: number[], months: number[], dows: number[];
+  try {
+    minutes = expandCronField(minuteStr, 0, 59);
+    hours   = expandCronField(hourStr,   0, 23);
+    doms    = expandCronField(domStr,    1, 31);
+    months  = expandCronField(monthStr,  1, 12);
+    dows    = expandCronField(dowStr,    0, 6);
+  } catch {
+    return NaN;
+  }
+
+  // Feasibility pre-check: a dom+month pair that exists in NO month (Feb 31)
+  // parses fine but can never match, and would otherwise walk the entire
+  // 1-year window just to return NaN. Feb counts as 29 — "29 2" is feasible in
+  // leap years, and whether the next one is inside the window is the scan's
+  // question, not this check's.
+  const MAX_DOM_BY_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (!months.some((mo) => doms.some((d) => d <= MAX_DOM_BY_MONTH[mo - 1]))) {
+    return NaN;
+  }
+
+  let fieldsAt: (ms: number) => CronFields;
+  if (timezone === DEFAULT_CRON_TIMEZONE) {
+    fieldsAt = utcCronFields;
+  } else {
+    let formatter: Intl.DateTimeFormat;
+    try {
+      formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit',
+        hourCycle: 'h23', weekday: 'short',
+      });
+    } catch {
+      return NaN; // invalid IANA string fails safe, as on the daemon side
+    }
+    fieldsAt = (ms) => {
+      const map: Record<string, string> = {};
+      for (const p of formatter.formatToParts(new Date(ms))) map[p.type] = p.value;
+      return {
+        minute: parseInt(map.minute, 10),
+        hour: parseInt(map.hour, 10),
+        day: parseInt(map.day, 10),
+        month: parseInt(map.month, 10),
+        weekday: WEEKDAY_ABBR_TO_NUM[map.weekday],
+      };
+    };
+  }
+
+  let candidate = Math.floor(fromMs / 60_000) * 60_000 + 60_000;
+  const MAX_MINUTES = 366 * 24 * 60;
+  for (let i = 0; i < MAX_MINUTES; i++) {
+    const f = fieldsAt(candidate);
+    if (
+      months.includes(f.month) &&
+      doms.includes(f.day) &&
+      dows.includes(f.weekday) &&
+      hours.includes(f.hour) &&
+      minutes.includes(f.minute)
+    ) {
+      return candidate;
+    }
+    candidate += 60_000;
+  }
+  return NaN;
+}
