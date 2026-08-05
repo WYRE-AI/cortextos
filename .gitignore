@@ -76,3 +76,10 @@ WINDOWS_INSTALL_REPORT.md
 *INSTALL_REPORT.md
 /PHASE*-REPORT.md
 docs/phase-reports/
+
+# Third-party design skills (task_1785698988864, Aaron directive 2026-08-02) -- installed
+# fleet-wide via cortextos/skills/, kept out of git so upstream-sync never touches them.
+skills/impeccable/
+skills/hallmark/
+skills/taste-skill/
+skills/brandkit/
