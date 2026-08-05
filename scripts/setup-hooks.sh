@@ -4,8 +4,9 @@
 # Run once after cloning:
 #   bash scripts/setup-hooks.sh
 #
-# Installs a pre-push hook that runs npm run build && npm test before
-# any push. If either fails, the push is aborted and you fix it locally
+# Installs a pre-push hook that runs the leak-guard scan, then npm run
+# build && npm test, before any push. If any step fails, the push is
+# aborted and you fix it locally
 # rather than failing on CI.
 
 set -euo pipefail
