@@ -310,9 +310,12 @@ describe('Bus System', () => {
     });
 
     it('scans multiple orgs and agents', () => {
-      // Create two orgs with agents
-      for (const org of ['org1', 'org2']) {
-        const agentDir = join(testDir, 'orgs', org, 'agents', 'bot');
+      // Create two orgs, each with a distinctly-named agent. Agent names are
+      // assumed unique fleet-wide (discoverAllAgents/list-agents key on bare
+      // name across orgs) — same-bare-name-in-different-orgs is a separate,
+      // pre-existing edge case, not what this test is exercising.
+      for (const [org, name] of [['org1', 'bot1'], ['org2', 'bot2']]) {
+        const agentDir = join(testDir, 'orgs', org, 'agents', name);
         mkdirSync(agentDir, { recursive: true });
         const date = new Date().toISOString();
         writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${date}\n`);
@@ -320,6 +323,21 @@ describe('Bus System', () => {
 
       const report = checkGoalStaleness(testDir);
       expect(report.summary.total).toBe(2);
+    });
+
+    it('covers namespaced personal agents, not just shared org agents', () => {
+      // task_1785723303692: the bug this whole fix closes — a personal agent
+      // under orgs/<org>/engineers/<eng>/agents/<name> used to be silently
+      // invisible to this scan entirely.
+      const agentDir = join(testDir, 'orgs', 'myorg', 'engineers', 'aaron', 'agents', 'sidekick');
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${new Date().toISOString()}\n`);
+
+      const report = checkGoalStaleness(testDir);
+      expect(report.summary.total).toBe(1);
+      expect(report.agents[0].agent).toBe('aaron/sidekick');
+      expect(report.agents[0].org).toBe('myorg');
+      expect(report.agents[0].stale).toBe(false);
     });
   });
 

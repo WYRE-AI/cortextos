@@ -7,6 +7,7 @@ import {
   runExperiment,
   evaluateExperiment,
   listExperiments,
+  listAllExperiments,
   gatherContext,
   manageCycle,
 } from '../src/bus/experiment.js';
@@ -471,6 +472,55 @@ describe('Sprint 3: Experiment Framework', () => {
 
     it('throws when creating without required fields', () => {
       expect(() => manageCycle(testDir, 'create', { name: 'x' })).toThrow('requires');
+    });
+  });
+
+  describe('listAllExperiments (task_1785723303692: fleet-wide, not caller-only)', () => {
+    // Own framework/ctx root, distinct from testDir's flat experiments/history
+    // fixture used by the single-agent tests above.
+    const frameworkRoot = join(tmpdir(), `cortextos-fleet-${Date.now()}`);
+
+    afterEach(() => {
+      try {
+        rmSync(frameworkRoot, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    it('aggregates experiments across every agent, including namespaced personal agents', () => {
+      const sharedDir = join(frameworkRoot, 'orgs', 'wyre', 'agents', 'boss');
+      const personalDir = join(frameworkRoot, 'orgs', 'wyre', 'engineers', 'aaron', 'agents', 'sidekick');
+      mkdirSync(sharedDir, { recursive: true });
+      mkdirSync(personalDir, { recursive: true });
+
+      createExperiment(sharedDir, 'boss', 'engagement_rate', 'Shorter posts get more likes');
+      createExperiment(personalDir, 'aaron/sidekick', 'response_time', 'Caching cuts latency');
+
+      // No ctxRoot / enabled-agents.json needed — pure directory scan.
+      const experiments = listAllExperiments(frameworkRoot, '');
+      expect(experiments).toHaveLength(2);
+      expect(experiments.map(e => e.agent).sort()).toEqual(['aaron/sidekick', 'boss']);
+    });
+
+    it('applies status/metric filters across the whole fleet, not per-agent', () => {
+      const agentA = join(frameworkRoot, 'orgs', 'wyre', 'agents', 'alpha');
+      const agentB = join(frameworkRoot, 'orgs', 'wyre', 'agents', 'beta');
+      mkdirSync(agentA, { recursive: true });
+      mkdirSync(agentB, { recursive: true });
+
+      const idA = createExperiment(agentA, 'alpha', 'ctr', 'hypothesis A');
+      createExperiment(agentB, 'beta', 'ctr', 'hypothesis B');
+      runExperiment(agentA, idA); // moves idA to 'running'; beta's stays 'proposed'
+
+      const running = listAllExperiments(frameworkRoot, '', { status: 'running' });
+      expect(running).toHaveLength(1);
+      expect(running[0].agent).toBe('alpha');
+    });
+
+    it('returns empty, not throws, when frameworkRoot has no orgs directory yet', () => {
+      const emptyRoot = join(tmpdir(), `cortextos-empty-${Date.now()}`);
+      expect(listAllExperiments(emptyRoot, '')).toEqual([]);
     });
   });
 });

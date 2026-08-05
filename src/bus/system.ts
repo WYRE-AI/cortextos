@@ -1,10 +1,10 @@
 import { execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, statSync, appendFileSync, writeFileSync } from 'fs';
 import { join, extname } from 'path';
-import { readdirSync } from 'fs';
 import { ensureDir } from '../utils/atomic.js';
 import { TelegramAPI } from '../telegram/api.js';
 import type { BusPaths } from '../types/index.js';
+import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
 
 // --- Types ---
 
@@ -228,145 +228,118 @@ export function autoCommit(projectDir: string, dryRun: boolean = false): AutoCom
 /**
  * Check goal staleness for all agents across all orgs.
  * Mirrors bash bus/check-goal-staleness.sh.
+ *
+ * task_1785723303692: previously reimplemented its own orgs/<org>/agents/*
+ * scan inline, which — unlike discoverAllAgents — never covered namespaced
+ * personal agents (orgs/<org>/engineers/<eng>/agents/*). A personal agent's
+ * stale GOALS.md would silently never surface here. Migrated onto the same
+ * canonical enumerator list-agents/list-experiments use, so this class of
+ * drift is structurally impossible going forward — one enumerator, not three.
  */
 export function checkGoalStaleness(
   projectRoot: string,
   thresholdDays: number = 7,
+  ctxRoot?: string,
 ): GoalStalenessReport {
   const agents: AgentGoalStatus[] = [];
   const thresholdMs = thresholdDays * 86400 * 1000;
   const now = Date.now();
 
-  const orgsDir = join(projectRoot, 'orgs');
-  if (!existsSync(orgsDir)) {
-    return {
-      summary: { total: 0, stale: 0, fresh: 0, threshold_days: thresholdDays },
-      agents: [],
-    };
-  }
+  // ctxRoot is optional for backward compatibility with existing callers/tests
+  // that only ever exercised the directory-scan half; discoverAllAgents treats
+  // a falsy ctxRoot as "skip the enabled-agents.json lookup", not an error.
+  const discovered = discoverAllAgents(projectRoot, ctxRoot ?? '');
 
-  let orgNames: string[];
-  try {
-    orgNames = readdirSync(orgsDir).filter(name => {
-      try {
-        return statSync(join(orgsDir, name)).isDirectory();
-      } catch {
-        return false;
-      }
-    });
-  } catch {
-    orgNames = [];
-  }
+  for (const { name: agentName, org: orgName } of discovered) {
+    const agentDir = resolveAgentDir(projectRoot, orgName, agentName);
+    const goalsFile = join(agentDir, 'GOALS.md');
 
-  for (const orgName of orgNames) {
-    const agentsDir = join(orgsDir, orgName, 'agents');
-    if (!existsSync(agentsDir)) continue;
-
-    let agentNames: string[];
-    try {
-      agentNames = readdirSync(agentsDir).filter(name => {
-        // Validate agent name (lowercase, numbers, hyphens, underscores)
-        if (!/^[a-z0-9_-]+$/.test(name)) return false;
-        try {
-          return statSync(join(agentsDir, name)).isDirectory();
-        } catch {
-          return false;
-        }
-      });
-    } catch {
-      continue;
-    }
-
-    for (const agentName of agentNames) {
-      const goalsFile = join(agentsDir, agentName, 'GOALS.md');
-
-      if (!existsSync(goalsFile)) {
-        agents.push({
-          agent: agentName,
-          org: orgName,
-          status: 'missing',
-          stale: true,
-          reason: 'no GOALS.md file',
-        });
-        continue;
-      }
-
-      // Read and parse GOALS.md
-      let content: string;
-      try {
-        content = readFileSync(goalsFile, 'utf-8');
-      } catch {
-        agents.push({
-          agent: agentName,
-          org: orgName,
-          status: 'missing',
-          stale: true,
-          reason: 'could not read GOALS.md',
-        });
-        continue;
-      }
-
-      // Find "## Updated" section and get the next line
-      const lines = content.split('\n');
-      let updatedLine: string | null = null;
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].trim().startsWith('## Updated')) {
-          // Get next non-empty line
-          for (let j = i + 1; j < lines.length; j++) {
-            const trimmed = lines[j].trim();
-            if (trimmed && !trimmed.startsWith('##')) {
-              updatedLine = trimmed;
-              break;
-            }
-          }
-          break;
-        }
-      }
-
-      if (!updatedLine) {
-        agents.push({
-          agent: agentName,
-          org: orgName,
-          status: 'no_timestamp',
-          stale: true,
-          reason: 'no Updated timestamp in GOALS.md',
-        });
-        continue;
-      }
-
-      // Parse ISO 8601 timestamp — goals.json writes a trailing "(by <agent>)"
-      // attribution suffix (e.g. "2026-07-28T12:03:06Z (by boss)") that
-      // Date() cannot tolerate after a valid ISO string, so strip it first.
-      const isoTimestamp = updatedLine.replace(/\s*\([^()]*\)\s*$/, '').trim();
-      const parsedDate = new Date(isoTimestamp);
-      if (isNaN(parsedDate.getTime())) {
-        agents.push({
-          agent: agentName,
-          org: orgName,
-          status: 'parse_error',
-          updated: updatedLine,
-          stale: true,
-          reason: 'could not parse timestamp',
-        });
-        continue;
-      }
-
-      const ageMs = now - parsedDate.getTime();
-      const ageDays = Math.floor(ageMs / 86400000);
-      const isStale = ageMs > thresholdMs;
-
+    if (!existsSync(goalsFile)) {
       agents.push({
         agent: agentName,
         org: orgName,
-        status: isStale ? 'stale' : 'fresh',
-        updated: updatedLine,
-        age_days: ageDays,
-        stale: isStale,
-        reason: isStale
-          ? `${ageDays} days since last update (threshold: ${thresholdDays})`
-          : undefined,
+        status: 'missing',
+        stale: true,
+        reason: 'no GOALS.md file',
       });
+      continue;
     }
+
+    // Read and parse GOALS.md
+    let content: string;
+    try {
+      content = readFileSync(goalsFile, 'utf-8');
+    } catch {
+      agents.push({
+        agent: agentName,
+        org: orgName,
+        status: 'missing',
+        stale: true,
+        reason: 'could not read GOALS.md',
+      });
+      continue;
+    }
+
+    // Find "## Updated" section and get the next line
+    const lines = content.split('\n');
+    let updatedLine: string | null = null;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim().startsWith('## Updated')) {
+        // Get next non-empty line
+        for (let j = i + 1; j < lines.length; j++) {
+          const trimmed = lines[j].trim();
+          if (trimmed && !trimmed.startsWith('##')) {
+            updatedLine = trimmed;
+            break;
+          }
+        }
+        break;
+      }
+    }
+
+    if (!updatedLine) {
+      agents.push({
+        agent: agentName,
+        org: orgName,
+        status: 'no_timestamp',
+        stale: true,
+        reason: 'no Updated timestamp in GOALS.md',
+      });
+      continue;
+    }
+
+    // Parse ISO 8601 timestamp — goals.json writes a trailing "(by <agent>)"
+    // attribution suffix (e.g. "2026-07-28T12:03:06Z (by boss)") that
+    // Date() cannot tolerate after a valid ISO string, so strip it first.
+    const isoTimestamp = updatedLine.replace(/\s*\([^()]*\)\s*$/, '').trim();
+    const parsedDate = new Date(isoTimestamp);
+    if (isNaN(parsedDate.getTime())) {
+      agents.push({
+        agent: agentName,
+        org: orgName,
+        status: 'parse_error',
+        updated: updatedLine,
+        stale: true,
+        reason: 'could not parse timestamp',
+      });
+      continue;
+    }
+
+    const ageMs = now - parsedDate.getTime();
+    const ageDays = Math.floor(ageMs / 86400000);
+    const isStale = ageMs > thresholdMs;
+
+    agents.push({
+      agent: agentName,
+      org: orgName,
+      status: isStale ? 'stale' : 'fresh',
+      updated: updatedLine,
+      age_days: ageDays,
+      stale: isStale,
+      reason: isStale
+        ? `${ageDays} days since last update (threshold: ${thresholdDays})`
+        : undefined,
+    });
   }
 
   const total = agents.length;
