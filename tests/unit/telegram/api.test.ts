@@ -25,8 +25,8 @@ describe('TelegramAPI fetch timeout', () => {
     ) as any;
 
     const api = new TelegramAPI('123:TEST');
-    await expect(api.getUpdates(0, 1)).rejects.toThrow(/timed out after 15s/);
-  }, 20000);
+    await expect(api.getUpdates(0, 1)).rejects.toThrow(/timed out after 30s/);
+  }, 35000);
 
   it('succeeds on normal fetch response', async () => {
     globalThis.fetch = vi.fn(async () =>
