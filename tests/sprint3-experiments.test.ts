@@ -40,7 +40,7 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(exp.metric).toBe('engagement_rate');
       expect(exp.hypothesis).toBe('Shorter posts get more likes');
       expect(exp.status).toBe('proposed');
-      expect(exp.baseline_value).toBe(0);
+      expect(exp.baseline_value).toBeNull();
       expect(exp.result_value).toBeNull();
       expect(exp.decision).toBeNull();
       expect(exp.direction).toBe('higher');
@@ -181,6 +181,18 @@ describe('Sprint 3: Experiment Framework', () => {
       const exp = JSON.parse(readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim());
       expect(exp.kind).toBe('snapshot');
     });
+
+    it('accepts an explicit baseline value', () => {
+      const id = createExperiment(testDir, 'testbot', 'engagement_rate', 'test', { baseline: 12.5 });
+      const exp = JSON.parse(readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim());
+      expect(exp.baseline_value).toBe(12.5);
+    });
+
+    it('defaults baseline to null (not 0) when --baseline is omitted', () => {
+      const id = createExperiment(testDir, 'testbot', 'engagement_rate', 'test');
+      const exp = JSON.parse(readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim());
+      expect(exp.baseline_value).toBeNull();
+    });
   });
 
   describe('runExperiment', () => {
@@ -208,9 +220,16 @@ describe('Sprint 3: Experiment Framework', () => {
   });
 
   describe('evaluateExperiment', () => {
+    it('refuses to evaluate an experiment created without --baseline', () => {
+      const id = createExperiment(testDir, 'testbot', 'engagement', 'No baseline set');
+      runExperiment(testDir, id);
+      expect(() => evaluateExperiment(testDir, id, 42)).toThrow('no baseline_value');
+    });
+
     it('keeps when higher is better and measured > baseline', () => {
       const id = createExperiment(testDir, 'testbot', 'engagement', 'More emojis', {
         direction: 'higher',
+        baseline: 0,
       });
       runExperiment(testDir, id);
       const result = evaluateExperiment(testDir, id, 42, { learning: 'Emojis work' });
@@ -242,9 +261,9 @@ describe('Sprint 3: Experiment Framework', () => {
     });
 
     it('discards when measured < baseline (direction=higher)', () => {
-      const id = createExperiment(testDir, 'testbot', 'engagement', 'Remove images');
-      // Manually set a higher baseline by creating, running, evaluating once
-      // then creating a new experiment
+      const id = createExperiment(testDir, 'testbot', 'engagement', 'Remove images', {
+        baseline: 0,
+      });
       runExperiment(testDir, id);
 
       // Measured 0 vs baseline 0 should discard (not strictly greater)
@@ -256,6 +275,7 @@ describe('Sprint 3: Experiment Framework', () => {
     it('keeps when lower is better and measured < baseline', () => {
       const id = createExperiment(testDir, 'testbot', 'bounce_rate', 'Simplify nav', {
         direction: 'lower',
+        baseline: 0,
       });
       runExperiment(testDir, id);
       // baseline is 0, measured -5 is lower -> keep
@@ -323,15 +343,15 @@ describe('Sprint 3: Experiment Framework', () => {
   describe('gatherContext', () => {
     it('calculates keep rate from completed experiments', () => {
       // Create 3 experiments: 2 keep, 1 discard
-      const id1 = createExperiment(testDir, 'testbot', 'engagement', 'h1');
+      const id1 = createExperiment(testDir, 'testbot', 'engagement', 'h1', { baseline: 0 });
       runExperiment(testDir, id1);
       evaluateExperiment(testDir, id1, 10); // keep (10 > 0)
 
-      const id2 = createExperiment(testDir, 'testbot', 'engagement', 'h2');
+      const id2 = createExperiment(testDir, 'testbot', 'engagement', 'h2', { baseline: 0 });
       runExperiment(testDir, id2);
       evaluateExperiment(testDir, id2, 5); // keep (5 > 0)
 
-      const id3 = createExperiment(testDir, 'testbot', 'engagement', 'h3');
+      const id3 = createExperiment(testDir, 'testbot', 'engagement', 'h3', { baseline: 0 });
       runExperiment(testDir, id3);
       evaluateExperiment(testDir, id3, 0); // discard (0 not > 0)
 
