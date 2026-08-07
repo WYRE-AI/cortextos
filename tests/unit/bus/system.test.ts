@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../../../src/bus/system';
-import type { BusPaths } from '../../../src/types';
+import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, postActivity } from '../../../src/bus/system';
+import type { BusPaths, Task } from '../../../src/types';
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
   return {
@@ -368,6 +368,124 @@ describe('Bus System', () => {
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
+    });
+  });
+
+  describe('checkStaleBlockers', () => {
+    function writeTask(org: string, task: Partial<Task> & Pick<Task, 'id' | 'title' | 'status'>) {
+      const taskDir = join(testDir, 'orgs', org, 'tasks');
+      mkdirSync(taskDir, { recursive: true });
+      const full: Task = {
+        description: '',
+        type: 'agent',
+        needs_approval: false,
+        assigned_to: 'worker',
+        created_by: 'worker',
+        org,
+        priority: 'normal',
+        project: '',
+        kpi_key: null,
+        created_at: '2026-08-01T00:00:00Z',
+        updated_at: '2026-08-01T00:00:00Z',
+        completed_at: null,
+        due_date: null,
+        archived: false,
+        ...task,
+      };
+      writeFileSync(join(taskDir, `${task.id}.json`), JSON.stringify(full));
+    }
+
+    it('flags a blocked task whose blocked_by dependency is already completed', () => {
+      writeTask('myorg', { id: 'task_dep', title: 'dependency', status: 'completed' });
+      writeTask('myorg', {
+        id: 'task_blocked',
+        title: 'waiting on dep',
+        status: 'blocked',
+        blocked_by: ['task_dep'],
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.summary.scanned).toBe(1);
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0]).toMatchObject({
+        task_id: 'task_blocked',
+        org: 'myorg',
+        kind: 'resolved_dependency',
+      });
+    });
+
+    it('does not flag a blocked task whose dependency is still open', () => {
+      writeTask('myorg', { id: 'task_dep', title: 'dependency', status: 'in_progress' });
+      writeTask('myorg', {
+        id: 'task_blocked',
+        title: 'waiting on dep',
+        status: 'blocked',
+        blocked_by: ['task_dep'],
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('flags a blocked task mentioning a bare PR reference as unverified_external_ref', () => {
+      writeTask('myorg', {
+        id: 'task_pr',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'blocked on PR#67 merging',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0]).toMatchObject({
+        task_id: 'task_pr',
+        kind: 'unverified_external_ref',
+      });
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    it('does not flag a blocked task with no dependency signal at all', () => {
+      writeTask('myorg', {
+        id: 'task_plain',
+        title: 'held for Aaron',
+        status: 'blocked',
+        description: 'waiting on a human decision',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('scans every org, not just one', () => {
+      writeTask('org-a', { id: 'task_dep_a', title: 'dep', status: 'completed' });
+      writeTask('org-a', {
+        id: 'task_blocked_a',
+        title: 'waiting',
+        status: 'blocked',
+        blocked_by: ['task_dep_a'],
+      });
+      writeTask('org-b', {
+        id: 'task_blocked_b',
+        title: 'waiting',
+        status: 'blocked',
+        description: 'blocked on PR #12',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.summary.scanned).toBe(2);
+      const orgs = report.entries.map(e => e.org).sort();
+      expect(orgs).toEqual(['org-a', 'org-b']);
+    });
+
+    it('returns an empty report when there are no orgs yet', () => {
+      const report = checkStaleBlockers(testDir);
+      expect(report.summary.scanned).toBe(0);
+      expect(report.entries).toHaveLength(0);
     });
   });
 });

@@ -1,10 +1,11 @@
 import { execSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync, statSync, appendFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, statSync, appendFileSync, writeFileSync } from 'fs';
 import { join, extname } from 'path';
 import { ensureDir } from '../utils/atomic.js';
 import { TelegramAPI } from '../telegram/api.js';
-import type { BusPaths } from '../types/index.js';
+import type { BusPaths, TaskStatus } from '../types/index.js';
 import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
+import { listTasks, checkTaskDependencies } from './task.js';
 
 // --- Types ---
 
@@ -354,6 +355,137 @@ export function checkGoalStaleness(
       threshold_days: thresholdDays,
     },
     agents,
+  };
+}
+
+// --- Stale blocker sweep ---
+
+export interface StaleBlockerEntry {
+  task_id: string;
+  org: string;
+  title: string;
+  status: TaskStatus;
+  assigned_to: string;
+  kind: 'resolved_dependency' | 'unverified_external_ref';
+  detail: string;
+}
+
+export interface StaleBlockerReport {
+  summary: {
+    scanned: number;
+    resolved_dependency: number;
+    unverified_external_ref: number;
+  };
+  entries: StaleBlockerEntry[];
+}
+
+// task_1786068529924: catches "PR #67", "PR#67", "pr # 67" — deliberately
+// loose on whitespace/case since these are freeform prose mentions, not a
+// structured field.
+const PR_REFERENCE_REGEX = /\bPR\s*#\s*(\d+)\b/gi;
+
+/**
+ * Sweep every org's blocked tasks for blockers that have already resolved.
+ *
+ * Two distinct, non-overlapping checks — deliberately not merged into one
+ * fuzzy pass, because they have different confidence levels:
+ *
+ * 1. `resolved_dependency` — the task's own `blocked_by` DAG (a structured
+ *    field, see Task.blocked_by) lists only completed deps, via the same
+ *    `checkTaskDependencies` used by claimTask/updateTask. Zero ambiguity:
+ *    if the task system itself would consider this task unblocked, but the
+ *    task is still sitting at status=blocked, that's a stale blocker.
+ *
+ * 2. `unverified_external_ref` — freeform "PR #NN" mentions in the title or
+ *    description (e.g. "blocked on PR#67"). There is no structured field
+ *    naming which repo a bare PR number belongs to (task_1786068529924's
+ *    own research pass confirmed this), and guessing a repo from context is
+ *    exactly the kind of silent-wrong-answer this sweep exists to prevent.
+ *    These are surfaced for manual/agent follow-up, not auto-resolved.
+ *
+ * Mirrors `checkGoalStaleness`'s fleet-wide-by-default shape (task_1785723303692
+ * / #65: a fleet scan that silently covers only a subset is a recurring bug
+ * class here) — every org under ctxRoot is scanned, not just the caller's own.
+ *
+ * Takes `ctxRoot` directly (not `instanceId` + an internal homedir() join)
+ * so tests can point it at a tmpdir fixture instead of the real filesystem —
+ * same testability shape `checkGoalStaleness` already uses via its `projectRoot`
+ * param.
+ */
+export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
+  const entries: StaleBlockerEntry[] = [];
+  let scanned = 0;
+
+  const orgsDir = join(ctxRoot, 'orgs');
+  const orgs = existsSync(orgsDir)
+    ? readdirSync(orgsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name)
+    : [];
+
+  for (const org of orgs) {
+    // Only taskDir/ctxRoot are read (listTasks + checkTaskDependencies'
+    // cross-org fallback); the rest of BusPaths is unused here but built out
+    // for type-completeness, mirroring resolvePaths()'s own layout exactly.
+    const orgBase = join(ctxRoot, 'orgs', org);
+    const paths: BusPaths = {
+      ctxRoot,
+      inbox: join(ctxRoot, 'inbox', '_stale-blocker-scan'),
+      inflight: join(ctxRoot, 'inflight', '_stale-blocker-scan'),
+      processed: join(ctxRoot, 'processed', '_stale-blocker-scan'),
+      logDir: join(ctxRoot, 'logs', '_stale-blocker-scan'),
+      stateDir: join(ctxRoot, 'state', '_stale-blocker-scan'),
+      taskDir: join(orgBase, 'tasks'),
+      approvalDir: join(orgBase, 'approvals'),
+      analyticsDir: join(orgBase, 'analytics'),
+      deliverablesDir: join(orgBase, 'deliverables'),
+    };
+    const blocked = listTasks(paths, { status: 'blocked' });
+    scanned += blocked.length;
+
+    for (const task of blocked) {
+      if ((task.blocked_by?.length ?? 0) > 0) {
+        const openDeps = checkTaskDependencies(paths, task.id);
+        if (openDeps.length === 0) {
+          entries.push({
+            task_id: task.id,
+            org,
+            title: task.title,
+            status: task.status,
+            assigned_to: task.assigned_to,
+            kind: 'resolved_dependency',
+            detail: `blocked_by [${task.blocked_by!.join(', ')}] are all completed, but task is still status=blocked.`,
+          });
+          continue;
+        }
+      }
+
+      const text = `${task.title} ${task.description}`;
+      const refs = [...new Set([...text.matchAll(PR_REFERENCE_REGEX)].map(m => `PR #${m[1]}`))];
+      if (refs.length > 0) {
+        entries.push({
+          task_id: task.id,
+          org,
+          title: task.title,
+          status: task.status,
+          assigned_to: task.assigned_to,
+          kind: 'unverified_external_ref',
+          detail: `Mentions ${refs.join(', ')} — repo not structurally determinable from the task record, needs manual check.`,
+        });
+      }
+    }
+  }
+
+  const resolvedCount = entries.filter(e => e.kind === 'resolved_dependency').length;
+  const unverifiedCount = entries.filter(e => e.kind === 'unverified_external_ref').length;
+
+  return {
+    summary: {
+      scanned,
+      resolved_dependency: resolvedCount,
+      unverified_external_ref: unverifiedCount,
+    },
+    entries,
   };
 }
 
