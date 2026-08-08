@@ -2548,6 +2548,11 @@ busCommand
   .description('PreToolUse hook: writes last_activity.flag on every tool call — mid-turn liveness proof for hang-detector class 3')
   .action(() => runHook('hook-activity-beat'));
 
+busCommand
+  .command('hook-subagent-priming')
+  .description('PreToolUse hook (matcher: Agent): appends the benign-date-notice priming line to every subagent prompt via updatedInput')
+  .action(() => runHook('hook-subagent-priming'));
+
 // --- OAuth token rotation commands ---
 
 busCommand
