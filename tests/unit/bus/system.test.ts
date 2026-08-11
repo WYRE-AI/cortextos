@@ -511,7 +511,10 @@ describe('Bus System', () => {
       localDir = join(fixtureDir, 'local');
 
       mkdirSync(originDir, { recursive: true });
-      sh('git init --bare -q .', originDir);
+      // -b main explicitly: the host's init.defaultBranch decides the bare
+      // repo's HEAD otherwise, and on a `master` default the clones below end
+      // up on an unborn `master` while these fixtures push/read `main`.
+      sh('git init --bare -q -b main .', originDir);
 
       sh(`git clone -q ${originDir} local`, fixtureDir);
       sh('git config user.email test@test.com', localDir);
@@ -543,7 +546,7 @@ describe('Bus System', () => {
 
       // Simulate another agent merging a PR: a second clone pushes ahead.
       const otherDir = join(fixtureDir, 'other');
-      sh(`git clone -q ${originDir} other`, fixtureDir);
+      sh(`git clone -q -b main ${originDir} other`, fixtureDir);
       sh('git config user.email test@test.com', otherDir);
       sh('git config user.name Other', otherDir);
       writeFileSync(join(otherDir, 'file2.txt'), 'b');
