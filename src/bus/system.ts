@@ -503,6 +503,7 @@ export interface BuildDrift {
   local_head: string;
   built_sha: string | null;
   built_at: string | null;
+  built_dirty?: boolean;
   reason?: string;
 }
 
@@ -541,6 +542,13 @@ export const COMMIT_LOG_LIMIT = 20;
  *    `git checkout`/`pull` sets file mtimes to checkout time regardless of
  *    content, so mtime doesn't reliably indicate "built from the newest
  *    commit" — the SHA stamp is the robust signal the task called for.
+ *    A gitSha match alone isn't sufficient, though: a build from a DIRTY
+ *    tree stamps the same gitSha as a clean build at that commit (this
+ *    exact gap left the live fleet on unmerged code briefly during this
+ *    task's own review — a build ran while this PR's branch was checked
+ *    out). `manifest.dirty` (also stamped by the `onSuccess` hook) is
+ *    checked independently so a dirty-tree build is flagged even when the
+ *    sha matches.
  *
  * Either drift sets `status: 'drift'` so a cron consumer can alert on a
  * single field rather than re-deriving it from both sub-reports.
@@ -609,15 +617,27 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
     };
   } else {
     try {
-      const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { gitSha?: string; builtAt?: string };
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { gitSha?: string; builtAt?: string; dirty?: boolean };
       const builtSha = manifest.gitSha ?? null;
-      const stale = builtSha !== localHead;
+      const builtDirty = manifest.dirty === true;
+      const shaMismatch = builtSha !== localHead;
+      // A dirty-tree build stamps the same gitSha as a clean build at that
+      // commit — sha-match alone can't tell them apart, so dirty is checked
+      // independently rather than folded into shaMismatch.
+      const stale = shaMismatch || builtDirty;
+      let reason: string | undefined;
+      if (shaMismatch) {
+        reason = 'dist/ was built from a different commit than local HEAD — run npm run build';
+      } else if (builtDirty) {
+        reason = 'dist/ was built from a dirty working tree (uncommitted changes present at build time) — commit or stash, then run npm run build';
+      }
       build_drift = {
         stale,
         local_head: localHead,
         built_sha: builtSha,
         built_at: manifest.builtAt ?? null,
-        ...(stale ? { reason: 'dist/ was built from a different commit than local HEAD — run npm run build' } : {}),
+        built_dirty: builtDirty,
+        ...(reason ? { reason } : {}),
       };
     } catch {
       build_drift = {

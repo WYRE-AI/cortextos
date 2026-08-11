@@ -498,10 +498,10 @@ describe('Bus System', () => {
       return execSync(cmd, { cwd, encoding: 'utf-8', stdio: 'pipe' }).trim();
     }
 
-    function writeManifest(sha: string) {
+    function writeManifest(sha: string, dirty: boolean = false) {
       writeFileSync(
         join(localDir, 'dist', 'build-manifest.json'),
-        JSON.stringify({ gitSha: sha, builtAt: '2026-08-11T00:00:00.000Z' }),
+        JSON.stringify({ gitSha: sha, dirty, builtAt: '2026-08-11T00:00:00.000Z' }),
       );
     }
 
@@ -573,6 +573,22 @@ describe('Bus System', () => {
       expect(report.pull_drift?.behind).toBe(false);
       expect(report.build_drift?.stale).toBe(true);
       expect(report.build_drift?.reason).toMatch(/different commit/);
+    });
+
+    // 2026-08-11 fleet-CLI incident: a build from a dirty tree stamps the
+    // same gitSha as a clean build at that commit — sha-match alone can't
+    // tell them apart, so `dirty` must be checked independently.
+    it('reports build drift when dist/ was built from a dirty tree, even though gitSha matches HEAD', () => {
+      const head = sh('git rev-parse HEAD', localDir);
+      writeManifest(head, true);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.pull_drift?.behind).toBe(false);
+      expect(report.build_drift?.stale).toBe(true);
+      expect(report.build_drift?.built_dirty).toBe(true);
+      expect(report.build_drift?.reason).toMatch(/dirty working tree/);
     });
 
     it('reports build drift when dist/build-manifest.json is missing', () => {
