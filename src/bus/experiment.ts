@@ -142,6 +142,27 @@ function saveConfig(agentDir: string, config: ExperimentConfig): void {
 // --- Public API ---
 
 /**
+ * Guard for the create-experiment CLI boundary: refuses a missing --baseline
+ * up front instead of letting the caller find out from evaluate-experiment's
+ * refusal after the measurement window has already run and been wasted
+ * (evaluateExperiment's own null-baseline guard is the last line of defense,
+ * not the first). `raw` is the CLI flag's raw string value (undefined when
+ * the flag was omitted) — pass `'0'` explicitly for a genuine from-zero
+ * baseline, since that's a real value, not an omission.
+ */
+export function validateExperimentBaseline(raw: string | undefined): void {
+  if (raw === undefined) {
+    throw new Error(
+      'create-experiment refused: no --baseline given.\n' +
+      'evaluate-experiment will refuse to score this experiment later (comparing against an\n' +
+      'implicit 0 baseline structurally forces every direction=higher result to KEEP) — but\n' +
+      'that refusal only fires after the measurement window has already run, wasting it.\n' +
+      'Pass --baseline <n>, or --baseline 0 if genuinely starting from zero.',
+    );
+  }
+}
+
+/**
  * Create a new experiment proposal.
  *
  * Fields with no explicit option fall back to the matching cycle in
