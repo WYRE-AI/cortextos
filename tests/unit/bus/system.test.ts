@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, postActivity } from '../../../src/bus/system';
+import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, postActivity } from '../../../src/bus/system';
 import type { BusPaths, Task } from '../../../src/types';
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
@@ -486,6 +486,137 @@ describe('Bus System', () => {
       const report = checkStaleBlockers(testDir);
       expect(report.summary.scanned).toBe(0);
       expect(report.entries).toHaveLength(0);
+    });
+  });
+
+  describe('checkDeployDrift', () => {
+    let fixtureDir: string;
+    let originDir: string;
+    let localDir: string;
+
+    function sh(cmd: string, cwd: string): string {
+      return execSync(cmd, { cwd, encoding: 'utf-8', stdio: 'pipe' }).trim();
+    }
+
+    function writeManifest(sha: string, dirty: boolean = false) {
+      writeFileSync(
+        join(localDir, 'dist', 'build-manifest.json'),
+        JSON.stringify({ gitSha: sha, dirty, builtAt: '2026-08-11T00:00:00.000Z' }),
+      );
+    }
+
+    beforeEach(() => {
+      fixtureDir = mkdtempSync(join(tmpdir(), 'cortextos-deploy-drift-'));
+      originDir = join(fixtureDir, 'origin');
+      localDir = join(fixtureDir, 'local');
+
+      mkdirSync(originDir, { recursive: true });
+      // -b main explicitly: the host's init.defaultBranch decides the bare
+      // repo's HEAD otherwise, and on a `master` default the clones below end
+      // up on an unborn `master` while these fixtures push/read `main`.
+      sh('git init --bare -q -b main .', originDir);
+
+      sh(`git clone -q ${originDir} local`, fixtureDir);
+      sh('git config user.email test@test.com', localDir);
+      sh('git config user.name Test', localDir);
+      writeFileSync(join(localDir, 'file.txt'), 'a');
+      sh('git add file.txt && git commit -q -m init', localDir);
+      sh('git push -q origin HEAD:main', localDir);
+      mkdirSync(join(localDir, 'dist'), { recursive: true });
+    });
+
+    afterEach(() => {
+      rmSync(fixtureDir, { recursive: true, force: true });
+    });
+
+    it('reports clean when local HEAD matches origin/main and dist/ matches HEAD', () => {
+      const head = sh('git rev-parse HEAD', localDir);
+      writeManifest(head);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('clean');
+      expect(report.pull_drift?.behind).toBe(false);
+      expect(report.build_drift?.stale).toBe(false);
+    });
+
+    it('reports pull drift when origin/main has commits local has not fetched', () => {
+      const head = sh('git rev-parse HEAD', localDir);
+      writeManifest(head);
+
+      // Simulate another agent merging a PR: a second clone pushes ahead.
+      const otherDir = join(fixtureDir, 'other');
+      sh(`git clone -q -b main ${originDir} other`, fixtureDir);
+      sh('git config user.email test@test.com', otherDir);
+      sh('git config user.name Other', otherDir);
+      writeFileSync(join(otherDir, 'file2.txt'), 'b');
+      sh('git add file2.txt && git commit -q -m second', otherDir);
+      sh('git push -q origin HEAD:main', otherDir);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.pull_drift?.behind).toBe(true);
+      expect(report.pull_drift?.commits_behind).toBe(1);
+      expect(report.pull_drift?.commit_summaries).toHaveLength(1);
+      expect(report.pull_drift?.commit_summaries[0]).toContain('second');
+      // build_drift stays clean — dist/ still matches the (unchanged) local HEAD.
+      expect(report.build_drift?.stale).toBe(false);
+    });
+
+    it('reports build drift when dist/build-manifest.json gitSha does not match local HEAD', () => {
+      writeManifest('0000000000000000000000000000000000dead');
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.pull_drift?.behind).toBe(false);
+      expect(report.build_drift?.stale).toBe(true);
+      expect(report.build_drift?.reason).toMatch(/different commit/);
+    });
+
+    // 2026-08-11 fleet-CLI incident: a build from a dirty tree stamps the
+    // same gitSha as a clean build at that commit — sha-match alone can't
+    // tell them apart, so `dirty` must be checked independently.
+    it('reports build drift when dist/ was built from a dirty tree, even though gitSha matches HEAD', () => {
+      const head = sh('git rev-parse HEAD', localDir);
+      writeManifest(head, true);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.pull_drift?.behind).toBe(false);
+      expect(report.build_drift?.stale).toBe(true);
+      expect(report.build_drift?.built_dirty).toBe(true);
+      expect(report.build_drift?.reason).toMatch(/dirty working tree/);
+    });
+
+    it('reports build drift when dist/build-manifest.json is missing', () => {
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.build_drift?.stale).toBe(true);
+      expect(report.build_drift?.built_sha).toBeNull();
+      expect(report.build_drift?.reason).toMatch(/not found/);
+    });
+
+    it('returns status error when the path is not a git repository', () => {
+      const nonGitDir = join(fixtureDir, 'not-a-repo');
+      mkdirSync(nonGitDir, { recursive: true });
+
+      const report = checkDeployDrift(nonGitDir);
+
+      expect(report.status).toBe('error');
+      expect(report.error).toMatch(/not a git repository/);
+    });
+
+    it('returns status error when there is no origin remote configured', () => {
+      sh('git remote remove origin', localDir);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('error');
+      expect(report.error).toMatch(/no origin remote/);
     });
   });
 });

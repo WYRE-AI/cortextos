@@ -9,7 +9,7 @@ import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTa
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, postActivity } from '../bus/system.js';
+import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
@@ -726,6 +726,40 @@ busCommand
       );
     } else {
       console.log(JSON.stringify(report, null, 2));
+    }
+  });
+
+busCommand
+  .command('check-deploy-drift')
+  .description('Detect fleet CLI drift: unpulled origin/main commits, or dist/ built from a stale commit')
+  .option('--format <fmt>', 'Output format: json|text', 'json')
+  .action((opts: { format?: string }) => {
+    const env = resolveEnv();
+    const frameworkRoot = env.frameworkRoot || env.projectRoot || process.cwd();
+    const report = checkDeployDrift(frameworkRoot);
+    if (opts.format === 'text') {
+      if (report.status === 'error') {
+        console.log(`ERROR: ${report.error}${report.hint ? ` (${report.hint})` : ''}`);
+      } else if (report.status === 'clean') {
+        console.log(`Clean — local HEAD ${report.pull_drift!.local_head.slice(0, 8)} matches origin/main and dist/.`);
+      } else {
+        if (report.pull_drift!.behind) {
+          console.log(
+            `PULL DRIFT: local is ${report.pull_drift!.commits_behind} commit(s) behind origin/main ` +
+            `(${report.pull_drift!.local_head.slice(0, 8)} -> ${report.pull_drift!.origin_head.slice(0, 8)}).`,
+          );
+          for (const line of report.pull_drift!.commit_summaries) console.log(`  ${line}`);
+          if (report.pull_drift!.truncated) console.log(`  ...(${report.pull_drift!.commits_behind - COMMIT_LOG_LIMIT} more)`);
+        }
+        if (report.build_drift!.stale) {
+          console.log(`BUILD DRIFT: ${report.build_drift!.reason}`);
+        }
+      }
+    } else {
+      console.log(JSON.stringify(report, null, 2));
+    }
+    if (report.status !== 'clean') {
+      process.exitCode = 1;
     }
   });
 
