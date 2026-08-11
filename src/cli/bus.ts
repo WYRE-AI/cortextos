@@ -10,7 +10,7 @@ import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
-import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
+import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
@@ -728,6 +728,7 @@ busCommand
   .option('--kind <kind>', 'intervention or snapshot', 'intervention')
   .option('--baseline <n>', 'Baseline value to compare the measured result against (required before evaluate-experiment will accept this experiment)')
   .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string; baseline?: string }) => {
+    try { validateExperimentBaseline(opts.baseline); } catch (err) { console.error(String(err)); process.exit(1); }
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     const id = createExperiment(agentDir, env.agentName, metric, hypothesis, {

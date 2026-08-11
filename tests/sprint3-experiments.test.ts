@@ -10,6 +10,7 @@ import {
   listAllExperiments,
   gatherContext,
   manageCycle,
+  validateExperimentBaseline,
 } from '../src/bus/experiment.js';
 
 describe('Sprint 3: Experiment Framework', () => {
@@ -193,6 +194,20 @@ describe('Sprint 3: Experiment Framework', () => {
       const id = createExperiment(testDir, 'testbot', 'engagement_rate', 'test');
       const exp = JSON.parse(readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim());
       expect(exp.baseline_value).toBeNull();
+    });
+  });
+
+  describe('validateExperimentBaseline (create-experiment CLI guard)', () => {
+    it('throws when --baseline was omitted (raw undefined)', () => {
+      expect(() => validateExperimentBaseline(undefined)).toThrow('no --baseline given');
+    });
+
+    it('accepts an explicit "0" so a genuine from-zero baseline is not mistaken for an omission', () => {
+      expect(() => validateExperimentBaseline('0')).not.toThrow();
+    });
+
+    it('accepts any other explicit numeric string', () => {
+      expect(() => validateExperimentBaseline('12.5')).not.toThrow();
     });
   });
 
