@@ -489,6 +489,155 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
   };
 }
 
+export interface PullDrift {
+  behind: boolean;
+  local_head: string;
+  origin_head: string;
+  commits_behind: number;
+  commit_summaries: string[];
+  truncated: boolean;
+}
+
+export interface BuildDrift {
+  stale: boolean;
+  local_head: string;
+  built_sha: string | null;
+  built_at: string | null;
+  reason?: string;
+}
+
+export interface DeployDriftReport {
+  status: 'clean' | 'drift' | 'error';
+  checked_at: string;
+  pull_drift?: PullDrift;
+  build_drift?: BuildDrift;
+  error?: string;
+  hint?: string;
+}
+
+export const COMMIT_LOG_LIMIT = 20;
+
+/**
+ * Detect the "merged != live on the fleet binary" gap root-caused 2026-08-11
+ * (see continuity reference/cortextos-fleet-cli-deploy-mechanism): the fleet
+ * `cortextos` CLI is a global npm-link to this checkout's gitignored,
+ * tsup-built `dist/`, with no auto-deploy. A framework PR merging to
+ * `origin/main` does nothing for the running fleet until someone pulls AND
+ * rebuilds on this host — #77 shipped invisible for 3 commits' worth of time
+ * because the checkout sat behind.
+ *
+ * Two independent drift checks, deliberately not conflated (they have
+ * different fixes):
+ *
+ * 1. **Pull drift** — local HEAD vs `origin/main` after a fetch. Fix: `git
+ *    pull --ff-only`.
+ * 2. **Build drift** — `dist/build-manifest.json`'s stamped `gitSha` (written
+ *    by every `npm run build`, see tsup.config.ts's `onSuccess` hook — added
+ *    for daemon-restart forensics, task_1785551337187, reused here rather
+ *    than adding a second stamping mechanism) vs local HEAD. Comparing
+ *    against local HEAD, not origin — this check answers "does dist/ match
+ *    what's actually checked out," independent of whether the checkout
+ *    itself is also behind. Deliberately NOT using dist/cli.js's mtime: a
+ *    `git checkout`/`pull` sets file mtimes to checkout time regardless of
+ *    content, so mtime doesn't reliably indicate "built from the newest
+ *    commit" — the SHA stamp is the robust signal the task called for.
+ *
+ * Either drift sets `status: 'drift'` so a cron consumer can alert on a
+ * single field rather than re-deriving it from both sub-reports.
+ */
+export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
+  const checked_at = new Date().toISOString();
+  const execOpts = { cwd: frameworkRoot, encoding: 'utf-8' as const, timeout: 30000, stdio: 'pipe' as const };
+
+  try {
+    execSync('git rev-parse --is-inside-work-tree', execOpts);
+  } catch {
+    return { status: 'error', checked_at, error: 'not a git repository', hint: `${frameworkRoot} is not inside a git work tree` };
+  }
+
+  try {
+    execSync('git remote get-url origin', execOpts);
+  } catch {
+    return { status: 'error', checked_at, error: 'no origin remote configured' };
+  }
+
+  try {
+    execSync('git fetch origin main', execOpts);
+  } catch {
+    return { status: 'error', checked_at, error: 'failed to fetch origin/main', hint: 'Check network and repo access' };
+  }
+
+  let localHead: string, originHead: string;
+  try {
+    localHead = execSync('git rev-parse HEAD', execOpts).trim();
+    originHead = execSync('git rev-parse origin/main', execOpts).trim();
+  } catch {
+    return { status: 'error', checked_at, error: 'failed to resolve HEAD or origin/main' };
+  }
+
+  const behind = localHead !== originHead;
+  let commitsBehind = 0;
+  let commitSummaries: string[] = [];
+  if (behind) {
+    try {
+      commitsBehind = parseInt(execSync('git rev-list HEAD..origin/main --count', execOpts).trim(), 10);
+    } catch { /* default 0 */ }
+    try {
+      commitSummaries = execSync(`git log HEAD..origin/main --oneline -${COMMIT_LOG_LIMIT}`, execOpts)
+        .trim().split('\n').filter(Boolean);
+    } catch { /* leave empty */ }
+  }
+
+  const pull_drift: PullDrift = {
+    behind,
+    local_head: localHead,
+    origin_head: originHead,
+    commits_behind: commitsBehind,
+    commit_summaries: commitSummaries,
+    truncated: commitsBehind > COMMIT_LOG_LIMIT,
+  };
+
+  const manifestPath = join(frameworkRoot, 'dist', 'build-manifest.json');
+  let build_drift: BuildDrift;
+  if (!existsSync(manifestPath)) {
+    build_drift = {
+      stale: true,
+      local_head: localHead,
+      built_sha: null,
+      built_at: null,
+      reason: 'dist/build-manifest.json not found — dist/ has never been built, or was built before manifest stamping was added; run npm run build',
+    };
+  } else {
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { gitSha?: string; builtAt?: string };
+      const builtSha = manifest.gitSha ?? null;
+      const stale = builtSha !== localHead;
+      build_drift = {
+        stale,
+        local_head: localHead,
+        built_sha: builtSha,
+        built_at: manifest.builtAt ?? null,
+        ...(stale ? { reason: 'dist/ was built from a different commit than local HEAD — run npm run build' } : {}),
+      };
+    } catch {
+      build_drift = {
+        stale: true,
+        local_head: localHead,
+        built_sha: null,
+        built_at: null,
+        reason: 'dist/build-manifest.json exists but could not be parsed',
+      };
+    }
+  }
+
+  return {
+    status: (pull_drift.behind || build_drift.stale) ? 'drift' : 'clean',
+    checked_at,
+    pull_drift,
+    build_drift,
+  };
+}
+
 /**
  * Post a message to the org's Telegram activity channel.
  *
