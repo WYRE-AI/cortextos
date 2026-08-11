@@ -9,7 +9,7 @@ import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTa
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
+import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, postActivity } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
@@ -700,6 +700,33 @@ busCommand
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
     const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10), env.ctxRoot);
     console.log(JSON.stringify(report, null, 2));
+  });
+
+busCommand
+  .command('check-stale-blockers')
+  .description('Detect blocked tasks whose dependency (task or referenced PR) has already resolved')
+  .option('--format <fmt>', 'Output format: json|text', 'json')
+  .action((opts: { format?: string }) => {
+    const env = resolveEnv();
+    const report = checkStaleBlockers(env.ctxRoot);
+    if (opts.format === 'text') {
+      if (report.entries.length === 0) {
+        console.log(`No stale blockers found (${report.summary.scanned} blocked tasks scanned).`);
+        return;
+      }
+      for (const e of report.entries) {
+        console.log(`[${e.kind}] ${e.task_id} (${e.org}, assigned: ${e.assigned_to})`);
+        console.log(`  ${e.title}`);
+        console.log(`  ${e.detail}`);
+        console.log('');
+      }
+      console.log(
+        `Total: ${report.entries.length} flagged (${report.summary.resolved_dependency} resolved-dependency, ` +
+        `${report.summary.unverified_external_ref} needs-manual-check) out of ${report.summary.scanned} blocked tasks scanned.`,
+      );
+    } else {
+      console.log(JSON.stringify(report, null, 2));
+    }
   });
 
 busCommand
