@@ -17,6 +17,7 @@ export default defineConfig({
     'hooks/hook-activity-beat': 'src/hooks/hook-activity-beat.ts',
     'hooks/hook-context-status': 'src/hooks/hook-context-status.ts',
     'hooks/hook-loop-detector': 'src/hooks/hook-loop-detector.ts',
+    'hooks/hook-subagent-priming': 'src/hooks/hook-subagent-priming.ts',
   },
   format: ['cjs'],
   target: 'node20',

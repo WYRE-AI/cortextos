@@ -60,6 +60,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cortextos bus hook-subagent-priming",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SessionEnd": [
