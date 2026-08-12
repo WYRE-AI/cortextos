@@ -447,6 +447,65 @@ describe('Bus System', () => {
       expect(report.entries[0].detail).toContain('PR #67');
     });
 
+    // task_1786548092193 (analyst/forge, 2026-08-12 first live run): the
+    // sweep matched "PR #306" in "...same shape as the action1 precedent,
+    // PR #306..." as if it were the blocker, when it's a precedent-citation
+    // example — PR #306 predated the task by weeks and never touched the
+    // task's actual subject. This exact scenario, reproduced.
+    it('does not flag a PR mention that is a precedent-citation example, not a blocker', () => {
+      writeTask('myorg', {
+        id: 'task_precedent',
+        title: 'Gateway vendor-parity decision: mimecast + scalepad',
+        status: 'blocked',
+        description: 'Needs a business-scope call — same shape as the action1 precedent, PR #306.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('still flags a genuine blocking PR mention even when a precedent citation appears earlier in the same description', () => {
+      writeTask('myorg', {
+        id: 'task_mixed',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'Same shape as the action1 precedent, PR #306. This one is actually blocked on PR#67 merging.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+      expect(report.entries[0].detail).not.toContain('PR #306');
+    });
+
+    it('does not flag other precedent-citation phrasings ("see PR #NN for the pattern", "e.g.", "prior art")', () => {
+      writeTask('org-a', {
+        id: 'task_see_pattern',
+        title: 'wire the new vendor',
+        status: 'blocked',
+        description: 'Follow the existing rollout — see PR #12 for the pattern.',
+      });
+      writeTask('org-a', {
+        id: 'task_eg',
+        title: 'add the config flag',
+        status: 'blocked',
+        description: 'Gate it behind a flag (e.g. PR #45) rather than hardcoding.',
+      });
+      writeTask('org-a', {
+        id: 'task_prior_art',
+        title: 'draft the design doc',
+        status: 'blocked',
+        description: 'Prior art: PR #99 covers a similar migration.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
     it('does not flag a blocked task with no dependency signal at all', () => {
       writeTask('myorg', {
         id: 'task_plain',
