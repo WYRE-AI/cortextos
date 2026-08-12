@@ -384,6 +384,60 @@ export interface StaleBlockerReport {
 // structured field.
 const PR_REFERENCE_REGEX = /\bPR\s*#\s*(\d+)\b/gi;
 
+// task_1786548092193 (analyst/forge, 2026-08-12 first live run): the bare
+// regex above matches ANY "PR #NN" mention, including precedent-citation
+// prose ("...same shape as the action1 precedent, PR #306...") that isn't
+// naming a blocker at all — false-positived a task as unblockable when the
+// cited PR predated the task by weeks and never touched its actual subject.
+//
+// Fix is an exclude-list, not a require-list: look at the text immediately
+// around each match for precedent-citation phrasing and drop that specific
+// mention if found, rather than requiring an explicit "blocked on"/"pending"
+// cue be present. A require-list would suppress genuine free-form blocking
+// mentions that don't happen to use one of a fixed set of phrases (e.g.
+// "can't proceed until PR#67 lands") — the false-positive class here is
+// narrow and nameable (precedent/example citation), so exclude it
+// specifically rather than narrowing the whole match surface.
+//
+// No trailing \b: several cues end in a non-word char ("e.g."), and \b only
+// holds at a word/non-word transition — a trailing \b after "e.g." silently
+// never matches, since both the "." and the space after it are non-word.
+const PRECEDENT_CITATION_CUE_REGEX =
+  /\b(same (shape|pattern|approach|idiom) as|see .{0,10}for (the )?pattern|per the .{0,40}precedent|precedent|e\.g\.|for example|prior art)/i;
+
+// Some cues fully precede the reference ("same shape as ... PR #306"); one
+// straddles it ("see PR #12 for the pattern" — the reference sits INSIDE the
+// cue phrase, not before it). Rather than special-case that shape, replace
+// the matched "PR #NN" text with a same-length placeholder and test the cue
+// regex against a window of the RESULT — "see PR #12 for the pattern"
+// becomes "see [PRREF] for the pattern", which the "see .{0,10}for pattern"
+// alternative matches straightforwardly on either side of the placeholder.
+//
+// The before-window is clamped to never reach past the END of the PREVIOUS
+// PR reference in the same text (if any) — not a generic sentence-boundary
+// regex, which breaks on abbreviation periods ("e.g." itself contains two
+// periods, so a naive [.!?]-boundary split truncates the window right after
+// "e.g."'s own trailing period and discards the very cue it's meant to
+// preserve). Clamping to the prior PR mention's end is a more targeted
+// anchor for the actual failure mode: an earlier citation's own trailing
+// context ("...precedent, PR #306. ") leaking into a later, separate,
+// genuinely blocking mention's window ("...blocked on PR#67").
+const PRECEDENT_CUE_WINDOW_BEFORE = 80;
+const PRECEDENT_CUE_WINDOW_AFTER = 40;
+
+function isPrecedentCitation(
+  text: string,
+  matchIndex: number,
+  matchLength: number,
+  previousMatchEnd: number,
+): boolean {
+  const windowStart = Math.max(0, matchIndex - PRECEDENT_CUE_WINDOW_BEFORE, previousMatchEnd);
+  const before = text.slice(windowStart, matchIndex);
+  const after = text.slice(matchIndex + matchLength, matchIndex + matchLength + PRECEDENT_CUE_WINDOW_AFTER);
+  const withPlaceholder = `${before}[PRREF]${after}`;
+  return PRECEDENT_CITATION_CUE_REGEX.test(withPlaceholder);
+}
+
 /**
  * Sweep every org's blocked tasks for blockers that have already resolved.
  *
@@ -461,7 +515,19 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
       }
 
       const text = `${task.title} ${task.description}`;
-      const refs = [...new Set([...text.matchAll(PR_REFERENCE_REGEX)].map(m => `PR #${m[1]}`))];
+      // matchAll yields matches left-to-right; previousMatchEnd tracks the
+      // prior match's end so each mention's precedent-cue window can be
+      // clamped against it (see isPrecedentCitation's doc comment).
+      let previousMatchEnd = 0;
+      const keptRefs: string[] = [];
+      for (const m of text.matchAll(PR_REFERENCE_REGEX)) {
+        const matchIndex = m.index ?? 0;
+        if (!isPrecedentCitation(text, matchIndex, m[0].length, previousMatchEnd)) {
+          keptRefs.push(`PR #${m[1]}`);
+        }
+        previousMatchEnd = matchIndex + m[0].length;
+      }
+      const refs = [...new Set(keptRefs)];
       if (refs.length > 0) {
         entries.push({
           task_id: task.id,
