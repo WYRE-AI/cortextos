@@ -303,6 +303,72 @@ describe('Sprint 3: Experiment Framework', () => {
       const id = createExperiment(testDir, 'testbot', 'ctr', 'test');
       expect(() => evaluateExperiment(testDir, id, 10)).toThrow("expected 'running'");
     });
+
+    describe('--score (qualitative metrics)', () => {
+      it('keeps result_value as the raw measuredValue passed, even when score is given (task_1786464752094)', () => {
+        const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {
+          direction: 'higher',
+          baseline: 5,
+        });
+        runExperiment(testDir, id);
+        // Placeholder measuredValue (0) + a real qualitative score (7).
+        const result = evaluateExperiment(testDir, id, 0, { score: 7 });
+
+        expect(result.result_value).toBe(0); // NOT overwritten by the score
+        expect(result.score).toBe(7); // independent field
+      });
+
+      it('decides keep/discard using score, not the placeholder measuredValue', () => {
+        const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {
+          direction: 'higher',
+          baseline: 5,
+        });
+        runExperiment(testDir, id);
+        // measuredValue (0) alone would discard (0 < 5); score (7) should keep (7 > 5).
+        const result = evaluateExperiment(testDir, id, 0, { score: 7 });
+
+        expect(result.decision).toBe('keep');
+        expect(result.baseline_value).toBe(7); // next eval's baseline is the score, not the placeholder
+      });
+
+      it('score is null when not given, on both a scored-metric and a plain-metric evaluation', () => {
+        const id = createExperiment(testDir, 'testbot', 'ctr', 'test', { baseline: 0 });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 42);
+
+        expect(result.score).toBeNull();
+        expect(result.result_value).toBe(42);
+      });
+
+      it('results.tsv records measured_value and score as independent columns', () => {
+        const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {
+          direction: 'higher',
+          baseline: 5,
+        });
+        runExperiment(testDir, id);
+        evaluateExperiment(testDir, id, 0, { score: 7 });
+
+        const tsvPath = join(testDir, 'experiments', 'results.tsv');
+        const lines = readFileSync(tsvPath, 'utf-8').trim().split('\n');
+        expect(lines[0]).toBe('experiment_id\tagent\tmetric\tmeasured_value\tscore\tbaseline\tdecision\thypothesis\ttimestamp');
+        const cols = lines[1].split('\t');
+        expect(cols[3]).toBe('0'); // measured_value: the raw placeholder
+        expect(cols[4]).toBe('7'); // score: independent column
+        expect(cols[5]).toBe('7'); // baseline: the effective (score-driven) value on keep
+      });
+
+      it('results.tsv leaves the score column empty for a plain (unscored) evaluation', () => {
+        const id = createExperiment(testDir, 'testbot', 'ctr', 'test', { baseline: 0 });
+        runExperiment(testDir, id);
+        evaluateExperiment(testDir, id, 42);
+
+        const tsvPath = join(testDir, 'experiments', 'results.tsv');
+        const lines = readFileSync(tsvPath, 'utf-8').trim().split('\n');
+        const cols = lines[1].split('\t');
+        expect(cols[3]).toBe('42');
+        expect(cols[4]).toBe('');
+      });
+    });
   });
 
   describe('listExperiments', () => {
