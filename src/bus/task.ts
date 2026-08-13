@@ -240,10 +240,12 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
       }
     }
   } catch {
-    return null; // orgs/ missing or unreadable
+    // orgs/ missing or unreadable — the prefix scan still covers the
+    // caller's own taskDir (which is not guaranteed to live under orgs/).
+    return findTaskFileByPrefix(paths, taskId, orgsRoot);
   }
 
-  if (matches.length === 0) return null;
+  if (matches.length === 0) return findTaskFileByPrefix(paths, taskId, orgsRoot);
   if (matches.length > 1) {
     const orgList = matches.map((m) => m.org).join(', ');
     console.warn(
@@ -253,6 +255,61 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
     );
   }
   return matches[0].path;
+}
+
+/**
+ * Tier 3 of findTaskFile: unique-prefix resolution. list-tasks' display
+ * truncated ids for a long time (fixed in #14), so operators habitually
+ * copy prefixes — and a prefix that misses the exact-match tiers used to
+ * dead-end in "not found" even though the task was sitting right there.
+ * A prefix that matches exactly one task resolves to it; an ambiguous
+ * prefix throws NAMING every candidate (so the operator can see what to
+ * disambiguate to) rather than silently picking one; no match falls
+ * through to the caller's existing not-found error.
+ */
+function findTaskFileByPrefix(
+  paths: BusPaths,
+  taskIdPrefix: string,
+  orgsRoot: string,
+): string | null {
+  const prefixMatches: Array<{ path: string; id: string; org: string }> = [];
+  const scanDir = (tasksDir: string, org: string): void => {
+    if (!existsSync(tasksDir)) return;
+    for (const f of readdirSync(tasksDir)) {
+      if (!f.endsWith('.json') || !f.startsWith(taskIdPrefix)) continue;
+      prefixMatches.push({
+        path: join(tasksDir, f),
+        id: f.slice(0, -'.json'.length),
+        org,
+      });
+    }
+  };
+  try {
+    // The caller's own taskDir is not guaranteed to live under orgs/
+    // (the fast path in findTaskFile makes the same assumption), so scan
+    // it explicitly, then the sibling orgs — skipping the own dir if the
+    // orgs sweep would visit it again.
+    scanDir(paths.taskDir, 'own');
+    if (existsSync(orgsRoot)) {
+      for (const entry of readdirSync(orgsRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const tasksDir = join(orgsRoot, entry.name, 'tasks');
+        if (tasksDir === paths.taskDir) continue;
+        scanDir(tasksDir, entry.name);
+      }
+    }
+  } catch {
+    return null; // orgs/ or a tasks dir unreadable
+  }
+  if (prefixMatches.length === 1) return prefixMatches[0].path;
+  if (prefixMatches.length > 1) {
+    const candidates = prefixMatches.map((m) => `${m.id} (org: ${m.org})`).join(', ');
+    throw new Error(
+      `Ambiguous task id prefix '${taskIdPrefix}': matches ${prefixMatches.length} tasks — ` +
+      `${candidates}. Use the full task id.`,
+    );
+  }
+  return null;
 }
 
 /**
