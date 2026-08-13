@@ -358,20 +358,27 @@ export function evaluateExperiment(
   if (!existsSync(tsvPath)) {
     appendFileSync(
       tsvPath,
-      'experiment_id\tagent\tmetric\tmeasured_value\tscore\tbaseline\tdecision\thypothesis\ttimestamp\n',
+      'experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\tscore\n',
       'utf-8',
     );
   }
+  // score is APPENDED last, not inserted mid-row: the header is only ever
+  // written for a brand-new file (guarded above), so a pre-existing
+  // results.tsv keeps its original 8-column header forever. A mid-row
+  // insert would silently shift baseline/decision/hypothesis/timestamp one
+  // position out of alignment with that old header on every future row —
+  // a trailing column is backward-compatible for any positional reader,
+  // an inserted one is not (walter, cortextos#90 review).
   const tsvLine = [
     experiment.id,
     experiment.agent,
     experiment.metric,
     String(measuredValue),
-    experiment.score === null ? '' : String(experiment.score),
     String(decision === 'keep' ? effectiveValue : baseline),
     decision,
     experiment.hypothesis,
     experiment.completed_at,
+    experiment.score === null ? '' : String(experiment.score),
   ].join('\t');
   appendFileSync(tsvPath, tsvLine + '\n', 'utf-8');
 

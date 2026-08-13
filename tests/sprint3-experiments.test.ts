@@ -340,7 +340,7 @@ describe('Sprint 3: Experiment Framework', () => {
         expect(result.result_value).toBe(42);
       });
 
-      it('results.tsv records measured_value and score as independent columns', () => {
+      it('results.tsv records measured_value and score as independent columns, score TRAILING (not inserted mid-row)', () => {
         const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {
           direction: 'higher',
           baseline: 5,
@@ -349,12 +349,12 @@ describe('Sprint 3: Experiment Framework', () => {
         evaluateExperiment(testDir, id, 0, { score: 7 });
 
         const tsvPath = join(testDir, 'experiments', 'results.tsv');
-        const lines = readFileSync(tsvPath, 'utf-8').trim().split('\n');
-        expect(lines[0]).toBe('experiment_id\tagent\tmetric\tmeasured_value\tscore\tbaseline\tdecision\thypothesis\ttimestamp');
+        const lines = readFileSync(tsvPath, 'utf-8').split('\n').filter(Boolean);
+        expect(lines[0]).toBe('experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\tscore');
         const cols = lines[1].split('\t');
         expect(cols[3]).toBe('0'); // measured_value: the raw placeholder
-        expect(cols[4]).toBe('7'); // score: independent column
-        expect(cols[5]).toBe('7'); // baseline: the effective (score-driven) value on keep
+        expect(cols[4]).toBe('7'); // baseline: the effective (score-driven) value on keep
+        expect(cols[8]).toBe('7'); // score: independent, trailing column
       });
 
       it('results.tsv leaves the score column empty for a plain (unscored) evaluation', () => {
@@ -363,10 +363,52 @@ describe('Sprint 3: Experiment Framework', () => {
         evaluateExperiment(testDir, id, 42);
 
         const tsvPath = join(testDir, 'experiments', 'results.tsv');
-        const lines = readFileSync(tsvPath, 'utf-8').trim().split('\n');
+        const lines = readFileSync(tsvPath, 'utf-8').split('\n').filter(Boolean);
         const cols = lines[1].split('\t');
         expect(cols[3]).toBe('42');
-        expect(cols[4]).toBe('');
+        expect(cols[8]).toBe('');
+      });
+
+      it('a scored row appended to a PRE-EXISTING 8-column results.tsv stays aligned with the old header (cortextos#90 review finding)', () => {
+        const expDir = join(testDir, 'experiments');
+        const tsvPath = join(expDir, 'results.tsv');
+        // Seed a results.tsv exactly as it looked before `score` existed —
+        // 8 columns, no score column at all (e.g. walter's own live
+        // theta-wave file). A mid-row insert of `score` would shift every
+        // column after it out of alignment with this header.
+        writeFileSync(
+          tsvPath,
+          'experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\n' +
+            'exp_old_1\ttestbot\tctr\t10\t5\tkeep\told hypothesis\t2026-05-01T00:00:00.000Z\n',
+          'utf-8',
+        );
+
+        const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {
+          direction: 'higher',
+          baseline: 5,
+        });
+        runExperiment(testDir, id);
+        evaluateExperiment(testDir, id, 0, { score: 7 });
+
+        const lines = readFileSync(tsvPath, 'utf-8').split('\n').filter(Boolean);
+        expect(lines).toHaveLength(3); // header + pre-existing row + new row
+        expect(lines[0]).toBe(
+          'experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp',
+        ); // untouched — still the OLD 8-column header, never rewritten
+        expect(lines[1]).toBe(
+          'exp_old_1\ttestbot\tctr\t10\t5\tkeep\told hypothesis\t2026-05-01T00:00:00.000Z',
+        ); // untouched
+        const newCols = lines[2].split('\t');
+        // First 8 columns line up exactly with the old header's positions —
+        // score is a 9th, trailing column any positional reader of the old
+        // 8-column shape simply never sees.
+        expect(newCols).toHaveLength(9);
+        expect(newCols[0]).toBe(id);
+        expect(newCols[3]).toBe('0'); // measured_value
+        expect(newCols[4]).toBe('7'); // baseline (effective value on keep)
+        expect(newCols[5]).toBe('keep'); // decision
+        expect(newCols[6]).toBe('Warmer replies'); // hypothesis
+        expect(newCols[8]).toBe('7'); // score, trailing
       });
     });
   });
