@@ -46,8 +46,23 @@ Onboarding must complete all of the following before you are considered function
 | Knowledge base ingestion rules set | `.claude/skills/memory-management/SKILL.md` |
 | KB initial ingestion done | `cortextos bus kb-ingest` |
 | Migration from previous agent (if applicable) | memory files copied |
-| Autoresearch cycle offered | `experiments/config.json` (optional) |
+| One starter autoresearch cycle, scoped to a real lane metric | `list-experiments` shows 1 active cycle |
 | .onboarded flag written | `$CTX_ROOT/state/$CTX_AGENT_NAME/.onboarded` |
+
+---
+
+## Step 3.5: Stand up a starter autoresearch cycle
+
+Before you mark onboarding complete, set up ONE autoresearch cycle scoped to a metric you genuinely own in your lane. This is structural, not a checkbox — cold-start experiment coverage is part of becoming functional, not something to remember later.
+
+- Pick a REAL metric your role can move (e.g. infra → deploy/KB health; marketing → content→signup conversion; adoption → activation-funnel step; warden → security-finding false-positive rate; dev → PR-cycle-time or build health; ruby → migration reconnection rate; murph → dependency-freshness). If you genuinely cannot name a metric you own, that is a signal about your role definition — surface it to the orchestrator rather than inventing a fake one. A checkbox experiment on a metric nobody owns produces noise and discredits the mechanism.
+- Register it as a real, daemon-managed cycle (see the autoresearch skill), not a session-local loop.
+
+```bash
+cortextos bus list-experiments   # confirm exactly one active cycle before proceeding
+```
+
+Do not write the `.onboarded` flag until this shows one active cycle (or you have surfaced a genuine no-metric case to the orchestrator).
 
 ---
 
@@ -79,5 +94,6 @@ If a session crash or restart interrupts onboarding mid-way:
 
 - Do NOT send a Telegram message claiming you are online until onboarding is complete
 - Do NOT set up crons until IDENTITY.md and GOALS.md are written
+- Do NOT write `.onboarded` until a starter autoresearch cycle is active (Step 3.5) or a genuine no-metric case has been surfaced
 - Do NOT start processing user requests until `.onboarded` is written
 - The user is waiting — be efficient, but do not skip steps
