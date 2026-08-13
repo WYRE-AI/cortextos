@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added — bus-native activity broadcast fallback (fleet broadcast without Telegram)
+
+`bus post-activity` previously required a Telegram activity channel
+(`orgs/<org>/activity-channel.env` with `ACTIVITY_BOT_TOKEN` +
+`ACTIVITY_CHAT_ID`) and went silently dark without one — while its failure
+message pointed at the wrong file and key (`ACTIVITY_CHAT_ID` in
+`secrets.env`, which `postActivity` never reads).
+
+- **`src/bus/system.ts`**: new `broadcastActivityViaBus()` — fans the
+  message out as a normal-priority `[ACTIVITY]`-prefixed inbox message to
+  every enabled agent in the sender's org except the sender. Fleet-wide
+  broadcast now has zero Telegram dependency, which matters for fleets
+  with bus-only agents (no BOT_TOKEN at all).
+- **`src/cli/bus.ts`**: `post-activity` falls back to the bus broadcast
+  when no Telegram channel is configured (Telegram still wins when
+  present), logs an `agent_activity/activity_broadcast` event, and the
+  corrected failure text now names the real config file and both keys.
+- Deliberately NOT wired into `approval.ts`'s `postActivity` call: approval
+  posts carry Telegram inline-keyboard buttons that a bus message cannot
+  render — silently downgrading them to inert text would break the
+  approval flow. Fallback stays at the plain-message call site.
+
 ### Fixed — agent templates documented a KB CLI surface that does not exist
 
 The AGENTS.md of the `agent`, `agent-codex`, `analyst`, and `orchestrator`

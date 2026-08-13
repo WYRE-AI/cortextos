@@ -5,6 +5,8 @@ import { ensureDir } from '../utils/atomic.js';
 import { TelegramAPI } from '../telegram/api.js';
 import type { BusPaths, TaskStatus } from '../types/index.js';
 import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
+import { resolvePaths } from '../utils/paths.js';
+import { sendMessage } from './message.js';
 import { listTasks, checkTaskDependencies } from './task.js';
 
 // --- Types ---
@@ -794,4 +796,46 @@ export async function postActivity(
   } catch {
     return false;
   }
+}
+
+export interface BusBroadcastResult {
+  /** Agents whose inbox accepted the broadcast message. */
+  delivered: string[];
+  /** Agents that were targeted but whose delivery threw (e.g. unresolvable paths). */
+  skipped: string[];
+}
+
+/**
+ * Bus-native activity broadcast — the fallback used when no Telegram
+ * activity channel is configured (activity-channel.env absent). Fans the
+ * message out as a normal-priority inbox message to every enabled agent in
+ * the sender's org except the sender itself.
+ *
+ * Telegram-independent by design: a fleet can contain bus-only agents (no
+ * BOT_TOKEN at all), and fleet-wide broadcast must not depend on a Telegram
+ * chat id existing anywhere.
+ */
+export function broadcastActivityViaBus(
+  frameworkRoot: string,
+  ctxRoot: string,
+  instanceId: string,
+  org: string,
+  sender: string,
+  message: string,
+): BusBroadcastResult {
+  const delivered: string[] = [];
+  const skipped: string[] = [];
+  const recipients = discoverAllAgents(frameworkRoot, ctxRoot).filter(
+    (a) => a.enabled && a.org === org && a.name !== sender,
+  );
+  for (const agent of recipients) {
+    try {
+      const recipientPaths = resolvePaths(agent.name, instanceId, org);
+      sendMessage(recipientPaths, sender, agent.name, 'normal', `[ACTIVITY] ${message}`);
+      delivered.push(agent.name);
+    } catch {
+      skipped.push(agent.name);
+    }
+  }
+  return { delivered, skipped };
 }
