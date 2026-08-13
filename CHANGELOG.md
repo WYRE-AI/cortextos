@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed — agent templates documented a KB CLI surface that does not exist
+
+The AGENTS.md of the `agent`, `agent-codex`, `analyst`, and `orchestrator`
+templates told every agent to pass a `--collection` flag that neither
+`bus kb-ingest` nor `bus kb-query` accepts, and described a three-collection
+model (`memory-{agent}` / `private-{agent}` / `shared-{org}`) that has never
+existed in code — the real model is two collections, `agent-{agent}` and
+`shared-{org}`, derived from `--scope`/`--agent`. Agents following the
+template verbatim got hard CLI errors on the documented heartbeat re-ingest
+command. Docs now match the implemented CLI exactly and state explicitly
+that no `--collection` flag exists. (Template HEARTBEAT.md files were
+already correct on main; found while restoring the fleet KB outage.)
+
 ### Fixed — empty env value in a later secrets file clobbered the real key, killing KB ingest fleet-wide
 
 `loadSecretsEnv()` (`src/bus/knowledge-base.ts`) merges the framework `.env`
