@@ -823,3 +823,72 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     expect(existsSync(join(paths.taskDir, `${id}.json`))).toBe(true);
   });
 });
+
+describe('findTaskFile — tier-3 unique-prefix resolution', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-task-prefix-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'paul'),
+      inflight: join(testDir, 'inflight', 'paul'),
+      processed: join(testDir, 'processed', 'paul'),
+      logDir: join(testDir, 'logs', 'paul'),
+      stateDir: join(testDir, 'state', 'paul'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    } as BusPaths;
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  const mk = (id: string, dir?: string) => {
+    const d = dir ?? paths.taskDir;
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, `${id}.json`), JSON.stringify({ id, status: 'pending', title: 'T' }));
+  };
+
+  it('a unique prefix resolves to the full task — updateTask works with a truncated id', () => {
+    mk('task_1700000000001_11111111');
+    mk('task_1700000000002_22222222');
+    updateTask(paths, 'task_1700000000001', 'in_progress');
+    const saved = JSON.parse(
+      readFileSync(join(paths.taskDir, 'task_1700000000001_11111111.json'), 'utf-8'),
+    );
+    expect(saved.status).toBe('in_progress');
+  });
+
+  it('an ambiguous prefix throws naming every candidate', () => {
+    mk('task_1700000000001_11111111');
+    mk('task_1700000000001_22222222');
+    expect(() => findTaskFile(paths, 'task_1700000000001')).toThrow(/Ambiguous task id prefix/);
+    expect(() => findTaskFile(paths, 'task_1700000000001')).toThrow(/task_1700000000001_11111111/);
+    expect(() => findTaskFile(paths, 'task_1700000000001')).toThrow(/task_1700000000001_22222222/);
+  });
+
+  it('no prefix match preserves the caller not-found error', () => {
+    mk('task_1700000000001_11111111');
+    expect(findTaskFile(paths, 'task_9999')).toBeNull();
+    expect(() => updateTask(paths, 'task_9999', 'completed')).toThrow(/not found in any org/);
+  });
+
+  it('an exact id wins at tier 1 and never enters prefix logic', () => {
+    mk('task_1700000000001_11111111');
+    expect(findTaskFile(paths, 'task_1700000000001_11111111')).toContain(
+      'task_1700000000001_11111111.json',
+    );
+  });
+
+  it('a prefix resolves across sibling orgs too', () => {
+    mk('task_1700000000003_33333333', join(testDir, 'orgs', 'beta', 'tasks'));
+    expect(findTaskFile(paths, 'task_1700000000003')).toContain(
+      'task_1700000000003_33333333.json',
+    );
+  });
+});

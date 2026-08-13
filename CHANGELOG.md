@@ -18,6 +18,19 @@
   cannot see a running daemon still on older code (process-vs-dist drift),
   so a rebuild still needs a daemon restart to be fully deployed.
 
+### Added — unique-prefix task id resolution in findTaskFile
+
+Operators habitually copy truncated task ids (list-tasks' display
+truncated them for a long time — fixed in #14 — and stale dists kept
+showing the old format), and a truncated id dead-ended in "not found in
+any org" even with the task sitting right there. `findTaskFile` now has a
+tier-3 fallback after both exact-match tiers miss: a prefix matching
+exactly one task resolves to it; an ambiguous prefix throws naming every
+candidate (id + org) so the operator can disambiguate; no match preserves
+the caller's existing not-found error. Exact-match behavior is untouched.
+Benefits every consumer (update-task, complete-task, claim-task,
+dependency checks) through the shared chokepoint.
+
 ### Added — bus-native activity broadcast fallback (fleet broadcast without Telegram)
 
 `bus post-activity` previously required a Telegram activity channel
