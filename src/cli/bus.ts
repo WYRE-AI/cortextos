@@ -9,7 +9,7 @@ import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTa
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity } from '../bus/system.js';
+import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity, broadcastActivityViaBus } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
@@ -765,7 +765,7 @@ busCommand
 
 busCommand
   .command('post-activity')
-  .description('Post a message to the org Telegram activity channel')
+  .description('Post a message to the org activity channel (Telegram if configured, bus broadcast otherwise)')
   .argument('<message>', 'Message to post')
   .action(async (message: string) => {
     const env = resolveEnv();
@@ -773,8 +773,24 @@ busCommand
     const success = await postActivity(orgDir, env.ctxRoot, env.org, message);
     if (success) {
       console.log('Activity posted');
+      return;
+    }
+    // No Telegram activity channel (activity-channel.env absent or incomplete):
+    // fall back to a bus-native broadcast so fleet-wide activity never depends
+    // on a Telegram chat id — bus-only agents must be able to broadcast too.
+    const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
+    const result = broadcastActivityViaBus(projectRoot, env.ctxRoot, env.instanceId, env.org, env.agentName, message);
+    try {
+      const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+      logEvent(paths, env.agentName, env.org, 'agent_activity', 'activity_broadcast', 'info',
+        JSON.stringify({ via: 'bus', delivered: result.delivered.length, skipped: result.skipped.length }));
+    } catch { /* non-fatal */ }
+    if (result.delivered.length > 0) {
+      const skippedNote = result.skipped.length > 0 ? ` (${result.skipped.length} skipped)` : '';
+      console.log(`No Telegram activity channel configured — broadcast over the bus to ${result.delivered.length} agent(s)${skippedNote}`);
     } else {
-      console.error('Failed to post activity. Check that ACTIVITY_CHAT_ID is set in your org secrets.env or .env file.');
+      console.error('Failed to post activity: no Telegram activity channel and no reachable bus recipients. For the Telegram channel, create orgs/<org>/activity-channel.env with ACTIVITY_BOT_TOKEN and ACTIVITY_CHAT_ID.');
+      process.exit(1);
     }
   });
 
