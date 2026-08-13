@@ -196,3 +196,54 @@ describe('kb warn messages — UX invariants', () => {
     expect(specificOrgWarns.every((m) => /run setup/i.test(m))).toBe(true);
   });
 });
+
+describe('loadSecretsEnv merge — empty values never clobber non-empty ones', () => {
+  /**
+   * Helper: drive readFileSync per-path so the framework .env and the org
+   * secrets.env return different contents. All other reads return ''.
+   */
+  function mockEnvFiles(dotenvContent: string, secretsContent: string): void {
+    fsMocks.readFileSync.mockImplementation((p: any) => {
+      const path = String(p);
+      if (path.endsWith('/cortextOS/.env')) return dotenvContent;
+      if (path.endsWith('/orgs/TestOrg/secrets.env')) return secretsContent;
+      return '';
+    });
+  }
+
+  /** Extract the env object passed to the mmrag execFileSync call. */
+  function spawnedEnv(): Record<string, string> {
+    const call = execFileSyncMock.mock.calls[0] as [string, string[], { env: Record<string, string> }];
+    return call[2].env;
+  }
+
+  it('placeholder KEY= in org secrets.env does NOT wipe the framework .env value', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    mockEnvFiles('GEMINI_API_KEY=real-framework-key\n', 'GEMINI_API_KEY=\n');
+
+    ingestKnowledgeBase(['/some/file.md'], baseOptions);
+
+    expect(spawnedEnv().GEMINI_API_KEY).toBe('real-framework-key');
+  });
+
+  it('non-empty org secrets.env value still overrides the framework .env value', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    mockEnvFiles('GEMINI_API_KEY=real-framework-key\n', 'GEMINI_API_KEY=org-specific-key\n');
+
+    ingestKnowledgeBase(['/some/file.md'], baseOptions);
+
+    expect(spawnedEnv().GEMINI_API_KEY).toBe('org-specific-key');
+  });
+
+  it('an empty value with no earlier non-empty value is preserved as empty', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    mockEnvFiles('', 'ONLY_IN_SECRETS=\n');
+
+    ingestKnowledgeBase(['/some/file.md'], baseOptions);
+
+    expect(spawnedEnv().ONLY_IN_SECRETS).toBe('');
+  });
+});

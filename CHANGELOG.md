@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Fixed — empty env value in a later secrets file clobbered the real key, killing KB ingest fleet-wide
+
+`loadSecretsEnv()` (`src/bus/knowledge-base.ts`) merges the framework `.env`
+and the org `secrets.env` with later-file-wins semantics — and an EMPTY
+value counted as a win. A placeholder `GEMINI_API_KEY=` line in
+`orgs/<org>/secrets.env` (shipped by the org template) silently wiped the
+valid key loaded from the framework `.env`, so every `bus kb-ingest` exited
+with "No Gemini API key" and the fleet's semantic index went dark.
+
+- **`src/bus/knowledge-base.ts`**: an empty value no longer overrides a
+  non-empty value from an earlier file. Non-empty values still override
+  normally, and an empty value with no earlier value is preserved.
+- Deliberately scoped to the KB merge path: the PTY env injection in
+  `src/pty/agent-pty.ts` shares the merge shape, but there an empty
+  agent-`.env` line plausibly serves as an intentional "blank to disable"
+  override (e.g. a bus-only agent blanking an org-level `BOT_TOKEN`), so
+  changing it needs a deliberate design decision, not a drive-by.
+
 ### Fixed — `list-experiments` and `checkGoalStaleness` silently scoped to a subset, not the whole fleet
 
 `bus list-experiments` with no `--agent` fell back to the caller's own
