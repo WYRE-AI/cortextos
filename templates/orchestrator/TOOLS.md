@@ -66,7 +66,7 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 |---|---|
 | `create-approval "<title>" <category> "[context]"` | Request human approval |
 | `update-approval <id> <approved\|rejected> "[note]"` | Resolve an approval |
-| `list-approvals [--status S] [--all-orgs]` | List approvals |
+| `list-approvals [--all-orgs]` | List approvals |
 
 ### Knowledge Base — full docs: `.claude/skills/knowledge-base/SKILL.md`
 | Command | What it does |
@@ -89,6 +89,7 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 | `hard-restart --reason "<why>"` | Fresh session (no history) |
 | `auto-commit [--dry-run]` | Daily workspace snapshot (local only) |
 | `check-upstream [--apply]` | Check for framework updates |
+| `check-deploy-drift` | Verify checkout + dist match origin/main. Caveat: "clean" means source and build agree — it cannot see a running daemon still on older code (process-vs-dist drift), so a rebuild still needs a daemon restart to be fully deployed |
 
 ### Goals
 | Command | What it does |

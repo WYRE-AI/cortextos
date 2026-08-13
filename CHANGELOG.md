@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Fixed — template docs drift batch: broken date commands, phantom CLI flags, undocumented checker caveat
+
+- **Unquoted `date` format strings** (9 files: AGENTS.md / HEARTBEAT.md /
+  analyst memory skill across agent, agent-codex, analyst, orchestrator):
+  the mandated memory-entry heredocs used `$(date -u +%H:%M UTC)` — on
+  BSD/macOS date the unquoted `UTC` parses as an operand (`illegal time
+  format`) and every memory entry written verbatim from the template got an
+  EMPTY timestamp. Reproduced independently by two agents the same night.
+  Now quoted: `$(date -u '+%H:%M UTC')`.
+- **Phantom `--status` flag** removed from the `list-approvals` row in 5
+  TOOLS.md templates — the CLI has no such option.
+- **`check-deploy-drift` documented** in TOOLS.md Lifecycle tables with the
+  load-bearing caveat: "clean" means source and build agree — the checker
+  cannot see a running daemon still on older code (process-vs-dist drift),
+  so a rebuild still needs a daemon restart to be fully deployed.
+
 ### Added — bus-native activity broadcast fallback (fleet broadcast without Telegram)
 
 `bus post-activity` previously required a Telegram activity channel
