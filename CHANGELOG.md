@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Fixed — evaluate-experiment's --score silently overwrote result_value/baseline_value
+
+`evaluateExperiment` (`src/bus/experiment.ts`) reassigned its `measuredValue`
+local to `options.score` whenever `--score` was given, then persisted that
+reassigned value into `experiment.result_value` — so a qualitative
+evaluation (the documented pattern: pass `0` as a measuredValue placeholder,
+the real value in `--score`) silently destroyed the record of what was
+actually passed as `measuredValue`, and there was no independent field to
+recover it from. `Experiment` gains a `score: number | null` field;
+`result_value` now always records the raw `measuredValue` argument
+unconditionally, `score` records `--score` independently, and the
+keep/discard decision (plus the next baseline, on keep) still uses the
+"effective" value — score when given, else the raw measured value — matching
+the original intent for qualitative metrics without corrupting the stored
+record. `results.tsv` gains a `score` column **appended last**, after
+`timestamp` — not inserted mid-row — since the header is only ever written
+for a brand-new file; a pre-existing `results.tsv` keeps its original
+8-column header forever, so a mid-row insert would have silently shifted
+`baseline`/`decision`/`hypothesis`/`timestamp` one position out of alignment
+with that old header on every future scored row (caught in review: an
+agent's own live theta-wave `results.tsv` would have misaligned on its next
+append). The `learnings.md` entry format for a scored evaluation now shows
+the score, the raw measured_value, and the baseline separately instead of
+one ambiguous number. New coverage in `tests/sprint3-experiments.test.ts` (7
+cases: raw value preserved under `--score`, decision driven by score not the
+placeholder, `score` is `null` when not given, both tsv-column shapes, and a
+dedicated pre-existing-8-column-file case proving old rows and their header
+stay untouched while new rows land correctly with `score` trailing).
+
 ### Fixed — template docs drift batch: broken date commands, phantom CLI flags, undocumented checker caveat
 
 - **Unquoted `date` format strings** (9 files: AGENTS.md / HEARTBEAT.md /

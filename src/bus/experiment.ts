@@ -18,6 +18,11 @@ export interface Experiment {
   status: 'proposed' | 'running' | 'completed';
   baseline_value: number | null;
   result_value: number | null;
+  /** Independent qualitative-score field (--score). Distinct from result_value,
+   * which always records the raw measuredValue actually passed to
+   * evaluateExperiment — see that function's docstring for why they must not
+   * be conflated. null when no score was given. */
+  score: number | null;
   decision: 'keep' | 'discard' | null;
   learning: string;
   experiment_commit: string | null;
@@ -198,6 +203,7 @@ export function createExperiment(
     status: 'proposed',
     baseline_value: options?.baseline ?? null,
     result_value: null,
+    score: null,
     decision: null,
     learning: '',
     experiment_commit: null,
@@ -298,32 +304,30 @@ export function evaluateExperiment(
   }
   const baseline = experiment.baseline_value;
 
-  // Compare measured vs baseline using direction
+  // The value the keep/discard decision (and, on keep, the next baseline) is
+  // computed against. For qualitative metrics the agent passes 0 as a
+  // placeholder measuredValue and --score 7 as the real one, so score — when
+  // given — IS the effective value, not measuredValue. This does NOT touch
+  // result_value below: result_value always records measuredValue exactly as
+  // passed, and score (when given) is stored in its own field. Conflating the
+  // two used to overwrite result_value with the score, destroying the record
+  // of what was actually passed as measuredValue (e.g. the placeholder 0) and
+  // leaving no way to tell, from stored history, whether a given number was a
+  // real measurement or a qualitative score.
+  const effectiveValue = options?.score !== undefined ? options.score : measuredValue;
+
   let decision: 'keep' | 'discard';
   if (experiment.direction === 'higher') {
-    decision = measuredValue > baseline ? 'keep' : 'discard';
+    decision = effectiveValue > baseline ? 'keep' : 'discard';
   } else {
-    decision = measuredValue < baseline ? 'keep' : 'discard';
+    decision = effectiveValue < baseline ? 'keep' : 'discard';
   }
 
   experiment.status = 'completed';
   experiment.completed_at = nowISO();
   experiment.result_value = measuredValue;
+  experiment.score = options?.score ?? null;
   experiment.decision = decision;
-
-  // For qualitative metrics: if score is provided, use it as the measured value
-  // (agent passes 0 as placeholder measuredValue and --score 7 as the actual value)
-  if (options?.score !== undefined) {
-    measuredValue = options.score;
-    // Re-evaluate decision with the correct measured value
-    if (experiment.direction === 'higher') {
-      decision = measuredValue > baseline ? 'keep' : 'discard';
-    } else {
-      decision = measuredValue < baseline ? 'keep' : 'discard';
-    }
-    experiment.result_value = measuredValue;
-    experiment.decision = decision;
-  }
 
   // Build learning from options
   const learningParts: string[] = [];
@@ -333,33 +337,48 @@ export function evaluateExperiment(
     experiment.learning = learningParts.join(' — ');
   }
 
-  // If keep, baseline becomes the measured value
+  // If keep, baseline becomes the effective (decision-driving) value — for a
+  // qualitative metric that's the score, so the NEXT evaluation on this
+  // metric (which will also pass a placeholder measuredValue + a real
+  // --score) compares score against score, not score against a stale
+  // placeholder.
   if (decision === 'keep') {
-    experiment.baseline_value = measuredValue;
+    experiment.baseline_value = effectiveValue;
   }
 
   saveExperiment(agentDir, experiment);
 
-  // Append to results.tsv
+  // Append to results.tsv. measured_value always mirrors result_value (raw,
+  // never the score) — score gets its own column — so the tsv can't drift
+  // from the JSON source of truth the way it used to when both were derived
+  // from the same silently-reassigned local.
   const expDir = join(agentDir, 'experiments');
   ensureDir(expDir);
   const tsvPath = join(expDir, 'results.tsv');
   if (!existsSync(tsvPath)) {
     appendFileSync(
       tsvPath,
-      'experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\n',
+      'experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\tscore\n',
       'utf-8',
     );
   }
+  // score is APPENDED last, not inserted mid-row: the header is only ever
+  // written for a brand-new file (guarded above), so a pre-existing
+  // results.tsv keeps its original 8-column header forever. A mid-row
+  // insert would silently shift baseline/decision/hypothesis/timestamp one
+  // position out of alignment with that old header on every future row —
+  // a trailing column is backward-compatible for any positional reader,
+  // an inserted one is not (walter, cortextos#90 review).
   const tsvLine = [
     experiment.id,
     experiment.agent,
     experiment.metric,
     String(measuredValue),
-    String(decision === 'keep' ? measuredValue : baseline),
+    String(decision === 'keep' ? effectiveValue : baseline),
     decision,
     experiment.hypothesis,
     experiment.completed_at,
+    experiment.score === null ? '' : String(experiment.score),
   ].join('\t');
   appendFileSync(tsvPath, tsvLine + '\n', 'utf-8');
 
@@ -368,11 +387,15 @@ export function evaluateExperiment(
   if (!existsSync(learningsPath)) {
     appendFileSync(learningsPath, '# Experiment Learnings\n\n', 'utf-8');
   }
+  const resultLine =
+    experiment.score !== null
+      ? `- **Result:** score ${experiment.score} (measured_value: ${measuredValue}, baseline: ${decision === 'keep' ? effectiveValue : baseline})`
+      : `- **Result:** ${measuredValue} (baseline: ${decision === 'keep' ? effectiveValue : baseline})`;
   const learningEntry = [
     `## ${experiment.id} (${decision})`,
     `- **Metric:** ${experiment.metric}`,
     `- **Hypothesis:** ${experiment.hypothesis}`,
-    `- **Result:** ${measuredValue} (baseline: ${decision === 'keep' ? measuredValue : baseline})`,
+    resultLine,
     experiment.learning ? `- **Learning:** ${experiment.learning}` : '',
     '',
   ]
