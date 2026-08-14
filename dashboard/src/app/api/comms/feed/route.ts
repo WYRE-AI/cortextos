@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import fs from 'fs';
 import path from 'path';
+import { readMessagesNewestFirst } from '@/lib/comms-messages';
 import { getCTXRoot } from '@/lib/config';
 import { resolveIdentity } from '@/lib/comms-identity';
 
@@ -89,47 +90,21 @@ export async function GET(request: NextRequest) {
     } catch { /* fall through to inbox scan */ }
   }
 
-  // Fallback: scan inbox + processed directories for messages not in the history log.
-  // Processed messages (ACK'd via check-inbox) are moved to ctxRoot/processed/{agent}/
-  // and are invisible without this scan when the history log is empty or absent.
+  // Bus messages from inbox/ + processed/. Read newest-first and stop at
+  // `limit`: the merged result is sorted by timestamp descending and sliced to
+  // `limit` anyway, so the newest `limit` acceptable messages are exactly the
+  // ones that survive. Previously this opened and JSON.parsed every message on
+  // disk (~32k files on a working fleet) to then discard all but 200.
   const seen = new Set<string>(messages.map(m => m.id));
-  const processedBase = path.join(ctxRoot, 'processed');
-
-  for (const [base, subs] of [[inboxBase, ['inflight', '']], [processedBase, ['']]] as const) {
-    if (!fs.existsSync(base)) continue;
-    let agentDirs: string[];
-    try {
-      agentDirs = fs.readdirSync(base, { withFileTypes: true })
-        .filter(d => d.isDirectory())
-        .map(d => d.name);
-    } catch {
-      agentDirs = [];
-    }
-
-    for (const agent of agentDirs) {
-      for (const sub of subs) {
-        const dir = sub ? path.join(base, agent, sub) : path.join(base, agent);
-        if (!fs.existsSync(dir)) continue;
-        let files: string[];
-        try {
-          files = fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
-        } catch { continue; }
-
-        for (const file of files) {
-          try {
-            const raw = fs.readFileSync(path.join(dir, file), 'utf-8');
-            const msg: BusMessage = JSON.parse(raw);
-            if (!msg.id || !msg.from || !msg.to || !msg.timestamp) continue;
-            if (seen.has(msg.id)) continue;
-            if (agentFilter && msg.from !== agentFilter && msg.to !== agentFilter) continue;
-            if (!matchesSearch(msg.text)) continue;
-            if (before && msg.timestamp >= before) continue;
-            seen.add(msg.id);
-            messages.push(msg);
-          } catch { /* skip */ }
-        }
-      }
-    }
+  for (const msg of readMessagesNewestFirst(ctxRoot, limit, (m) => {
+    if (seen.has(m.id)) return false;
+    if (agentFilter && m.from !== agentFilter && m.to !== agentFilter) return false;
+    if (!matchesSearch(m.text)) return false;
+    if (before && m.timestamp >= before) return false;
+    return true;
+  })) {
+    seen.add(msg.id);
+    messages.push(msg);
   }
 
   // Include Telegram messages (inbound from user + outbound from agents)

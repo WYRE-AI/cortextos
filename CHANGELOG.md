@@ -21,11 +21,36 @@ outside `dashboard/` (only a `.test.ts` type import, excluded from builds).
 With the build succeeding, PM2 now runs `npm run start`: the same pages serve
 in 0.03–0.15s and `/api/events` in ~0.00s.
 
-Not fixed here, but surfaced by the same measurements: `/api/comms/feed` still
-costs ~0.65s warm because it reads the full history log line-by-line and then
-falls back to a synchronous scan of every agent inbox/processed directory —
-**32,342 JSON files** `readFileSync` + `JSON.parse`d per request on this box,
-uncached, growing without bound as the fleet works.
+### Fixed — `/api/comms/feed` read every message on disk to return 200 of them
+
+The route treated `logs/message-history.jsonl` as its primary source and the
+inbox/processed directory scan as a fallback — but **nothing in the daemon ever
+writes that file**; only the dashboard reads it. So every request took the
+fallback: a synchronous walk of every agent inbox/inflight/processed directory,
+`readFileSync` + `JSON.parse` per message, then a sort, then a slice to 200.
+On this box that was **32,350 files per request**, uncached, growing without
+bound as the fleet works.
+
+Bus message filenames already carry their timestamp
+(`2-1786740815529-from-boss-3znol.json`), so `src/lib/comms-messages.ts` now
+enumerates directory entries — cheap, no file reads — sorts by that epoch
+descending, and opens files only until `limit` messages pass the caller's
+filter. Because the merged result was always sorted by timestamp descending and
+sliced to `limit` anyway, the newest `limit` acceptable messages are exactly the
+ones that survived before: same result set, a fraction of the I/O.
+
+The equivalence rests on filename epoch ordering agreeing with `msg.timestamp`
+ordering, which was verified against all 32,350 messages on this box: zero
+filenames failed to parse, zero messages had the two values more than 60s
+apart, and the newest-200 by filename epoch was identical to the newest-200 by
+timestamp. Files with an unparseable name sort last rather than being dropped.
+
+`/api/comms/feed?limit=200`: **5.96s cold / 0.65s warm → 0.14s / 0.065s.**
+
+`/api/comms/channel/[pair]` was left alone: it is already scoped to the two
+agents in the pair and uses a different on-disk layout, and measures 0.02s. The
+6.9s previously seen on `/api/comms/channels` was dev-mode compilation, not
+data cost — it is 0.02s on a production build.
 
 ### Fixed — unbounded dashboard lists made Comms, Activity and Approvals unnavigable
 
