@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed — analyst template HEARTBEAT.md was missing the KB re-ingest step entirely
+
+Every other agent template's heartbeat checklist re-ingests MEMORY.md +
+daily memory into the KB each cycle; the analyst template never had the
+step, so analyst agents' semantic memory silently never populated (found
+via the kb_ingest_fleet_coverage experiment: analyst had 441KB of
+MEMORY.md unindexed while faithfully following its checklist). Added as
+Step 9.
+
 ### Added — `bus set-oauth-account <name>` for operator-directed account switching
 
 `rotate-oauth` walks its candidate list and takes the **first account that
