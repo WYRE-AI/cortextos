@@ -131,6 +131,24 @@ If you learned something this cycle that should persist across sessions:
 
 ---
 
+## Step 9: Re-ingest memory to knowledge base
+
+Full reference: `.claude/skills/knowledge-base/SKILL.md`
+
+Keep your memory collection searchable and current:
+
+```bash
+cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u '+%Y-%m-%d').md \
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
+```
+
+This runs on every heartbeat cycle. It ensures past experiences, patterns,
+and analyses are semantically searchable for future tasks (collection
+`agent-{name}`, derived from --scope/--agent). Skip if GEMINI_API_KEY is
+not configured.
+
+---
+
 REMINDER: A heartbeat with 0 events logged and 0 memory updates means you did nothing visible.
 Target: >= 2 events and >= 1 memory update per heartbeat cycle.
 Invisible work is wasted work.
