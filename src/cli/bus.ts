@@ -184,12 +184,20 @@ busCommand
 busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
-  .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
-    const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
-    if (!validStatuses.includes(status as TaskStatus)) {
-      console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
+  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project is given')
+  .option('--assignee <name>', 'Reroute the task to a different agent')
+  .option('--project <name>', 'Change the task\'s project')
+  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string }) => {
+    if (status === undefined && opts.assignee === undefined && opts.project === undefined) {
+      console.error('Nothing to update — pass a status, --assignee, and/or --project');
       process.exit(1);
+    }
+    if (status !== undefined) {
+      const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
+      if (!validStatuses.includes(status as TaskStatus)) {
+        console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
+        process.exit(1);
+      }
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
@@ -206,8 +214,19 @@ busCommand
     }
 
     try {
-      updateTask(paths, id, status as TaskStatus);
-      console.log(`Updated ${id} -> ${status}`);
+      updateTask(paths, id, status as TaskStatus | undefined, { assignee: opts.assignee, project: opts.project });
+      if (status !== undefined && opts.assignee === undefined && opts.project === undefined) {
+        // Preserve the original status-only message verbatim — scripts/
+        // dashboards may already parse it.
+        console.log(`Updated ${id} -> ${status}`);
+      } else {
+        const changes = [
+          status !== undefined ? `status -> ${status}` : null,
+          opts.assignee !== undefined ? `assignee -> ${opts.assignee}` : null,
+          opts.project !== undefined ? `project -> ${opts.project}` : null,
+        ].filter(Boolean);
+        console.log(`Updated ${id}: ${changes.join(', ')}`);
+      }
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);

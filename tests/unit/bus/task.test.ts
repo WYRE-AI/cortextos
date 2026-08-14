@@ -100,6 +100,49 @@ describe('Task Management', () => {
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
       expect(content.status).toBe('in_progress');
     });
+
+    it('reassigns without a status argument, leaving status untouched', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task', { assignee: 'boss' });
+      updateTask(paths, taskId, undefined, { assignee: 'dev' });
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.assigned_to).toBe('dev');
+      expect(content.status).toBe('pending'); // untouched
+    });
+
+    it('changes project without a status argument', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      updateTask(paths, taskId, undefined, { project: 'conduit' });
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.project).toBe('conduit');
+    });
+
+    it('bumps updated_at on a reassign-only call', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task', { assignee: 'boss' });
+      const before = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8')).updated_at;
+
+      updateTask(paths, taskId, undefined, { assignee: 'dev' });
+
+      const after = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8')).updated_at;
+      expect(after >= before).toBe(true);
+    });
+
+    it('throws when neither status, assignee, nor project is given', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      expect(() => updateTask(paths, taskId)).toThrow(
+        'updateTask requires at least one of: status, assignee, project',
+      );
+    });
+
+    it('records the reassign in the task audit log', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task', { assignee: 'boss' });
+      updateTask(paths, taskId, undefined, { assignee: 'dev' });
+
+      const log = readTaskAudit(paths, taskId);
+      const reassignEntry = log[log.length - 1];
+      expect(reassignEntry.note).toContain('assignee: boss -> dev');
+    });
   });
 
   describe('completeTask', () => {

@@ -313,15 +313,25 @@ function findTaskFileByPrefix(
 }
 
 /**
- * Update a task's status. Matches bash update-task.sh behavior, with the
+ * Update a task's status, and/or reroute it to a new assignee/project.
+ * Matches bash update-task.sh behavior for the status-only case, with the
  * cross-org fallback from findTaskFile so an assignee in one org can drive
  * the lifecycle of a task filed by an orchestrator in a sibling org.
+ *
+ * `status` is optional so a caller can reassign/re-project a task without
+ * restating (and risking accidentally churning) its current status —
+ * create-task is the only place assignee/project are otherwise settable.
+ * At least one of status/assignee/project must be given.
  */
 export function updateTask(
   paths: BusPaths,
   taskId: string,
-  status: TaskStatus,
+  status?: TaskStatus,
+  opts: { assignee?: string; project?: string } = {},
 ): void {
+  if (status === undefined && opts.assignee === undefined && opts.project === undefined) {
+    throw new Error('updateTask requires at least one of: status, assignee, project');
+  }
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
     throw new Error(
@@ -329,19 +339,34 @@ export function updateTask(
     );
   }
   let prevStatus: TaskStatus | undefined;
-  let assignee: string | undefined;
+  let auditAgent: string | undefined;
+  const noteParts: string[] = [];
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
-    assignee = task.assigned_to;
-    task.status = status;
+    auditAgent = task.assigned_to;
+    if (status !== undefined) task.status = status;
+    if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
+      noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
+      task.assigned_to = opts.assignee;
+    }
+    if (opts.project !== undefined && opts.project !== task.project) {
+      noteParts.push(`project: '${task.project}' -> '${opts.project}'`);
+      task.project = opts.project;
+    }
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+  appendTaskAudit(paths, taskId, {
+    event: 'update',
+    agent: auditAgent || 'unknown',
+    from: prevStatus,
+    to: status ?? prevStatus,
+    ...(noteParts.length ? { note: noteParts.join(', ') } : {}),
+  });
 }
 
 /**
