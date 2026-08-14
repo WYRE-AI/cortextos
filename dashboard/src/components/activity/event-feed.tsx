@@ -10,6 +10,8 @@ import {
   IconActivity,
 } from '@tabler/icons-react';
 import { formatDistanceToNow } from 'date-fns';
+import { usePagination } from '@/hooks/use-pagination';
+import { PaginationControls } from '@/components/ui/pagination-controls';
 import { AgentAvatar } from '@/components/shared/agent-avatar';
 import { useSSE } from '@/hooks/use-sse';
 import type { Event, SSEEvent, EventType } from '@/lib/types';
@@ -119,6 +121,11 @@ export function EventFeed({ initialEvents, filters }: EventFeedProps) {
     return true;
   });
 
+  // Live feed: page 0 keeps tracking the newest events as SSE prepends them.
+  // Deeper pages shift as new events arrive — acceptable for a chronological
+  // feed, and still far better than rendering the whole 200-event window.
+  const ep = usePagination(displayEvents, 25);
+
   return (
     <div className="space-y-1">
       {/* Connection indicator */}
@@ -138,7 +145,7 @@ export function EventFeed({ initialEvents, filters }: EventFeedProps) {
           No events match the current filters.
         </p>
       ) : (
-        displayEvents.map((event) => (
+        ep.pageItems.map((event) => (
           <div
             key={event.id}
             className={`flex items-start gap-3 rounded-lg px-3 py-2.5 hover:bg-muted/50 transition-colors ${
@@ -178,6 +185,19 @@ export function EventFeed({ initialEvents, filters }: EventFeedProps) {
           </div>
         ))
       )}
+
+      <PaginationControls
+        page={ep.page}
+        pageCount={ep.pageCount}
+        rangeStart={ep.rangeStart}
+        rangeEnd={ep.rangeEnd}
+        total={ep.total}
+        canPrev={ep.canPrev}
+        canNext={ep.canNext}
+        onPrev={ep.prev}
+        onNext={ep.next}
+        label="events"
+      />
     </div>
   );
 }

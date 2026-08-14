@@ -1,4 +1,6 @@
 import type { NextConfig } from "next";
+import { dirname } from "path";
+import { fileURLToPath } from "url";
 
 // Next.js 15.2+ blocks non-localhost origins from /_next/* dev-internal
 // resources by default. When the dashboard is accessed over Tailscale, a LAN
@@ -17,6 +19,23 @@ const allowedDevOrigins = (process.env.DASHBOARD_ALLOWED_DEV_ORIGINS ?? '')
   .filter(Boolean);
 
 const nextConfig: NextConfig = {
+  // Pin Turbopack's project root to dashboard/.
+  //
+  // src/lib/config.ts falls back to `path.resolve(process.cwd(), '..')` for
+  // CTX_FRAMEWORK_ROOT. Turbopack reads that as a directory asset reference and
+  // walks the whole parent repo at module-graph time, where it hits
+  // knowledge-base/venv/bin/python3.14 -> /opt/homebrew/... — an absolute
+  // symlink out of the project root that it refuses to trace, failing the whole
+  // build with a TurbopackInternalError. A failed `next build` is why this app
+  // was being served by `next dev` in production, which costs a multi-second
+  // on-demand compile on the first hit of every route after each restart.
+  //
+  // Those parent-repo reads are runtime fs access, not bundled imports, so
+  // narrowing the build-time root does not affect them. Nothing in src/ imports
+  // from outside dashboard/ (only a .test.ts type import, excluded from builds).
+  turbopack: {
+    root: dirname(fileURLToPath(import.meta.url)),
+  },
   serverExternalPackages: ['better-sqlite3'],
   ...(allowedDevOrigins.length > 0 && { allowedDevOrigins }),
   async headers() {

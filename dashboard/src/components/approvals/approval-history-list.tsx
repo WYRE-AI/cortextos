@@ -1,5 +1,7 @@
 'use client';
 
+import { usePagination } from '@/hooks/use-pagination';
+import { PaginationControls } from '@/components/ui/pagination-controls';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { CategoryBadge, OrgBadge, TimeAgo } from '@/components/shared';
@@ -29,6 +31,8 @@ export function ApprovalHistoryList({
   onClearFilters,
   onApprovalClick,
 }: ApprovalHistoryListProps) {
+  const hp = usePagination(approvals, 25);
+
   const filterConfigs: FilterConfig[] = [
     {
       key: 'agent',
@@ -62,7 +66,7 @@ export function ApprovalHistoryList({
         </p>
       ) : (
         <div className="grid gap-2">
-          {approvals.map((approval) => (
+          {hp.pageItems.map((approval) => (
             <Card
               key={approval.id}
               className="cursor-pointer p-4 transition-colors hover:bg-muted/50"
@@ -92,6 +96,18 @@ export function ApprovalHistoryList({
               </div>
             </Card>
           ))}
+          <PaginationControls
+            page={hp.page}
+            pageCount={hp.pageCount}
+            rangeStart={hp.rangeStart}
+            rangeEnd={hp.rangeEnd}
+            total={hp.total}
+            canPrev={hp.canPrev}
+            canNext={hp.canNext}
+            onPrev={hp.prev}
+            onNext={hp.next}
+            label="approvals"
+          />
         </div>
       )}
     </div>

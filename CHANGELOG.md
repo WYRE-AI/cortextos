@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+### Fixed — dashboard served by `next dev` in production because `next build` failed
+
+`dashboard/src/lib/config.ts` falls back to `path.resolve(process.cwd(), '..')`
+for `CTX_FRAMEWORK_ROOT`. Turbopack reads that as a directory asset reference
+and walks the entire parent repo at module-graph time, where it reaches
+`knowledge-base/venv/bin/python3.14 -> /opt/homebrew/opt/python@3.14/...` — an
+absolute symlink out of the project root that it refuses to trace — and fails
+the whole build with a `TurbopackInternalError`. Because `next build` could not
+complete, PM2 was running the dashboard with `npm run dev`, so **every route
+paid a multi-second on-demand compile on its first hit after each restart**.
+Measured on this box before the fix: `/knowledge-base` 27.2s, `/api/events`
+6.5s cold, first `/login` compile 60–110s. Pinning `turbopack.root` to
+`dashboard/` in `next.config.ts` stops the parent-repo traversal; those reads
+are runtime `fs` access rather than bundled imports, so narrowing the
+build-time root does not change them, and nothing under `src/` imports from
+outside `dashboard/` (only a `.test.ts` type import, excluded from builds).
+With the build succeeding, PM2 now runs `npm run start`: the same pages serve
+in 0.03–0.15s and `/api/events` in ~0.00s.
+
+Not fixed here, but surfaced by the same measurements: `/api/comms/feed` still
+costs ~0.65s warm because it reads the full history log line-by-line and then
+falls back to a synchronous scan of every agent inbox/processed directory —
+**32,342 JSON files** `readFileSync` + `JSON.parse`d per request on this box,
+uncached, growing without bound as the fleet works.
+
+### Fixed — unbounded dashboard lists made Comms, Activity and Approvals unnavigable
+
+These pages rendered their whole capped result set at once inside an
+`overflow:auto` container with no document-level scrollbar. Comms rendered 200
+message cards as a single 27,690px column — 33 screens. Added
+`usePagination` (`src/hooks/use-pagination.ts`), which slices an
+already-fetched array, and a shared `PaginationControls`
+(`src/components/ui/pagination-controls.tsx`) that hides itself at one page.
+Applied to the comms feed, the activity event feed, the approvals pending and
+"your tasks" lists, and the approval history list. Client-side by design: these
+endpoints already cap what they return, and the three APIs paginate
+inconsistently today (events has `limit`/`offset`, comms has `limit` plus a
+cursor, approvals has neither), so slicing the fetched array avoids reworking
+three API contracts to fix a rendering problem. Tall action cards page at 10,
+compact message/event rows at 25. Comms 33 → 4 screens, Activity 8 → 2,
+Approvals 6 → 2. The activity feed is live over SSE: page 0 keeps tracking the
+newest events, deeper pages shift as events arrive.
+
+### Fixed — Action Required pluralised by suffixing an 's' to the whole phrase
+
+`{item.label}{item.count !== 1 ? 's' : ''}` rendered "15 task assigned to
+you**s**", since the noun is not the last word in that phrase. `ActionItem`
+gains an explicit `plural` field and the component selects between `label` and
+`plural` on count instead of appending a character.
+
+### Known issue — agents with unfilled IDENTITY.md render raw HTML comments as their name
+
+An agent whose `IDENTITY.md` still holds its onboarding placeholders is
+displayed in the fleet list and on `/agents/<name>` as
+`<!-- Optional emoji identifier --><!-- Agent name (set during onboarding) -->`.
+Observed on this box for `boss`, the orchestrator. `orgs/` is gitignored, so
+filling the file in is per-deployment operator work — but the dashboard should
+arguably fall back to the agent's directory name rather than rendering comment
+markup verbatim. Not fixed here.
+
 ### Added — `disabled` flag on OAuth accounts (supported seat retirement)
 
 A cancelled subscription still AUTHENTICATES: it passes the setup-token
