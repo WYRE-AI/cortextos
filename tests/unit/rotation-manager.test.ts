@@ -204,3 +204,67 @@ describe('RotationManager', () => {
     });
   });
 });
+
+describe('disabled accounts on the daemon rotation path (#93 warden finding)', () => {
+  let ctxRoot: string, frameworkRoot: string;
+  let t: number;
+  let preflight: ReturnType<typeof vi.fn>;
+  let restartAgent: ReturnType<typeof vi.fn>;
+  let sendAlert: ReturnType<typeof vi.fn>;
+  let rm: RotationManager;
+
+  const accountsPath = () => join(ctxRoot, 'state', 'oauth', 'accounts.json');
+  const seedWithDisabled = (disabledNames: string[]) => {
+    const store = JSON.parse(readFileSync(accountsPath(), 'utf-8'));
+    for (const n of disabledNames) store.accounts[n].disabled = true;
+    writeFileSync(accountsPath(), JSON.stringify(store));
+  };
+
+  beforeEach(() => {
+    ctxRoot = mkdtempSync(join(tmpdir(), 'ctx-'));
+    frameworkRoot = mkdtempSync(join(tmpdir(), 'fw-'));
+    seedAccounts(ctxRoot);
+    makeAgentEnvs(frameworkRoot, 'wyre', ['boss', 'dev']);
+    t = T0;
+    preflight = vi.fn().mockResolvedValue('ok');
+    restartAgent = vi.fn().mockResolvedValue(undefined);
+    sendAlert = vi.fn();
+    rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {},
+    });
+  });
+
+  it('a disabled candidate is never preflighted — rotation lands on the enabled one', async () => {
+    // b iterates FIRST (insertion order); disabling it must skip straight to c.
+    seedWithDisabled(['b']);
+    await rm.onLimitEvent('boss', EV);
+    expect(preflight).not.toHaveBeenCalledWith('tok-b');
+    expect(preflight).toHaveBeenCalledWith('tok-c');
+    const store = JSON.parse(readFileSync(accountsPath(), 'utf-8'));
+    expect(store.active).toBe('c');
+  });
+
+  it('all alternatives disabled: no preflight at all, active unchanged', async () => {
+    seedWithDisabled(['b', 'c']);
+    await rm.onLimitEvent('boss', EV);
+    expect(preflight).not.toHaveBeenCalled();
+    const store = JSON.parse(readFileSync(accountsPath(), 'utf-8'));
+    expect(store.active).toBe('a');
+  });
+
+  it('mid-rotation disable race: setActiveAccount rejection skips gracefully to the next candidate', async () => {
+    // b passes preflight, but an operator disables it between the store load
+    // and setActiveAccount's own re-read — the throw must not crash the
+    // rotation; it must fall through to c.
+    preflight.mockImplementation(async (tok: string) => {
+      if (tok === 'tok-b') seedWithDisabled(['b']);
+      return 'ok';
+    });
+    await rm.onLimitEvent('boss', EV);
+    const store = JSON.parse(readFileSync(accountsPath(), 'utf-8'));
+    expect(store.active).toBe('c');
+    expect(preflight).toHaveBeenCalledWith('tok-b');
+    expect(preflight).toHaveBeenCalledWith('tok-c');
+  });
+});
