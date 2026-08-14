@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### Added — `bus set-oauth-account <name>` for operator-directed account switching
+
+`rotate-oauth` walks its candidate list and takes the **first account that
+passes preflight**, which is the right behaviour for automatic
+utilization-driven rotation but the wrong one when a specific account has
+died and the operator has already chosen the replacement. There was no CLI
+path to "switch to *this* account": the candidate order is
+`Object.entries(accounts)` minus the current one, sorted by
+`five_hour_utilization` — and for setup-tokens (`sk-ant-oat01-`) that field
+is permanently `0`, so the sort is an arbitrary tie order rather than a
+ranking. Worse, the setup-token preflight is a one-word inference ping, and
+a cancelled subscription still *authenticates* — it only fails on real
+workloads with `rate_limit_error` — so the ping happily green-lights a dead
+account. Combined, `rotate-oauth --force` off a dead account would land
+wherever insertion order happened to point, not where the operator wanted.
+
+The remaining option was hand-editing `accounts.json`, which skips the
+`rotation_log` entry and leaves every agent `.env` holding the old token.
+`set-oauth-account` closes that gap by composing the two already-tested
+primitives the daemon's own rotation manager uses — `setActiveAccount`
+(flip + log) and `writeTokenToAgents` (surgical `CLAUDE_CODE_OAUTH_TOKEN=`
+line replace, atomic write, `chmod 600`) — so a manual switch is recorded
+and propagated exactly like an automatic one. It deliberately performs **no**
+preflight, matching `setActiveAccount`'s documented contract: the operator
+named the target, and the only signal available for setup-tokens is the ping
+that cannot distinguish a live account from a cancelled one. Supports
+`--agent` (scope the `.env` write), `--reason` (logged to `rotation_log`),
+and `--json`. New coverage in `tests/unit/cli/bus-set-oauth-account.test.ts`
+(6 cases: targets a non-first candidate, propagates while preserving
+surrounding `.env` keys, logs the *outgoing* account's utilization,
+`--agent` scoping, unknown-account rejection leaving both `accounts.json`
+and every `.env` untouched, and `--json` shape).
+
 ### Fixed — evaluate-experiment's --score silently overwrote result_value/baseline_value
 
 `evaluateExperiment` (`src/bus/experiment.ts`) reassigned its `measuredValue`

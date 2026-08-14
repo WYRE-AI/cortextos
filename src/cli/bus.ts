@@ -19,7 +19,7 @@ import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-stat
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron, computeReferenceMs } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
-import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, setActiveAccount, writeTokenToAgents, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { mintInstallationToken, shouldRefuseInteractivePrint, redactForJson } from '../bus/github-app.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
@@ -2703,6 +2703,51 @@ busCommand
         console.log(`Reason: ${result.reason}`);
       } else {
         console.log(`No rotation needed: ${result.reason}`);
+      }
+    } catch (err) {
+      console.error(`Error: ${err}`);
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('set-oauth-account <name>')
+  .description('Switch to a SPECIFIC OAuth account and propagate its token to agent .env files. Unlike rotate-oauth (which picks the first candidate that passes preflight), this goes exactly where you tell it — use it when an account is known-dead and you have chosen the replacement yourself.')
+  .option('--agent <name>', 'Only update this agent\'s .env (default: all agents in org)')
+  .option('--reason <text>', 'Reason for the switch (logged to rotation_log)')
+  .option('--json', 'Output as JSON')
+  .action(async (name: string, opts: { agent?: string; reason?: string; json?: boolean }) => {
+    const env = resolveEnv();
+    if (!env.frameworkRoot) {
+      console.error('CTX_FRAMEWORK_ROOT is required for set-oauth-account');
+      process.exit(1);
+    }
+    try {
+      const store = loadAccounts(env.ctxRoot);
+      if (!store) throw new Error('No accounts.json found');
+      const from = store.active;
+
+      // No preflight by design: the operator has named the target explicitly,
+      // and the only signal available for setup-tokens is a one-word inference
+      // ping that passes even on accounts with no usable capacity.
+      setActiveAccount(env.ctxRoot, name, {
+        reason: opts.reason || `manual switch to ${name}`,
+        from,
+      });
+
+      // Re-read rather than reuse `store`: the daemon's rotation manager may
+      // have refreshed this account's token between our load and the flip, and
+      // propagating a stale token to every agent .env fails silently. Mirrors
+      // rotateOAuth's `finalStore` read for the same reason.
+      const token = loadAccounts(env.ctxRoot)!.accounts[name].access_token;
+      writeTokenToAgents(env.frameworkRoot, env.org, token, opts.agent);
+
+      const result = { switched: true, from, to: name, agent: opts.agent ?? 'all' };
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`Active OAuth account: ${from} → ${name}`);
+        console.log(`Token written to: ${opts.agent ?? `all agents in org "${env.org}"`}`);
       }
     } catch (err) {
       console.error(`Error: ${err}`);
