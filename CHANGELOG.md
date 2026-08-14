@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added — `disabled` flag on OAuth accounts (supported seat retirement)
+
+A cancelled subscription still AUTHENTICATES: it passes the setup-token
+liveness preflight (a 5-token ping sails through) and only fails on real
+workloads — so `rotate-oauth` could silently move the whole fleet onto a
+dead seat, and retiring one meant hand-editing `accounts.json` (which the
+candidate builder ignored anyway). Accounts now support `disabled: true`:
+
+- **rotation candidate filter** excludes disabled accounts BEFORE preflight
+  (the preflight cannot detect a cancelled seat, so filtering after it
+  would be no protection at all);
+- **`set-oauth-account`** refuses to activate a disabled account;
+- **`list-oauth-accounts`** renders the `(disabled)` marker;
+- **daemon rotation path** (`rotation-manager.ts` — the unattended
+  limit-banner path, a SECOND independent candidate builder found in
+  warden's review): same pre-preflight filter, plus a graceful
+  skip-to-next-candidate if an account is disabled mid-rotation instead
+  of an uncaught throw crashing the attempt.
+
 ### Fixed — analyst template HEARTBEAT.md was missing the KB re-ingest step entirely
 
 Every other agent template's heartbeat checklist re-ingests MEMORY.md +

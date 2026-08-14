@@ -189,6 +189,11 @@ export class RotationManager {
 
     const candidates = Object.keys(store.accounts).filter(name => {
       if (name === store.active) return false;
+      // Operator-retired seats are never candidates: a cancelled subscription
+      // still passes the inference preflight (it authenticates; it just has
+      // no capacity), so this filter is the only protection on the daemon's
+      // unattended rotation path — same rule as the bus rotate-oauth builder.
+      if (store.accounts[name].disabled) return false;
       const resetAt = state.exhausted[name];
       return !(resetAt && resetAt > t);
     });
@@ -201,7 +206,16 @@ export class RotationManager {
       attempted += 1;
       if (result === 'ok') {
         state.consecutiveInfraTicks = 0;
-        setActiveAccount(this.deps.ctxRoot, name, { reason, from: store.active });
+        try {
+          setActiveAccount(this.deps.ctxRoot, name, { reason, from: store.active });
+        } catch (err) {
+          // Defense-in-depth: an operator can disable an account between our
+          // store load and this call — setActiveAccount re-reads the file and
+          // refuses disabled targets. Skip to the next candidate instead of
+          // letting the throw crash the whole unattended rotation attempt.
+          this.deps.log(`[rotation] candidate ${name} rejected by setActiveAccount (${err}) — trying next`);
+          continue;
+        }
         writeTokenToAgents(this.deps.frameworkRoot, this.deps.org, store.accounts[name].access_token);
         // Reload: preflights are slow (real inference); more agents may have blocked meanwhile.
         state = loadState(this.deps.ctxRoot);

@@ -2800,10 +2800,11 @@ busCommand
     }
     for (const [name, acct] of Object.entries(store.accounts)) {
       const active = name === store.active ? ' (active)' : '';
+      const disabled = acct.disabled ? ' (disabled)' : '';
       const expiry = new Date(acct.expires_at).toISOString();
       const warn5h = acct.five_hour_utilization >= ALERT_5H ? ' ⚠️' : '';
       const warn7d = acct.seven_day_utilization >= ALERT_7D ? ' ⚠️' : '';
-      console.log(`${name}${active}`);
+      console.log(`${name}${active}${disabled}`);
       console.log(`  5h: ${pct(acct.five_hour_utilization)}${warn5h}  7d: ${pct(acct.seven_day_utilization)}${warn7d}  expires: ${expiry}`);
     }
   });

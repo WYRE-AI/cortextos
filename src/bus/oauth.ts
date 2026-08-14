@@ -49,6 +49,15 @@ export interface OAuthAccount {
   last_refreshed: string; // ISO 8601
   five_hour_utilization: number; // 0.0–1.0
   seven_day_utilization: number; // 0.0–1.0
+  /**
+   * Operator-set retirement flag. A disabled account is never selected as a
+   * rotation candidate and cannot be made active via set-oauth-account —
+   * needed because a CANCELLED subscription still passes the setup-token
+   * liveness preflight (it authenticates fine, it just has no capacity), so
+   * without this flag rotate-oauth can silently move the fleet onto a dead
+   * seat. Retiring a seat is a supported operation, not a hand-edit.
+   */
+  disabled?: boolean;
 }
 
 export interface AccountsStore {
@@ -559,7 +568,7 @@ export async function rotateOAuth(
   // and uses the first one that passes preflight, falling through to the
   // next on failure rather than giving up after a single arbitrary pick.
   const candidates = Object.entries(store.accounts)
-    .filter(([name]) => name !== currentName)
+    .filter(([name, acct]) => name !== currentName && !acct.disabled)
     .sort(([, a], [, b]) => a.five_hour_utilization - b.five_hour_utilization);
 
   if (candidates.length === 0) {
@@ -732,6 +741,9 @@ export function setActiveAccount(
   const store = loadAccounts(ctxRoot);
   if (!store) throw new Error('No accounts.json found');
   if (!store.accounts[name]) throw new Error(`Account "${name}" not found in accounts.json`);
+  if (store.accounts[name].disabled) {
+    throw new Error(`Account "${name}" is disabled (retired) — re-enable it in accounts.json before activating`);
+  }
   const from = store.accounts[logEntry.from];
   store.active = name;
   store.rotation_log = [{
