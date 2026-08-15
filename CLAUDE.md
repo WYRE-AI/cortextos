@@ -221,11 +221,11 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   convention: a WORKTREE.** A worktree is a separate working directory, so **nothing follows a branch
   switch at all** and the hazard cannot arise. `git worktree list` on this repo returns **17**
   (verified independently by `boss`, then re-run by `infra` rather than relayed — analyst 2, infra 1,
-  dev 2, murph 1, `.worktrees/` 5, `.claude/worktrees/` 3, plus external ones). **Only
-  `/Users/asachs/cortextos` itself — the primary tree, on `main` — is shared, and that is exactly
+  dev 2, murph 1, `.worktrees/` 5, `.claude/worktrees/` 3, plus external ones). **Only the primary
+  checkout itself — the tree the fleet shares, sitting on `main` — is shared, and that is exactly
   where every incident above happened.**
   **⚠ THE PATH LIST READS AGAINST ITSELF — 8 of the 17 sit UNDER the primary repo path**
-  (`/Users/asachs/cortextos/.worktrees/…` ×5, `.claude/worktrees/…` ×3), so skimming the paths
+  (`<primary>/.worktrees/…` ×5, `<primary>/.claude/worktrees/…` ×3), so skimming the paths
   suggests they are *inside* the shared tree and therefore exposed. **They are not.** Verified
   directly: primary tree is `main` @ `269bef42`, while `.worktrees/log-surface-docs` is on
   `fix/log-surface-docs` @ `bc36053f` — **different branch, different HEAD, same parent directory.**
