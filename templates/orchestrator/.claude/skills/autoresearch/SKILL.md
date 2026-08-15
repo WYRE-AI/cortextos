@@ -59,9 +59,24 @@ cortextos bus create-experiment "<metric_name>" "<your hypothesis>" --surface <p
 ```
 If `approval_required` is true in `experiments/config.json`, you must manually create an approval before proceeding:
 ```bash
-APPR_ID=$(cortextos bus create-approval "Run experiment: <hypothesis>" experiments "Cycle: <cycle_name>, Metric: <metric_name>, Surface: <surface>")
-cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID "Approval needed to run experiment for <metric_name> — check dashboard"
-# Block until approved, then continue to Step 5
+# 'other' is required: create-approval accepts ONLY external-comms, financial,
+# deployment, data-deletion, other. 'experiments' is rejected with exit 1.
+APPR_ID=$(cortextos bus create-approval "Run experiment: <hypothesis>" other "Cycle: <cycle_name>, Metric: <metric_name>, Surface: <surface>")
+
+# The command above writes its error to stderr and exits 1, which leaves APPR_ID
+# EMPTY while this script keeps going. Running the command is not the same as an
+# approval existing — check it, or you will proceed believing you asked.
+[ -n "$APPR_ID" ] || { echo "ABORT: approval was NOT created (APPR_ID empty). Do not continue to Step 5." >&2; exit 1; }
+
+# Notify. Bus-only agents have no BOT_TOKEN, so send-telegram fails for them and
+# the approval sits unseen — announce on the bus instead.
+if [ -n "$BOT_TOKEN" ]; then
+  cortextos bus send-telegram "$CTX_TELEGRAM_CHAT_ID" "Approval needed to run experiment for <metric_name> — check dashboard"
+else
+  cortextos bus send-message "$CTX_ORCHESTRATOR_AGENT" high "Approval needed to run experiment for <metric_name> — approval $APPR_ID, check dashboard"
+fi
+
+# Then WAIT for the approval decision before continuing to Step 5.
 ```
 
 ### Step 5: Make Changes and Run
