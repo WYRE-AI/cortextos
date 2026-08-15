@@ -26,7 +26,15 @@ wait for something the CLI could not show them.
   it previously hard-errored `unknown option`. Unknown values now fail loudly
   rather than returning `[]`, since a silent empty result is indistinguishable
   from a real absence.
-- `list-approvals` reads both buckets and reports each entry's status.
+- `bus list-approvals --all` — every bucket. **A bare `list-approvals` still
+  returns pending only**, unchanged from before. Its callers predate the
+  command being able to read `resolved/` and mean "what still needs a
+  decision" — the orchestrator heartbeat and its approval-sweep cron among
+  them, and that cron reminds the user about anything pending for over an
+  hour. Widening the bare invocation would turn every long-settled approval
+  into a fresh reminder, so reaching resolved records is opt-in.
+- `list-approvals` reports each entry's status, and its resolution note when
+  it has one.
 
 `listPendingApprovals` is unchanged in behaviour for existing callers.
 
