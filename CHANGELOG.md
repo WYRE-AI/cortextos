@@ -76,6 +76,36 @@ wait for something the CLI could not show them.
 
 `listPendingApprovals` is unchanged in behaviour for existing callers.
 
+### Fixed — KB collection model in `community/agents/` and the two memory skills
+
+PR #83 corrected the knowledge-base doctrine in `templates/*/AGENTS.md` — the
+documented three-collection model (`memory-{agent}` / `private-{agent}` /
+`shared-{org}`) never existed, and the `--collection` flag it told agents to
+pass is not accepted by `kb-ingest` or `kb-query`. That fix did not reach the
+`community/agents/` catalog or the memory skill templates, so four community
+agent definitions and both `skills/memory/SKILL.md` copies still taught the
+model and the flag.
+
+Live store: `kb-collections --org wyre` returns `agent-{name}` and
+`shared-{org}` only — zero collections match `^memory-` or `^private-`. The
+flag is rejected at argument parsing (`error: unknown option '--collection'`),
+so the documented invocation does not degrade, it does not run. Agents hit the
+error and used the working form instead, which is why no memory was actually
+lost — the cost was every agent privately routing around a broken documented
+line rather than fixing it.
+
+The affected sections are now byte-identical to the merged
+`templates/agent/AGENTS.md`:
+`community/agents/{agent,analyst,orchestrator,research-agent}/AGENTS.md` plus
+the ingest invocation in `templates/agent/.claude/skills/memory/SKILL.md` and
+`templates/agent-codex/plugins/cortextos-agent-skills/skills/memory/SKILL.md`.
+`research-agent` had already had its ingest line corrected but still carried
+the three-collection table.
+
+Deployed agent `AGENTS.md` files are a separate surface and are unchanged here:
+20 of 20 still carry the old model, with zero on the corrected text. That is a
+deployment gap tracked separately, not a template defect.
+
 ### Fixed — the documented agent log surface did not match reality, in both directions
 
 Three of the four documented log paths **did not exist**, and seven real
