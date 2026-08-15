@@ -63,7 +63,7 @@
  * the file."
  */
 import { readFileSync, existsSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { join, relative } from 'path';
 
 type CheckKind = 'equality' | 'property' | 'existence-only' | 'skipped';
 
@@ -91,6 +91,91 @@ const CATEGORIES: FileCategory[] = [
   { file: 'goals.json', kind: 'skipped', reason: 'fully agent-owned — regenerates GOALS.md' },
   { file: 'config.json', kind: 'skipped', reason: 'fully agent-owned — per-agent runtime config; has its own {{}} placeholder + migration tooling' },
 ];
+
+// Top-level templates/agent/ entries this tool deliberately does not treat
+// as individual doc files — either because they're directories handled
+// separately (skills/.claude, discovered dynamically below) or because
+// they're agent-owned/non-doc by construction. Named explicitly so the
+// runtime enumeration below can tell "known and intentionally skipped"
+// apart from "genuinely never considered."
+const KNOWN_NON_CATEGORY_TOPLEVEL: Record<string, string> = {
+  '.gitignore': 'not a doc file',
+  'skills': 'top-level skills/ (drafts, archive) is agent-authored content, not framework docs',
+  'experiments': 'fully agent-owned — experiment records',
+  'memory': 'fully agent-owned — daily memory files',
+  '.claude': 'contains settings.json (not yet categorized — see UNEXAMINED below) and skills/ (discovered dynamically as equality entries)',
+};
+
+// infra found (2026-08-15, before #105 merged) that this tool's original
+// hardcoded 14-entry CATEGORIES list silently never examined 5 of
+// templates/agent/'s 19 top-level entries, including .claude/, which holds
+// 24 files — every .claude/skills/*/SKILL.md among them. Five open
+// cortextos PRs (#99-#102, #104) touch that tree; two of them (#102, #104)
+// ALSO touch tracked AGENTS.md/CLAUDE.md, so the tool would have shown
+// real drift on the tracked files while identical-shaped drift in
+// .claude/skills/ sat invisible beside it — a partial hit that reads as
+// "we found the drift" instead of "we found the part we look at," the
+// exact standing-red shape this tool exists to avoid, one directory down
+// from where it was looking. Fix: discover .claude/skills/*/SKILL.md
+// dynamically (so a future new skill can't repeat the omission), AND
+// enumerate the full template tree at runtime to report anything still
+// not covered as UNEXAMINED by name — dual enumeration, the same
+// discipline infra shipped as cortextos#103, pointed back at this tool's
+// own scope.
+function discoverSkillCategories(templateDir: string): FileCategory[] {
+  const skillsDir = join(templateDir, '.claude', 'skills');
+  if (!existsSync(skillsDir)) return [];
+  const skillNames = readdirSync(skillsDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name);
+  const categories: FileCategory[] = [];
+  for (const skill of skillNames) {
+    const skillFile = join('.claude', 'skills', skill, 'SKILL.md');
+    if (existsSync(join(templateDir, skillFile))) {
+      categories.push({
+        file: skillFile,
+        kind: 'equality',
+        reason: 'framework skill file, expected near-identical',
+      });
+    }
+  }
+  return categories;
+}
+
+interface UnexaminedEntry {
+  path: string;
+  note: string;
+}
+
+// Walk the full template tree and report every top-level entry not
+// accounted for by CATEGORIES, the dynamically-discovered skill files, or
+// KNOWN_NON_CATEGORY_TOPLEVEL — so a future template file added by anyone
+// can't become invisible by default the way .claude/ did.
+function findUnexaminedEntries(templateDir: string, categories: FileCategory[]): UnexaminedEntry[] {
+  const categorizedTop = new Set(categories.map((c) => c.file.split('/')[0]));
+  const topLevel = readdirSync(templateDir, { withFileTypes: true });
+  const unexamined: UnexaminedEntry[] = [];
+  for (const entry of topLevel) {
+    // .claude/ is checked BEFORE the categorizedTop shortcut deliberately:
+    // its skill files DO appear in categorizedTop (as '.claude/skills/...'
+    // entries, split(\/)[0] === '.claude'), which would otherwise mask
+    // settings.json — the one real file under .claude/ this tool still
+    // doesn't examine. This was the exact bug the first version of this
+    // fix shipped with: settings.json silently vanished from UNEXAMINED
+    // because .claude "looked" fully categorized once skills/ was covered.
+    if (entry.name === '.claude') {
+      unexamined.push({
+        path: '.claude/settings.json',
+        note: 'not yet categorized — contains real framework-relevant config (e.g. defaultMode) alongside plausible per-agent permission customization; needs a deliberate category, not a guess',
+      });
+      continue;
+    }
+    if (categorizedTop.has(entry.name)) continue;
+    if (entry.name in KNOWN_NON_CATEGORY_TOPLEVEL) continue;
+    unexamined.push({ path: entry.name, note: 'new template entry, never considered by this tool — categorize it before trusting a clean report' });
+  }
+  return unexamined;
+}
 
 interface EqualityDiff {
   onlyInTemplate: string[];
@@ -121,6 +206,7 @@ function propertyDiff(templateText: string, deployedText: string): string[] {
 interface AgentReport {
   agent: string;
   org: string;
+  unexamined: UnexaminedEntry[];
   results: Array<{
     file: string;
     kind: CheckKind;
@@ -134,8 +220,10 @@ function runForAgent(frameworkRoot: string, org: string, agent: string): AgentRe
   const templateDir = join(frameworkRoot, 'templates', 'agent');
   const deployedDir = join(frameworkRoot, 'orgs', org, 'agents', agent);
   const results: AgentReport['results'] = [];
+  const allCategories = [...CATEGORIES, ...discoverSkillCategories(templateDir)];
+  const unexamined = findUnexaminedEntries(templateDir, allCategories);
 
-  for (const cat of CATEGORIES) {
+  for (const cat of allCategories) {
     const templatePath = join(templateDir, cat.file);
     const deployedPath = join(deployedDir, cat.file);
     const templateExists = existsSync(templatePath);
@@ -185,7 +273,7 @@ function runForAgent(frameworkRoot: string, org: string, agent: string): AgentRe
     }
   }
 
-  return { agent, org, results };
+  return { agent, org, unexamined, results };
 }
 
 function printReport(report: AgentReport): void {
@@ -202,8 +290,18 @@ function printReport(report: AgentReport): void {
   console.log(
     'READ EQUALITY vs PROPERTY DIFFERENTLY: an EQUALITY drift means the file differs, in either direction — a human decides which side is right. ' +
       'A PROPERTY drift means specific template content is MISSING from the deployed file — it is NEVER triggered by an agent\'s own legitimate ' +
-      'additions (those are expected and healthy, and this tool does not flag them). A high PROPERTY drift count is a real gap, not noise.\n',
+      'additions (those are expected and healthy, and this tool does not flag them). A high PROPERTY drift count is a real gap, not noise.',
   );
+  if (report.unexamined.length > 0) {
+    console.log(
+      `\nUNEXAMINED (${report.unexamined.length} template entr${report.unexamined.length === 1 ? 'y' : 'ies'} not covered by any category — ` +
+        'a clean report below does NOT mean these are clean, it means they were never checked):',
+    );
+    for (const u of report.unexamined) console.log(`    - ${u.path} — ${u.note}`);
+  } else {
+    console.log('\nUNEXAMINED: none — every top-level template entry is accounted for by a category.');
+  }
+  console.log('');
 
   for (const r of report.results) {
     const kindLabel = r.kind.toUpperCase();
