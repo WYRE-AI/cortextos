@@ -162,6 +162,30 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   bug one level up: `T` was measured on `last_fire_attempted_at`, an axis the failure cannot touch, so it
   stayed fresh while everything real froze — **the signal was measured on the wrong side of the event.**
 
+- **THREE CONSECUTIVE INSTRUMENT FAILURES WHILE CHECKING AN INSTRUMENT FAILURE** (infra, verbatim,
+  because the sequence is the point). Task: does `list-approvals --status` exist? TOOLS.md documented
+  it; it does not.
+  1. `... 2>&1 | head -1` — the error was not on line 1, so it reported **ok**.
+  2. A shell loop passing the whole argument string as ONE option — commander reported
+     `unknown option '--status pending --agent infra'`, so **all three** documented `--status` flags
+     came back broken.
+  3. Direct invocation **with a known-good control** (`list-tasks --status`, which does work) — the
+     true answer: **only `list-approvals` lacks it**; `list-tasks` and `list-experiments` have it.
+
+  **Without the control I would have shipped "three CLI flags are wrong" when ONE was** — a
+  documentation fix that broke two working flags, in a fleet-read file. **A control separates a real
+  defect from a broken probe, and nothing else does.** Note this happened while running a check
+  prompted *by* the instrument lesson, minutes after writing that lesson into this very file:
+  **A LESSON DOES NOT INSTALL FROM BEING WRITTEN DOWN. IT INSTALLS FROM A CONTROL.**
+
+- **APPLY THE PERISHABILITY RULE FORWARD, NOT AFTER THE BREAK.** Correcting TOOLS.md, infra noticed
+  the correction *itself* would be **falsified by a pending fix** — `maintainer`'s CLI PR ADDS a real
+  `--status`, so a standing fact reading "it does not exist" goes false the moment that merges, and
+  would read authoritative right up until it silently was not. Written instead as a **stamped
+  observation + a re-derive command + an exit-code test**. **Use that shape for any doc claim about
+  tooling behaviour that a known open PR will change.** Third stale-but-authoritative record caught
+  within the hour — and the only one caught *before* it was written rather than after.
+
 - **A WRONG LINE NUMBER DOES NOT 404 — IT RESOLVES.** (infra's catch, on this very entry.) Two of the
   source refs written above were wrong when first committed: `:181` for the beat comparison (it is the
   `S === null` **fail-safe return**; the comparison is `:183`) and `:150` for the `T` read (that is the
