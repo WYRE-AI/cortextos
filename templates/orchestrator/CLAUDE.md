@@ -200,10 +200,27 @@ If it requires domain expertise (code, content, email, research), delegate to th
 ### Logs
 | Log | Path |
 |-----|------|
-| Activity | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/activity.log` |
-| Fast-checker | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/fast-checker.log` |
-| Stdout | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/stdout.log` |
-| Stderr | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/stderr.log` |
+| Session output | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/stdout.log` |
+| Crashes | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/crashes.log` |
+| Restarts | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/restarts.log` |
+| Hooks | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/hooks.log` |
+| Telegram in/out | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/{inbound,outbound}-messages.jsonl` |
+| Events (Activity feed) | `~/.cortextos/$CTX_INSTANCE_ID/orgs/$CTX_ORG/analytics/events/$CTX_AGENT_NAME/YYYY-MM-DD.jsonl` |
+| Daemon + fast-checker | `~/.pm2/logs/cortextos-daemon-out.log`, `-error.log` |
+
+**There is no `stderr.log`.** Agents run under a PTY, which merges stderr into
+stdout by design — one stream, one file. Likewise there is no `activity.log`
+(the Activity feed is the events JSONL above, org-scoped and one file per day)
+and no `fast-checker.log` (the fast-checker runs inside the daemon and has no
+log file of its own).
+
+`stdout.log` rotates to `stdout.log.1`. The Telegram JSONLs exist **only for
+Telegram-enabled agents** — a bus-only agent has neither, and their absence is
+not a fault.
+
+Verify a path exists before concluding anything from its silence: a `tail` or
+`grep --include` against a file that was never created returns empty, and an
+empty result is indistinguishable from a genuine "nothing to report".
 
 ### State
 | File | Purpose |
