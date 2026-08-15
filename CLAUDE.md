@@ -224,6 +224,16 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   dev 2, murph 1, `.worktrees/` 5, `.claude/worktrees/` 3, plus external ones). **Only
   `/Users/asachs/cortextos` itself — the primary tree, on `main` — is shared, and that is exactly
   where every incident above happened.**
+  **⚠ THE PATH LIST READS AGAINST ITSELF — 8 of the 17 sit UNDER the primary repo path**
+  (`/Users/asachs/cortextos/.worktrees/…` ×5, `.claude/worktrees/…` ×3), so skimming the paths
+  suggests they are *inside* the shared tree and therefore exposed. **They are not.** Verified
+  directly: primary tree is `main` @ `269bef42`, while `.worktrees/log-surface-docs` is on
+  `fix/log-surface-docs` @ `bc36053f` — **different branch, different HEAD, same parent directory.**
+  Its `.git` is a `gitdir:` pointer file rather than a directory, and `.gitignore:60` excludes
+  `.worktrees/` outright, so the primary tree cannot even see it, let alone drag it. **Nested by
+  path, independent by construction.** (`maintainer`'s catch — the one place the evidence for this
+  entry reads as the opposite of the truth.)
+
   **Commit-early is the backstop; the worktree is the fix.**
 
   Sharpest detail, and it is about behaviour rather than tooling: `infra` **did** spin up a worktree
