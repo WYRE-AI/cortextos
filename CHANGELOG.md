@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Fixed — node-pty's `spawn-helper` lost its executable bit on install, crashing every agent spawn
+
+A plain `npm install`/`npm ci` of `node-pty@1.1.0` leaves
+`prebuilds/*/spawn-helper` as `-rw-------` (verified on a clean, isolated
+install — not just inferred from the missing script). The daemon spawns every
+agent through a PTY, and node-pty `posix_spawn`s that binary directly, so the
+OS refuses to run it: every agent loops `Failed to start: Error: posix_spawnp
+failed.` while the daemon itself stays `online`, reading as "everything is
+crashing."
+
+`cortextos install`/`cortextos doctor` already carry a fix for this
+(`fixSpawnHelper` in `src/cli/install.ts`), but neither runs automatically on
+a plain `npm install`/`npm ci` or on `cortextos update --apply` (which only
+`git merge`s, never reinstalls) — so a routine dependency reinstall on an
+already-running box is not covered by either safety net.
+
+Adds a `postinstall` script re-`chmod +x`-ing the prebuild binaries
+unconditionally, so the fix applies on every install regardless of which path
+triggered it. Verified end-to-end in this repo: with the script in place,
+both `npm install` and `npm ci` restore the executable bit; without it,
+neither does.
+
+Split out of #34, which also included an already-landed `complete-task`/
+`update-task` crash guard — not re-applied here, it's already on `main`.
+
 ### Fixed — `check-deploy-drift` gave the same remedy for two opposite conditions
 
 The report collapsed both drifts into `status: "drift"`. That is deliberate — a cron
