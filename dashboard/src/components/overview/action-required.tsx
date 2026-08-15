@@ -18,7 +18,14 @@ interface ActionRequiredProps {
 
 interface ActionItem {
   icon: React.ReactNode;
+  /** Singular phrase, used when count === 1. */
   label: string;
+  /**
+   * Plural phrase, used for every other count. Spelled out rather than
+   * derived by suffixing an 's': the noun is not always the last word
+   * ("task assigned to you" pluralised to "task assigned to yous").
+   */
+  plural: string;
   count: number;
   href: string;
 }
@@ -35,24 +42,28 @@ export function ActionRequired({
     {
       icon: <IconUser size={18} className="text-primary" />,
       label: 'task assigned to you',
+      plural: 'tasks assigned to you',
       count: humanTasks,
       href: '/tasks?agent=human',
     },
     {
       icon: <IconShield size={18} className="text-primary" />,
       label: 'pending approval',
+      plural: 'pending approvals',
       count: pendingApprovals,
       href: '/approvals',
     },
     {
       icon: <IconAlertTriangle size={18} className="text-warning" />,
       label: 'blocked task',
+      plural: 'blocked tasks',
       count: blockedTasks,
       href: '/tasks?status=blocked',
     },
     {
       icon: <IconHeartOff size={18} className="text-destructive" />,
       label: 'stale agent',
+      plural: 'stale agents',
       count: staleAgents,
       href: '/agents',
     },
@@ -85,8 +96,7 @@ export function ActionRequired({
                     {item.icon}
                     <span className="text-sm">
                       <span className="font-semibold">{item.count}</span>{' '}
-                      {item.label}
-                      {item.count !== 1 ? 's' : ''}
+                      {item.count === 1 ? item.label : item.plural}
                     </span>
                   </div>
                   <IconChevronRight
