@@ -127,6 +127,36 @@ If you learned something this cycle that should persist across sessions:
 - System behaviors noted
 - Append to MEMORY.md
 
+## Promotion check — is MEMORY.md behind today's daily memory?
+
+**Run this BEFORE the KB re-ingest step below.** Nothing promotes between memory layers
+automatically, and "MEMORY.md is current" and "MEMORY.md has not been touched in four hours"
+otherwise produce the same output: none.
+
+```bash
+TODAY="memory/$(date -u +%Y-%m-%d).md"
+if [ ! -f MEMORY.md ] || [ ! -f "$TODAY" ]; then
+  MISS=""; [ -f MEMORY.md ] || MISS="MEMORY.md"; [ -f "$TODAY" ] || MISS="$MISS $TODAY"
+  echo "PROMOTION CHECK: NOT CHECKED — missing:$MISS (this is NOT a pass)"
+else
+  M=$(stat -f %m MEMORY.md 2>/dev/null || stat -c %Y MEMORY.md)
+  D=$(stat -f %m "$TODAY" 2>/dev/null || stat -c %Y "$TODAY")
+  GAP=$(( D - M ))
+  if [ "$GAP" -gt 14400 ]; then
+    echo "PROMOTION CHECK: UNPROMOTED — daily memory is $((GAP/3600))h$(( (GAP%3600)/60 ))m newer than MEMORY.md (threshold 4h). Promote durable lessons to MEMORY.md NOW, before finishing this heartbeat."
+  else
+    echo "PROMOTION CHECK: OK — gap $((GAP/60))m (threshold 4h)"
+  fi
+fi
+```
+
+**Three distinct outcomes on purpose.** `NOT CHECKED` is not a pass — a missing file must never read
+as healthy. **Act on `UNPROMOTED` in this cycle**; deferring it is how the gap grew in the first place.
+
+**Threshold is one heartbeat interval (4h), matching the cron.** Bounded-latency detector, not
+immunity: an agent that stops promoting is caught at the **next** heartbeat, so worst-case
+onset-to-flag is ~2 intervals. A gap under 4h is by design invisible to it.
+
 ## Step 10: Re-ingest memory to knowledge base
 
 Full reference: `plugins/cortextos-agent-skills/skills/knowledge-base/SKILL.md`
