@@ -208,6 +208,15 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   Recovery is `stash → checkout branch → stash pop`. Found only because a dirty tree was noticed and
   someone bothered to work out **whose** it was.
 
+  **HAZARD AND REMEDY DEMONSTRATED BACK TO BACK ON THE SAME TREE, ~10 MINUTES APART.** Within the
+  hour the checkout moved *again* — onto `infra`'s branch, under `maintainer`, mid-session — and a
+  test file on disk reverted to its pre-fix import. **Nothing was lost, only because the work was by
+  then committed and pushed.** The identical tree movement that would have eaten it an hour earlier
+  was a non-event. **`infra` had the same near-miss from the other side:** branched `CLAUDE.md`
+  specifically to protect a peer's 96 lines, with the tree already dirty, and survived on a
+  ~90-second margin before committing — **the version where the rule-follower loses someone else's
+  work while believing they had just rescued it.**
+
 - **A WRONG LINE NUMBER DOES NOT 404 — IT RESOLVES.** (infra's catch, on this very entry.) Two of the
   source refs written above were wrong when first committed: `:181` for the beat comparison (it is the
   `S === null` **fail-safe return**; the comparison is `:183`) and `:150` for the `T` read (that is the
