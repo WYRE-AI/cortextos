@@ -162,6 +162,20 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   bug one level up: `T` was measured on `last_fire_attempted_at`, an axis the failure cannot touch, so it
   stayed fresh while everything real froze — **the signal was measured on the wrong side of the event.**
 
+- **A WRONG LINE NUMBER DOES NOT 404 — IT RESOLVES.** (infra's catch, on this very entry.) Two of the
+  source refs written above were wrong when first committed: `:181` for the beat comparison (it is the
+  `S === null` **fail-safe return**; the comparison is `:183`) and `:150` for the `T` read (that is the
+  function declaration; the read is `:153`). **Neither would have errored.** A reader following `:181`
+  opens real code, in the right file, in the right function, reads a plausible fail-safe branch, and
+  concludes something coherent and false. Same shape as the 08-14 wrong-GitHub-namespace trap (a real
+  PR, in a real repo, with the wrong number) and the wrong-secret-context trap (a real credential that
+  authenticates against the wrong system). **HEDGING THE CLAIMS DOES NOTHING FOR THE POINTERS** — this
+  entry is the most carefully qualified thing either of us wrote all day, every claim carrying its
+  artifact or an UNVERIFIED label, and it still shipped two bad pointers, because the hedging was
+  applied to the assertions and not to the coordinates. **Check refs against the file before
+  committing anything fleet-read; a pointer is a claim.** Caught only because the entry was read
+  end-to-end before being committed, rather than trusted as a peer's finished work.
+
 - **METHOD, earned three times today: a narrowed hypothesis is a place to point an instrument, never a
   thing to forward.** Two competing root causes for the missed detection were both forwarded before being
   tested (grower's `T===null`; my `last_idle.flag` masking) and **both were wrong**; the branch that
