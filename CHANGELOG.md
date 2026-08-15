@@ -76,6 +76,35 @@ wait for something the CLI could not show them.
 
 `listPendingApprovals` is unchanged in behaviour for existing callers.
 
+### Fixed — autoresearch skill told agents to file approvals with a category the CLI rejects
+
+`.claude/skills/autoresearch/SKILL.md` Step 4 prescribed
+`cortextos bus create-approval "..." experiments "..."`. `experiments` is not a
+valid category — `bus.ts` accepts only `external-comms`, `financial`,
+`deployment`, `data-deletion`, `other`, and rejects anything else with exit 1.
+
+The rejection is loud, but the snippet made it silent at the call site: the
+command is wrapped in `APPR_ID=$(...)`, so the error goes to stderr, `APPR_ID`
+is left **empty**, and the surrounding steps continue as though an approval had
+been filed. An agent following the skill literally would block on, and then
+report, an approval that does not exist. Running the command is not the same as
+an approval existing.
+
+Two further defects in the same three lines:
+
+- The notify step was an unconditional `send-telegram`, which fails outright for
+  bus-only agents (no `BOT_TOKEN`) — so on exactly the agents whose approvals are
+  hardest to see, the approval was filed and then announced to nobody.
+- "Block until approved" was a comment with no check behind it.
+
+Now: correct category, an explicit non-empty assertion on `APPR_ID` that aborts
+rather than continuing, and a notify path that falls back to the bus when there
+is no bot token. Applied to all seven tracked copies (4 templates, 3 community).
+
+**Not fixed here:** the ~20 already-deployed per-agent copies under the
+gitignored `orgs/` tree. `cortextos update` syncs `AGENTS.md` but not
+`.claude/skills/`, so this template fix does not reach running agents on its own.
+
 ### Fixed — KB collection model in `community/agents/` and the two memory skills
 
 PR #83 corrected the knowledge-base doctrine in `templates/*/AGENTS.md` — the
