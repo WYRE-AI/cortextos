@@ -5,7 +5,7 @@ import { join } from 'path';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
-import { resolveMessageBody, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
+import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
@@ -169,18 +169,32 @@ busCommand
   .command('create-task')
   .argument('<title>', 'Task title')
   .option('--desc <description>', 'Task description')
+  .option('--desc-file <path>', 'Read the task description from a file instead of --desc — the safe way to include backticks, $(, or apostrophes byte-identical')
   .option('--assignee <agent>', 'Assigned agent')
   .option('--priority <p>', 'Priority (urgent, high, normal, low)', 'normal')
   .option('--project <name>', 'Project name')
   .option('--needs-approval', 'Require human approval before execution')
   .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
   .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
-  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+  .action((title: string, opts: { desc?: string; descFile?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+    // Fail-closed body resolution (2026-08-15) — same construction that
+    // corrupts a send-message body corrupts --desc: a description is
+    // free text through the identical double-quoted shell argument.
+    let resolvedDesc: string | undefined;
+    try {
+      resolvedDesc = resolveOptionalTextField({ inlineText: opts.desc, bodyFile: opts.descFile, fileFlagName: '--desc-file' });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
     const taskId = createTask(paths, env.agentName, env.org, title, {
-      description: opts.desc,
+      description: resolvedDesc,
       assignee: opts.assignee,
       priority: opts.priority as Priority,
       project: opts.project,
@@ -342,9 +356,23 @@ busCommand
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
   .option('--result <text>', 'Completion result')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string }) => {
+  .option('--result-file <path>', 'Read the completion result from a file instead of the argument/--result — the safe way to include backticks, $(, or apostrophes byte-identical')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; resultFile?: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
-    const effectiveResult = opts.result ?? resultArg;
+    const inlineResult = opts.result ?? resultArg;
+    // Fail-closed body resolution (2026-08-15) — same construction that
+    // corrupts a send-message body corrupts a completion result: free
+    // text through the identical double-quoted shell argument.
+    let effectiveResult: string | undefined;
+    try {
+      effectiveResult = resolveOptionalTextField({ inlineText: inlineResult, bodyFile: opts.resultFile, fileFlagName: '--result-file' });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 

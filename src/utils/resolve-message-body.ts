@@ -36,6 +36,14 @@
  * stops being the common path. Do not read the inline check as covering
  * the double-quote case; it is a secondary net for what's still visible,
  * not the primary fix.
+ *
+ * CALLER-SIDE CONSTRUCTION THAT CANNOT FAIL (marketing, 2026-08-15): a
+ * QUOTED heredoc delimiter (`cat >file <<'EOF' ... EOF`) passes backticks,
+ * $(...), and $HOME through completely literally — an UNQUOTED delimiter
+ * (`<<EOF`) interpolates all three. Writing the body to a file via a
+ * quoted-delimiter heredoc, then passing that file with --body-file,
+ * prevents the corruption before argv even exists — complementary to the
+ * checks here, which only see what already survived to argv.
  */
 import { readFileSync } from 'node:fs';
 
@@ -47,12 +55,16 @@ export class UnsafeInlineBodyError extends Error {}
 export interface ResolveMessageBodyOptions {
   /** The positional body argument, if the caller passed one inline. */
   inlineText?: string;
-  /** --body-file <path>, takes priority over inlineText and stdin. */
+  /** --body-file <path> (or the call site's equivalent), takes priority over inlineText and stdin. */
   bodyFile?: string;
   /** Injectable for tests; defaults to reading fd 0 synchronously. */
   readStdin?: () => string;
   /** Injectable for tests. */
   warn?: (msg: string) => void;
+  /** Name of this call site's file flag, for the error/warning text. Defaults to '--body-file'. */
+  fileFlagName?: string;
+  /** Whether stdin is a valid fallback at this call site, for the error text. Defaults to true. */
+  stdinAvailable?: boolean;
 }
 
 /**
@@ -74,26 +86,59 @@ export function resolveMessageBody(opts: ResolveMessageBodyOptions): string {
   }
 
   if (opts.inlineText !== undefined) {
-    if (SHELL_METACHAR_PATTERN.test(opts.inlineText)) {
-      throw new UnsafeInlineBodyError(
-        'Refusing to send: the message body contains a backtick or $( character. ' +
-          'Sending arbitrary content through an inline shell argument is unsafe — either this ' +
-          'character survived shell quoting (meaning something else in the same string may already ' +
-          'have been silently substituted away before this command even ran), or it was typed on ' +
-          "purpose, in which case an inline argument still isn't a safe channel for it. " +
-          'Pass the body safely instead: --body-file <path>, or omit the body argument and pipe it via stdin.',
-      );
-    }
-    const warn = opts.warn ?? ((msg: string) => process.stderr.write(msg + '\n'));
-    if (opts.inlineText.length > LONG_INLINE_BODY_WARNING_THRESHOLD) {
-      warn(
-        `Warning: inline message body is ${opts.inlineText.length} chars — long inline bodies are where ` +
-          'shell metacharacters hide undetected. Consider --body-file or stdin instead.',
-      );
-    }
-    return opts.inlineText;
+    return checkInlineText(opts.inlineText, opts);
   }
 
   const readStdin = opts.readStdin ?? (() => readFileSync(0, 'utf8'));
   return readStdin();
+}
+
+/**
+ * Same fail-closed checks as resolveMessageBody, for OPTIONAL free-text
+ * fields that must NOT fall back to reading stdin when omitted (e.g.
+ * create-task --desc, which is valid to leave unset entirely — silently
+ * blocking on stdin there would hang every caller that doesn't pass one).
+ * Returns undefined when neither an inline value nor a file was given.
+ *
+ * Same scope as send-message/send-telegram — this covers create-task
+ * --desc and complete-task's result, which take free-text through the
+ * identical double-quoted shell-argument construction and are exposed to
+ * the same corruption (2026-08-15, scribe: a stored task description
+ * missing backtick-formatted content it should have had, consistent with
+ * this same failure hitting the task-write path, not just messaging).
+ */
+export function resolveOptionalTextField(opts: ResolveMessageBodyOptions): string | undefined {
+  if (opts.bodyFile) {
+    return readFileSync(opts.bodyFile, 'utf8');
+  }
+  if (opts.inlineText !== undefined) {
+    return checkInlineText(opts.inlineText, { ...opts, stdinAvailable: false });
+  }
+  return undefined;
+}
+
+function checkInlineText(
+  inlineText: string,
+  opts: { warn?: (msg: string) => void; fileFlagName?: string; stdinAvailable?: boolean },
+): string {
+  const fileFlag = opts.fileFlagName ?? '--body-file';
+  const viaStdin = opts.stdinAvailable === false ? '' : ', or omit the argument and pipe it via stdin';
+  if (SHELL_METACHAR_PATTERN.test(inlineText)) {
+    throw new UnsafeInlineBodyError(
+      'Refusing to proceed: this text contains a backtick or $( character. ' +
+        'Passing arbitrary content through an inline shell argument is unsafe — either this ' +
+        'character survived shell quoting (meaning something else in the same string may already ' +
+        'have been silently substituted away before this command even ran), or it was typed on ' +
+        "purpose, in which case an inline argument still isn't a safe channel for it. " +
+        `Pass it safely instead: ${fileFlag} <path>${viaStdin}.`,
+    );
+  }
+  const warn = opts.warn ?? ((msg: string) => process.stderr.write(msg + '\n'));
+  if (inlineText.length > LONG_INLINE_BODY_WARNING_THRESHOLD) {
+    warn(
+      `Warning: inline text is ${inlineText.length} chars — long inline bodies are where ` +
+        `shell metacharacters hide undetected. Consider ${fileFlag}${viaStdin ? ' or stdin' : ''} instead.`,
+    );
+  }
+  return inlineText;
 }

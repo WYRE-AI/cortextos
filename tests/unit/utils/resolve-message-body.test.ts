@@ -3,7 +3,11 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { resolveMessageBody, UnsafeInlineBodyError } from '../../../src/utils/resolve-message-body.js';
+import {
+  resolveMessageBody,
+  resolveOptionalTextField,
+  UnsafeInlineBodyError,
+} from '../../../src/utils/resolve-message-body.js';
 
 // The acceptance test (infra's spec, 2026-08-15): a body containing
 // backticks, $(, and apostrophes must round-trip byte-identical. That
@@ -117,5 +121,37 @@ describe('resolveMessageBody — priority order', () => {
     const readStdin = vi.fn(() => 'from stdin');
     expect(resolveMessageBody({ inlineText: '', readStdin })).toBe('');
     expect(readStdin).not.toHaveBeenCalled();
+  });
+});
+
+// resolveOptionalTextField backs create-task's --desc and complete-task's
+// result — free-text fields that must stay valid when OMITTED entirely
+// (an empty task description is normal), so unlike resolveMessageBody they
+// must never fall back to reading stdin. Same corruption class applies
+// (2026-08-15, scribe: a stored task description missing backtick content
+// it should have had), same fail-closed check, different default.
+describe('resolveOptionalTextField', () => {
+  it('returns undefined when neither inlineText nor bodyFile is given (does not read stdin)', () => {
+    expect(resolveOptionalTextField({})).toBeUndefined();
+  });
+
+  it('returns the inline text unchanged when safe', () => {
+    expect(resolveOptionalTextField({ inlineText: 'a normal description' })).toBe('a normal description');
+  });
+
+  it('rejects an inline value containing a backtick', () => {
+    expect(() => resolveOptionalTextField({ inlineText: 'see `task_123`' })).toThrow(UnsafeInlineBodyError);
+  });
+
+  it('reads a file when --*-file is given, round-tripping backticks/$()/apostrophes byte-identical', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resolve-optional-'));
+    const file = join(dir, 'desc.txt');
+    writeFileSync(file, DANGEROUS_BODY);
+
+    try {
+      expect(resolveOptionalTextField({ bodyFile: file })).toBe(DANGEROUS_BODY);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
