@@ -1875,12 +1875,13 @@ function listOrgDirs(instanceId: string): string[] {
 
 busCommand
   .command('list-approvals')
-  .description('List approval requests (pending and resolved)')
+  .description('List pending approval requests (--status/--all also reach resolved ones)')
   .option('--format <fmt>', 'Output format: json|text', 'json')
-  .option('--status <status>', `Filter by status: ${APPROVAL_STATUSES.join('|')} (default: all)`)
+  .option('--status <status>', `Filter by status: ${APPROVAL_STATUSES.join('|')}`)
+  .option('--all', 'Include resolved approvals, not just pending', false)
   .option('--all-orgs', 'Scan all orgs under CTX_ROOT (matches dashboard view)', false)
-  .action((opts: { format?: string; status?: string; allOrgs?: boolean }) => {
-    const { listApprovals } = require('../bus/approval.js');
+  .action((opts: { format?: string; status?: string; all?: boolean; allOrgs?: boolean }) => {
+    const { listApprovals, resolveListStatus } = require('../bus/approval.js');
     const env = resolveEnv();
 
     // Reject an unknown status loudly. Silently returning [] would be
@@ -1894,20 +1895,22 @@ busCommand
       return;
     }
 
+    const effectiveStatus = resolveListStatus(opts.status, opts.all);
+
     let approvals: unknown[] = [];
 
     if (opts.allOrgs) {
       for (const org of listOrgDirs(env.instanceId)) {
         const orgPaths = resolvePaths(env.agentName, env.instanceId, org);
-        approvals = approvals.concat(listApprovals(orgPaths, opts.status));
+        approvals = approvals.concat(listApprovals(orgPaths, effectiveStatus));
       }
     } else {
       const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-      approvals = listApprovals(paths, opts.status);
+      approvals = listApprovals(paths, effectiveStatus);
     }
 
     if (opts.format === 'text') {
-      const label = opts.status ? `${opts.status} ` : '';
+      const label = effectiveStatus ? `${effectiveStatus} ` : '';
       if (approvals.length === 0) { console.log(`No ${label}approvals`); return; }
       for (const a of approvals as Array<{ id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string }>) {
         console.log(`[${a.id}] ${a.title}`);

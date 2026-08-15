@@ -28,7 +28,7 @@ vi.mock('../../../src/telegram/api', () => ({
 import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createApproval, updateApproval, listPendingApprovals, listApprovals, getApproval } from '../../../src/bus/approval';
+import { createApproval, updateApproval, listPendingApprovals, listApprovals, getApproval, resolveListStatus } from '../../../src/bus/approval';
 import type { BusPaths } from '../../../src/types';
 
 let testDir: string;
@@ -469,6 +469,33 @@ describe('getApproval — point lookup across both buckets', () => {
 
   it('returns null ONLY when the id is in neither bucket', () => {
     expect(getApproval(paths, 'approval_does_not_exist')).toBeNull();
+  });
+});
+
+// REGRESSION GUARD. `list-approvals` meant PENDING before it learned to read
+// resolved/, and its callers still mean that: the orchestrator heartbeat and
+// its approval-sweep cron, which reminds the user about anything pending for
+// over an hour. A build that widened the bare invocation to every bucket went
+// live briefly and turned 88 long-settled approvals into 88 would-be
+// reminders. The bare default must stay pending-only.
+describe('resolveListStatus — bare list-approvals stays pending-only', () => {
+  it('defaults to pending when no flags are given', () => {
+    expect(resolveListStatus(undefined, false)).toBe('pending');
+    expect(resolveListStatus(undefined, undefined)).toBe('pending');
+  });
+
+  it('returns undefined (no filter) only when --all is explicit', () => {
+    expect(resolveListStatus(undefined, true)).toBeUndefined();
+  });
+
+  it('honours an explicit --status over the default', () => {
+    expect(resolveListStatus('approved', false)).toBe('approved');
+    expect(resolveListStatus('rejected', false)).toBe('rejected');
+    expect(resolveListStatus('pending', false)).toBe('pending');
+  });
+
+  it('lets an explicit --status win over --all rather than silently widening', () => {
+    expect(resolveListStatus('approved', true)).toBe('approved');
   });
 });
 

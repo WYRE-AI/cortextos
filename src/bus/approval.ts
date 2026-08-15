@@ -325,6 +325,26 @@ export function listApprovals(paths: BusPaths, status?: ApprovalStatus): Approva
 }
 
 /**
+ * Which status `list-approvals` should filter on, given its flags.
+ *
+ * DEFAULT STAYS PENDING-ONLY. Callers predate this command growing a resolved/
+ * reader and mean "what still needs a decision" — the orchestrator heartbeat and
+ * its approval-sweep cron among them, and that cron reminds the user about
+ * anything pending for over an hour. Widening the bare invocation to every
+ * bucket turns long-settled approvals into fresh reminders. Reaching resolved
+ * records is opt-in: an explicit --status, or --all for everything.
+ *
+ * Returns undefined to mean "no filter" (i.e. every status).
+ */
+export function resolveListStatus(
+  status?: ApprovalStatus,
+  all?: boolean,
+): ApprovalStatus | undefined {
+  if (status) return status;
+  return all ? undefined : 'pending';
+}
+
+/**
  * Fetch a single approval by id, looking in pending/ THEN resolved/.
  *
  * Returns null only when the id is in NEITHER bucket — that is the one true
