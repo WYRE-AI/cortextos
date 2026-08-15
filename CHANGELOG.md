@@ -34,12 +34,22 @@ errors used `--include=stderr.log`, matched zero files, and the clean zero was
 briefly reported as a real absence.
 
 **Verified per file rather than per inference**, which mattered: the events
-path was first read from `src/bus/event.ts` as `<ctxRoot>/analytics/events/…`,
-and that directory does not exist for real agents. `analyticsDir` resolves
-org-scoped (`src/bus/system.ts:496`), so the true path is
-`<ctxRoot>/orgs/<org>/analytics/events/<agent>/<date>.jsonl` — confirmed by
-locating the live file. Deleting the three bad rows and trusting the rest
-would have repeated the original error at smaller scale.
+path was first read from `src/bus/event.ts` as `<ctxRoot>/analytics/events/…`.
+`analyticsDir` in fact resolves org-scoped (`src/bus/system.ts:496`), so the
+true path is `<ctxRoot>/orgs/<org>/analytics/events/<agent>/<date>.jsonl` —
+confirmed by locating the live file and checking that today's events are
+actually in it.
+
+And the wrong path is worse than a wrong path: `<ctxRoot>/analytics/events/`
+**does exist**. It holds `aaron`, `fix-the-things`, and `test-agent` — the last
+written to as recently as today, so it is not even dormant. An agent following
+the inferred path therefore finds a **real, populated, actively-written
+directory**, does not find itself in it, and concludes it has logged nothing.
+A missing directory raises an error; this one returns a confident wrong answer.
+
+Deleting the three bad rows and trusting the rest would have repeated the
+original error at smaller scale — reading the code is still an inference; only
+locating the live artifact is verification.
 
 Each corrected table now also carries the general rule: confirm a path exists
 before drawing a conclusion from its silence.
