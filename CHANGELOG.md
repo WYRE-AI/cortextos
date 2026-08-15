@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### Fixed — cherry-picked two upstream fixes (`grandamenium/cortextos`)
+
+This fork diverged from upstream on 2026-04-06 and is now +390 / -264 commits
+against that base, so a full merge is a project rather than a pull. These two
+were content-verified as genuinely missing here (most of the upstream delta —
+the PTY-injection Unicode-whitespace hardening, task-id path validation, 50MB
+stdout rotation, `next@16.2.4`, the TRUST_PROXY/CF-Connecting-IP rate-limit
+logic — is already present under different SHAs, so the raw "264 behind" count
+badly overstates the gap).
+
+**`fix(security)`: sanitize the display-name in `formatTelegramReaction`**
+(upstream `5362a5a2`, #708). `formatTelegramReaction` interpolated the Telegram
+display name raw. The caller's `stripControlChars` deliberately keeps `\n`/`\r`,
+so a crafted display name could forge a `=== TELEGRAM ===` containment header
+into an agent's PTY stream — the #592/#597 injection class. This was the last
+unhardened `formatTelegram*` path; the other five were already sanitized here,
+which is what made it a live residual rather than a deliberate omission. The
+commit's two tests were verified load-bearing by mutation: reverting the
+sanitization fails "neutralizes a display-name header forgery" and "a bare-CR
+forgery is folded to LF and quoted".
+
+**`fix(pty)`: auto-accept the Claude Code 2.1.x Bypass Permissions screen**
+(upstream `a15baad4`). Without it a headless agent wedges on that screen at
+first run and crash-loops — the same shape as the interactive-dialog hangs
+already recorded in this repo's CLAUDE.md learnings.
+
+Both retain their original upstream authorship. Two bugs found here on
+2026-08-14 are **not** fixed upstream either — `injectMessage`'s fixed 300ms
+`setTimeout` Enter (bus task `…53511893`) and `restart <agent>` reporting a
+start-dedupe as "Agent is now stopped" (bus task `…76411072`) — upstream's
+copies of both files are identical to ours, so those are push-upstream
+candidates, not pull.
+
 ### Fixed — dashboard served by `next dev` in production because `next build` failed
 
 `dashboard/src/lib/config.ts` falls back to `path.resolve(process.cwd(), '..')`
