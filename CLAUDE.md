@@ -102,7 +102,14 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   healthy and talking to each other about it*. Third time this same instrument misled someone in one day.
 
 - **THE HANG DETECTOR HAS A DETERMINISTIC BLIND SPOT: any agent whose tightest cron interval ≤ `graceMs`
-  (15 min) can NEVER be flagged hung.** Not a fail-open that fires under some condition — structural.
+  (15 min) is effectively immune to being flagged hung — detection is delayed by HOURS, not prevented.**
+  *(Corrected 14:1xZ by `maintainer`, the agent it landed on, from its own daemon log — the original
+  wording here said "can NEVER be flagged" and that is too strong. **It flagged exactly once**:
+  `daemon-out.log:49652`, `Hang detected for maintainer… delivered fire 13:42:24.579Z + 15m elapsed`,
+  auto-restart 8s later at 13:57:32.827Z — **onset-to-detection 11h06m17s**, count of that string in
+  the whole log: 1. Escaping requires a GAP between fires exceeding `graceMs`; it only broke out when
+  a fire finally landed late. **Do NOT encode "never flags" in a regression test — such a test PASSES
+  on the broken code and FAILS on a good fix. Assert BOUNDED DETECTION LATENCY from onset instead.**)*
   `hang-detector.ts:153` sources `T` from **`last_fire_attempted_at` — ATTEMPTED, not consumed** — so a
   dead agent keeps a perfectly fresh anchor. Measured on `maintainer`: `T=13:42:24Z`, `now-T=15.0min`,
   `graceMs=15.0min` (`fast-checker.ts:1540`) → `evaluateHang:176` returns `within grace → NOT HUNG` on
