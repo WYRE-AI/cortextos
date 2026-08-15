@@ -2,6 +2,58 @@
 
 ## [Unreleased]
 
+### Fixed — the documented agent log surface did not match reality, in both directions
+
+Three of the four documented log paths **did not exist**, and seven real
+streams were undocumented. Every agent inherits this table, so every agent
+inherited a wrong map.
+
+Documented but never written by any code (`git grep` finds zero references in
+`src/` to any of them):
+
+| Path | Reality |
+|---|---|
+| `logs/<agent>/stderr.log` | Cannot exist. Agents run under a **PTY**, which merges stderr into stdout — one stream, one file. |
+| `logs/<agent>/activity.log` | The Activity feed is the events JSONL, at `orgs/<org>/analytics/events/<agent>/<YYYY-MM-DD>.jsonl`. |
+| `logs/<agent>/fast-checker.log` | The fast-checker runs inside the daemon and has no log file of its own; its output is in `~/.pm2/logs/cortextos-daemon-out.log`. |
+
+Real but undocumented: `crashes.log`, `restarts.log`, `hooks.log`,
+`inbound-messages.jsonl`, `outbound-messages.jsonl`, the org-scoped events
+JSONL, and the pm2 daemon logs. The Telegram JSONLs are also **conditional** —
+written by `src/telegram/logging.ts`, so a bus-only agent has neither and their
+absence is not a fault.
+
+**Why this is a correctness bug and not tidiness.** A documented-but-absent
+path returns a *clean empty result*. `tail` on a file that was never created,
+or `grep --include=stderr.log`, yields nothing — and nothing is
+indistinguishable from a genuine "nothing to report." Two of the corrected
+lines were troubleshooting steps that told an agent to `tail` a nonexistent
+file *while diagnosing a broken agent*, which is exactly when a false
+all-clear does the most damage. This was found when a sweep for torn-build
+errors used `--include=stderr.log`, matched zero files, and the clean zero was
+briefly reported as a real absence.
+
+**Verified per file rather than per inference**, which mattered: the events
+path was first read from `src/bus/event.ts` as `<ctxRoot>/analytics/events/…`.
+`analyticsDir` in fact resolves org-scoped (`src/bus/system.ts:496`), so the
+true path is `<ctxRoot>/orgs/<org>/analytics/events/<agent>/<date>.jsonl` —
+confirmed by locating the live file and checking that today's events are
+actually in it.
+
+And the wrong path is worse than a wrong path: `<ctxRoot>/analytics/events/`
+**does exist**. It holds `aaron`, `fix-the-things`, and `test-agent` — the last
+written to as recently as today, so it is not even dormant. An agent following
+the inferred path therefore finds a **real, populated, actively-written
+directory**, does not find itself in it, and concludes it has logged nothing.
+A missing directory raises an error; this one returns a confident wrong answer.
+
+Deleting the three bad rows and trusting the rest would have repeated the
+original error at smaller scale — reading the code is still an inference; only
+locating the live artifact is verification.
+
+Each corrected table now also carries the general rule: confirm a path exists
+before drawing a conclusion from its silence.
+
 ### Fixed — `restart <agent>` reported a healthy agent as stopped
 
 `cortextos restart <agent>` issues `stop-agent` then `start-agent` back to

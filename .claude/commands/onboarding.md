@@ -558,9 +558,9 @@ If `PM2_SUDO_CMD` is empty (PM2 startup is already configured, or the system doe
 
 **Agent not messaging on Telegram:**
 1. Check stdout.log: `tail -50 ~/.cortextos/<instance>/logs/<agent>/stdout.log`
-2. Check activity.log: `tail -20 ~/.cortextos/<instance>/logs/<agent>/activity.log`
+2. Check the events feed: `tail -20 ~/.cortextos/<instance>/orgs/<org>/analytics/events/<agent>/$(date -u '+%Y-%m-%d').jsonl`
 3. Check .env has valid BOT_TOKEN and CHAT_ID
-4. Check fast-checker.log: `tail -20 ~/.cortextos/<instance>/logs/<agent>/fast-checker.log`
+4. Check the daemon log (the fast-checker has no log file of its own): `tail -20 ~/.pm2/logs/cortextos-daemon-out.log`
 
 **Daemon not starting:**
 1. Check `pm2 logs cortextos-daemon --lines 30`
