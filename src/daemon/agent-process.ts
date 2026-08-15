@@ -1021,15 +1021,20 @@ export class AgentProcess {
     const handoffBlock = this.consumeHandoffBlock();
     const isHandoffRestart = handoffBlock.length > 0;
     this.lastSpawnWasHandoff = isHandoffRestart;
+    const telegram = this.hasTelegram();
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
     // before cron restoration, before heartbeat, before anything else. Placing this instruction
     // immediately after the handoffBlock in the prompt ensures it is not buried.
     const handoffUxOverride = isHandoffRestart
-      ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
+      ? (telegram
+        ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
+        : ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. You have NO Telegram bot configured, so do NOT attempt send-telegram; it will fail. Instead, after reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus update-heartbeat \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. That string is what the dashboard shows a human, so write it as a sentence, not a status code. Do this BEFORE any other tool call. No cron IDs, no cold-boot phrasing.')
       : '';
     const onlineMessage = isHandoffRestart
       ? ''
-      : ' Send a Telegram message to the user saying you are back online.';
+      : (telegram
+        ? ' Send a Telegram message to the user saying you are back online.'
+        : ' You have NO Telegram bot configured — do NOT attempt send-telegram. Report you are back online with: cortextos bus update-heartbeat \'<one-sentence status>\'.');
     return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
   }
 
@@ -1039,7 +1044,40 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
+    const backOnline = this.hasTelegram()
+      ? 'After checking inbox, send a Telegram message to the user saying you are back online.'
+      : 'You have NO Telegram bot configured — do NOT attempt send-telegram. After checking inbox, report you are back online with: cortextos bus update-heartbeat \'<one-sentence status>\'.';
+    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. ${backOnline}`;
+  }
+
+  /**
+   * Whether this agent can actually send Telegram.
+   *
+   * Keys on BOT_TOKEN having a VALUE, not on the `BUS_ONLY` marker. BUS_ONLY is a
+   * classification that currently happens to select the right five agents; BOT_TOKEN
+   * is the property that actually determines whether `send-telegram` succeeds. They
+   * diverge on any newly-created agent: `add-agent` writes a literal `BOT_TOKEN=`
+   * (empty) with no BUS_ONLY field, so a BUS_ONLY check would tell every fresh agent
+   * to send Telegram it cannot send — the same defect, on a population that did not
+   * exist when the marker was introduced.
+   *
+   * Note CHAT_ID is deliberately NOT a tell: it is set (to the same value) on all
+   * five bus-only agents while BOT_TOKEN is empty, so its presence is a false
+   * positive for Telegram capability.
+   *
+   * Precedence matches `cortextos bus send-telegram` itself (src/cli/bus.ts): agent
+   * `.env` first, then the process environment. If the two ever disagree, this and
+   * the command it advertises must agree, or the prompt resumes lying.
+   */
+  private hasTelegram(): boolean {
+    try {
+      const envPath = join(this.env.agentDir, '.env');
+      if (existsSync(envPath)) {
+        const match = readFileSync(envPath, 'utf-8').match(/^BOT_TOKEN=(.+)$/m);
+        if (match && match[1].trim()) return true;
+      }
+    } catch { /* fall through to process env */ }
+    return Boolean(process.env.BOT_TOKEN && process.env.BOT_TOKEN.trim());
   }
 
   /**
