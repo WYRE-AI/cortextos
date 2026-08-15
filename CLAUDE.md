@@ -386,11 +386,28 @@ labelled.
   the merge as the fix**; (b) **the shared tree MOVED under me** (`e8ff2dff → 4d6d1c4b`, not by me —
   clean tree, no git writes), so a standing note recording the gap as *"benign pull drift, dist
   matches local HEAD"* **went false without anyone editing it.**
-  **And #110 — which exists precisely to teach `deploy-drift-check` to tell "behind" apart from
-  "built elsewhere" — was itself sitting in the unbuilt gap. A diagnostic cannot diagnose its own
-  non-deployment.** Second instance in one evening of a tool blind to exactly the condition it exists
-  to detect (the first: a monitor cannot observe its own wedge). **Treat that as one pattern, not two
-  anecdotes.**
+  **CORRECTED 18:2xZ, after this entry was merged — the original claim here was mine and it was
+  overstated.** I wrote that #110, which refines `deploy-drift-check`, "was sitting in the unbuilt
+  gap — **a diagnostic cannot diagnose its own non-deployment**," and called it a second instance of
+  a tool blind to the condition it exists to detect. **I never ran the tool before writing that.**
+  Run afterwards, the **pre-#110** check reports:
+  `build_drift: {stale: true, built_sha: e8ff2dff, reason: "built from a different commit than local
+  HEAD — run npm run build"}`. **It diagnoses its own non-deployment precisely** — built sha, local
+  head, and the remedy — and the pull-vs-build split it uses **predates #110** entirely. What #110
+  actually adds (`src/bus/system.ts`, +48) is a `drift_kind` classifier and a *behind*-vs-*divergent*
+  distinction with a sharper reason string. So #110 being unbuilt is true and worth recording; **the
+  aphorism was false.**
+  **What is actually true, and still worth keeping: A TOOL CAN REPORT ITS OWN STALENESS ACCURATELY
+  AND STILL BE THE STALE VERSION OF ITSELF.** The fix for a diagnostic is not live until it is built,
+  and the *un*fixed diagnostic will keep telling you so — correctly, and less precisely than the
+  version you merged.
+  **Why it survived to be merged, which is the part that belongs in a journal about verification:**
+  it *paired* with the monitor-cannot-observe-its-own-wedge finding from the same evening, and the
+  symmetry is what stopped me checking. **An aphorism that completes a pattern is the claim least
+  likely to be tested** — it arrives feeling already confirmed. I asserted it twice to `boss` before
+  reading #110's diff. Note the axis, too: this entry's own lesson is that an *understated* caveat is
+  armoured against challenge. **This one OVERCLAIMED — the failure mode that invites correction — and
+  it still took four hours and a merge to get one.**
 
 - **AN AUTOMATION IS A THIRD ACTOR IN A SHARED REPO — "who changed this" is not answered by asking
   the agents.** Two PR branches were rebased at `17:29:13Z` and `17:29:21Z`, **eight seconds apart**,
