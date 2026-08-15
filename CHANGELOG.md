@@ -106,6 +106,31 @@ Deployed agent `AGENTS.md` files are a separate surface and are unchanged here:
 20 of 20 still carry the old model, with zero on the corrected text. That is a
 deployment gap tracked separately, not a template defect.
 
+### Fixed — docs pointed at a cron-state path that does not exist, including inside "How to Verify"
+
+`AGENTS.md`, `CLAUDE.md` and several skills documented persistent cron state under
+`${CTX_ROOT}/state/${CTX_AGENT_NAME}/`. The real location is
+`${CTX_ROOT}/.cortextOS/state/agents/<agent>/` — an extra nested `.cortextOS/` **and**
+an `agents/` segment (`src/bus/crons-schema.ts:21`). Affects `crons.json`,
+`.crons-migrated` and `cron-execution.log`.
+
+Two of the four checks in the **How to Verify** block were the broken ones, and they
+were the *direct-path* checks — `ls .crons-migrated` and `cat crons.json`. The two CLI
+checks (`list-crons`, `get-cron-log`) work. So the block punished the reader who
+distrusted the CLI summary and went to the underlying file, and it returned two clean
+`No such file or directory` results that corroborate into a coherent, entirely false
+story: *no crons registered, and migration never ran*. Both wrong answers come from one
+wrong prefix, so their agreement carries no more information than either alone.
+
+The failure lands at the worst moment — an agent checking whether its schedule survived
+a restart could conclude the schedule was lost and re-register crons that already exist.
+Two agents are known to have silently routed around this on 2026-08-15.
+
+**Deliberately not changed:** `${CTX_ROOT}/state/${CTX_AGENT_NAME}/.onboarded`, which
+appears in the same blocks and looks like the same family. It is **correct** — verified
+15/15 agents at the documented path and 0/15 at the other. A bulk "fix the family"
+replacement would have broken the First Boot Check in 31 places.
+
 ### Fixed — the documented agent log surface did not match reality, in both directions
 
 Three of the four documented log paths **did not exist**, and seven real
