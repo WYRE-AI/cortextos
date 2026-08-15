@@ -46,6 +46,42 @@ timeout; and make the inbox ACK in `fast-checker` contingent on confirmed
 submission, since today it ACKs as soon as `injectMessage` returns, so a dropped
 message is also ACKed and never redelivered.
 
+### Fixed — unquoted `date` format strings: the remaining 14 files
+
+Completes the earlier "template docs drift batch" fix below, which landed in 9
+files and left 34 occurrences across 14 more. Same bug, same fix: on BSD/macOS
+`date`, the unquoted `UTC` in `$(date -u +%H:%M UTC)` parses as an operand
+(`illegal time format`), so every memory entry written verbatim from the
+template got an EMPTY timestamp. Now quoted: `$(date -u '+%H:%M UTC')`.
+
+Swept files: `community/agents/{agent,agentic-crm-assistant,analyst,orchestrator,research-agent,security}`,
+`community/skills/memory`, `templates/agent/.claude/skills/memory`, and
+`templates/agent-codex/plugins/cortextos-agent-skills/skills/memory`.
+
+**Why the first pass missed them — worth knowing, it will bite other sweeps.**
+The agent shell's `grep` is not `/usr/bin/grep`: the Claude Code shell snapshot
+shadows it with a function that execs `ugrep` under `--ignore-files`, which
+honours `.gitignore`. Files that are **tracked in git but textually matched by
+an ignore rule are silently skipped** — no error, no warning, just a smaller
+number. This repo has exactly that overlap: a bare `AGENTS.md` rule
+(`.gitignore:55`) and a `memory/` rule (`templates/agent/.gitignore:3`),
+both meant for per-agent runtime dirs, also match tracked framework templates.
+
+The three searches disagreed and only the last two were right:
+
+| search | result |
+|---|---|
+| `grep -rn …` (shimmed ugrep) | 17 |
+| `grep -rn … community templates` (explicit dirs) | 26 |
+| `git grep` / `/usr/bin/grep -rn` | **34** |
+
+`community/agents/research-agent/AGENTS.md` *was* found by the shim, because
+`.gitignore:69` un-ignores it with `!community/agents/research-agent/**` —
+which is what pinned the mechanism down rather than leaving it a guess.
+
+Rule for completeness sweeps in this repo: drive them from `git grep`, and
+verify the residual with `/usr/bin/grep`. A bare `grep -r` under-reports here.
+
 ### Fixed — cherry-picked two upstream fixes (`grandamenium/cortextos`)
 
 This fork diverged from upstream on 2026-04-06 and is now +390 / -264 commits
