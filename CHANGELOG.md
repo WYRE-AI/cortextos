@@ -127,6 +127,49 @@ locating the live artifact is verification.
 
 Each corrected table now also carries the general rule: confirm a path exists
 before drawing a conclusion from its silence.
+### Fixed — boot/restart prompts ordered Telegram-less agents to send Telegram
+
+The daemon-generated startup and `--continue` prompts told **every** agent to
+report in over Telegram. The context-handoff variant was emphatic about it —
+"your VERY FIRST tool call MUST be a Bash call running
+`cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID …`", to be done *before* the
+heartbeat and before any other tool call. On agents with no bot configured that
+mandated first action exits 1 with
+`Error: BOT_TOKEN not configured`. Five of twenty fleet agents are in that
+state, so each began every restart with a guaranteed failure, as the very first
+thing a fresh session did. Hit live on 2026-08-15 by two agents independently.
+
+Nothing was broken downstream — agents route around it — but a boot directive is
+the least appropriate place to be confidently wrong, because it is the first
+thing read and there is no prior context to weigh it against. An agent that
+reasoned "my boot instructions tell me to use Telegram, so I must have Telegram"
+would be treating a description of what the system is *for* as evidence of what
+*is*.
+
+`buildStartupPrompt()` and `buildContinuePrompt()` now gate all three
+Telegram directives on a new `hasTelegram()` check, and emit a
+`cortextos bus update-heartbeat '<one sentence>'` instruction instead — which
+preserves the intent (a human-visible, conversational "I'm back"), since the
+heartbeat string is what the dashboard shows.
+
+**The check keys on `BOT_TOKEN` having a value, not on the `BUS_ONLY` marker.**
+`BUS_ONLY` currently selects exactly the right five agents, but it is a
+classification standing in for the property that actually decides whether
+`send-telegram` succeeds. The two diverge on any newly-created agent:
+`cortextos add-agent` writes a literal `BOT_TOKEN=` and no `BUS_ONLY` field, so
+a `BUS_ONLY`-based check would tell every fresh agent to send Telegram it cannot
+send — the same defect on a population that did not exist when the marker was
+introduced. Precedence matches `cortextos bus send-telegram` itself: agent
+`.env` first, then the process environment.
+
+`CHAT_ID` is deliberately not a tell. It is set to the same value on all fifteen
+agents in the primary org whether or not they have a bot, so it has no
+discriminating power at all.
+
+Coverage in `tests/unit/daemon/agent-process-telegram-capability.test.ts`,
+including the empty-token, whitespace-only-token, fresh-`add-agent`, and
+`CHAT_ID`-is-not-a-tell cases. Verified against the unfixed code as a negative
+control: 5 of 8 fail without the change.
 
 ### Fixed — `restart <agent>` reported a healthy agent as stopped
 
