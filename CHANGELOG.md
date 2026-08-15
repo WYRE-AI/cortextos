@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+### Fixed — `restart <agent>` reported a healthy agent as stopped
+
+`cortextos restart <agent>` issues `stop-agent` then `start-agent` back to
+back. The stop IPC returns as soon as the stop is *dispatched*, but the agent
+only leaves the registry once its PTY has actually exited — so the start can
+land while the entry is still present and come back `DEDUPED`. `restart.ts`
+treated any unsuccessful start as fatal and printed
+`Agent is now stopped. Recover with: cortextos start <agent>` — while the
+agent was in fact coming up. Following that advice then errors as deduped too,
+reading as a second failure against a perfectly healthy agent. Hit live on
+2026-08-14: the command reported failure and exited 1 while `cortextos status`
+showed the agent running with 2s uptime on its newly configured model.
+
+The IPC response already carried a structured `code` (`DEDUPED` / `NOT_FOUND` /
+`NOT_RUNNING`); `restart.ts` simply ignored it. It now treats `DEDUPED` as
+"starting or already running" and points at `cortextos status`, while genuine
+failures still exit non-zero. Behaviour coverage added to
+`tests/unit/cli/restart-command.test.ts`, which previously pinned only command
+wiring; the DEDUPED case was verified load-bearing by mutation.
+
+### Known issue — injected messages can be silently dropped (investigated, not fixed)
+
+`injectMessage` (`src/pty/inject.ts`) pastes in bracketed-paste mode then
+submits with a fixed 300ms `setTimeout` Enter. On 2026-08-14 an inbound
+Telegram message reached `boss`'s input box, rendered there, and was never
+submitted — no `user` entry in the session jsonl — while the agent sat idle for
+four minutes and the operator saw silence.
+
+Deliberately **not** patched, because the mechanism is not established: the
+payload was 1048 bytes, under `MAX_CHUNK`, so it was a single `write()` (not
+chunk interleaving), and PTY bytes are an ordered stream, so paste-then-Enter
+should arrive in order even with the app busy. Something in the TUI discards or
+defers the keystroke, and that has not been reproduced.
+
+**A retry Enter is not a safe fix here.** `Enter` is overloaded: `fast-checker`
+writes `KEYS.ENTER` to confirm AskUserQuestion option selections and
+multi-select submits. A blind second Enter from `injectMessage` could
+auto-confirm whatever dialog opened in between — worse than a dropped message.
+Viable directions: reproduce the busy-TUI state first; verify submission
+against the PTY output `AgentProcess` already consumes rather than a fixed
+timeout; and make the inbox ACK in `fast-checker` contingent on confirmed
+submission, since today it ACKs as soon as `injectMessage` returns, so a dropped
+message is also ACKed and never redelivered.
+
 ### Fixed — cherry-picked two upstream fixes (`grandamenium/cortextos`)
 
 This fork diverged from upstream on 2026-04-06 and is now +390 / -264 commits
