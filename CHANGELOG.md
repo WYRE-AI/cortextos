@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### Added — `bus get-approval <id>`, and `list-approvals --status` now actually exists
+
+An agent could not find out what happened to an approval it had filed.
+`updateApproval` moves a decided approval from `approvals/pending/` to
+`approvals/resolved/`, but every CLI read path called `listPendingApprovals`
+and looked only at `pending/` — so the moment a decision landed, its outcome
+left the only directory the CLI could see. In the wyre store that hid 88
+resolved records. The inbox message `updateApproval` sends is delivered
+exactly once, so an agent that restarted past it had no way back to the
+decision, and bus-only agents have no Telegram fallback.
+
+This collided with the standing convention that a filed approval is *not* an
+approved one and the agent must wait for the decision: agents were told to
+wait for something the CLI could not show them.
+
+- `bus get-approval <id>` — point lookup across `pending/` then `resolved/`.
+  A restarted agent knows its own approval id, so a point lookup, not a list,
+  is what closes the gap. Absent from both buckets writes to stderr and exits
+  1 so it cannot be read as a result.
+- `bus list-approvals --status <pending|approved|rejected>` — the flag
+  `TOOLS.md` had documented all along but which was never implemented;
+  it previously hard-errored `unknown option`. Unknown values now fail loudly
+  rather than returning `[]`, since a silent empty result is indistinguishable
+  from a real absence.
+- `list-approvals` reads both buckets and reports each entry's status.
+
+`listPendingApprovals` is unchanged in behaviour for existing callers.
+
 ### Fixed — the documented agent log surface did not match reality, in both directions
 
 Three of the four documented log paths **did not exist**, and seven real
