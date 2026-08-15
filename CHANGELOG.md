@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+### Fixed — `check-deploy-drift` gave the same remedy for two opposite conditions
+
+The report collapsed both drifts into `status: "drift"`. That is deliberate — a cron
+can alert on one field — but it left consumers unable to tell apart two situations
+whose fixes point in opposite directions:
+
+- **pull drift** — `origin/main` has commits the tree does not. Benign. Fix: pull, then build.
+- **build drift** — `dist/` does not match local HEAD. Fix: build.
+
+On 2026-08-15 a drift-check cron would have offered a rebuild for pull drift in the
+language of restoring sync, and been right only by accident.
+
+`drift_kind` (`pull` | `build` | `both`) is now emitted alongside `status`, which is
+unchanged so existing consumers keep working.
+
+### Fixed — build drift could not distinguish "behind" from "built from somewhere else"
+
+Both produced `dist/ was built from a different commit than local HEAD — run npm run
+build`. Those are very different situations: an **ancestor** build is merely old and
+everything in it was reviewed code on main, while a **non-ancestor** build means `dist/`
+carries commits that are not in this history at all — a branch built in the shared
+checkout — so the fleet is running code nobody chose to deploy, and a rebuild silently
+discards it.
+
+Verified live that day: `dist/` carried an unmerged PR's CLI changes, and the existing
+check correctly reported drift but advised the rebuild in the same words it uses for
+ordinary staleness.
+
+The classification asks `git merge-base --is-ancestor`, not a symbol comparison. A
+name-based probe against a minified bundle collides — `hasTelegram` matching an
+unrelated `hasTelegramMessage` produced a false fleet-risk alarm that day and cost an
+hour. An unknown or pruned commit is treated as divergent, which fails toward warning
+rather than reassuring. `builtSha` is shape-guarded before it reaches the shell.
+
+Coverage in `tests/unit/bus/deploy-drift-kind.test.ts`, including a test that the two
+reasons actually *differ* rather than each merely being non-empty, and a non-SHA
+manifest case. Verified against the unfixed code as a negative control: 5 of 6 fail.
+
 ### Added — `bus get-approval <id>`, and `list-approvals --status` now actually exists
 
 An agent could not find out what happened to an approval it had filed.
