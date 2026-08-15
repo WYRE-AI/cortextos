@@ -198,7 +198,12 @@ function printReport(report: AgentReport): void {
       `(${counts.equality} equality-checked, ${counts.property} property-checked, ` +
       `${counts['existence-only']} existence-only, ${counts.skipped} deliberately skipped as agent-owned)`,
   );
-  console.log('NOT covered by this run: community/agents/agent/ (public catalog tree — separate, unanswered question, not this tool\'s scope).\n');
+  console.log('NOT covered by this run: community/agents/agent/ (public catalog tree — separate, unanswered question, not this tool\'s scope).');
+  console.log(
+    'READ EQUALITY vs PROPERTY DIFFERENTLY: an EQUALITY drift means the file differs, in either direction — a human decides which side is right. ' +
+      'A PROPERTY drift means specific template content is MISSING from the deployed file — it is NEVER triggered by an agent\'s own legitimate ' +
+      'additions (those are expected and healthy, and this tool does not flag them). A high PROPERTY drift count is a real gap, not noise.\n',
+  );
 
   for (const r of report.results) {
     const kindLabel = r.kind.toUpperCase();
@@ -278,10 +283,32 @@ function main(): void {
   }
 
   const frameworkRoot = findFrameworkRoot(rootOverride);
+
+  // Fail CLOSED, explicitly, before doing any per-file work. orgs/ is
+  // gitignored — a fresh `git worktree` checkout (or a CI runner without
+  // the real tree mounted) does not have it, and the naive failure mode
+  // for that is a CLEAN, EMPTY result: every file check reports "missing
+  // in deployed," which a hasty reader can misread as "nothing to see
+  // here" rather than "this tool couldn't see the tree it needed to
+  // check." Refuse outright instead, with an error that names the exact
+  // thing that's missing, rather than let the absence look like a report.
+  const agentsBaseDir = join(frameworkRoot, 'orgs', org, 'agents');
+  if (!existsSync(agentsBaseDir)) {
+    console.error(`REFUSING TO RUN: orgs/${org}/agents/ does not exist under ${frameworkRoot}.`);
+    console.error('orgs/ is gitignored — a fresh `git worktree` checkout will never have it.');
+    console.error('Point --root at a checkout with the real orgs/ tree (normally the primary framework checkout).');
+    process.exit(1);
+  }
+
   const agents = all ? listAgentsInOrg(frameworkRoot, org) : [agent as string];
 
   if (agents.length === 0) {
     console.error(`No agents found under orgs/${org}/agents/`);
+    process.exit(1);
+  }
+
+  if (!all && !existsSync(join(agentsBaseDir, agent as string))) {
+    console.error(`REFUSING TO RUN: orgs/${org}/agents/${agent}/ does not exist.`);
     process.exit(1);
   }
 
