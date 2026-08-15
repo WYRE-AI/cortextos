@@ -28,7 +28,7 @@ vi.mock('../../../src/telegram/api', () => ({
 import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createApproval, updateApproval, listPendingApprovals } from '../../../src/bus/approval';
+import { createApproval, updateApproval, listPendingApprovals, listApprovals, getApproval, resolveListStatus } from '../../../src/bus/approval';
 import type { BusPaths } from '../../../src/types';
 
 let testDir: string;
@@ -428,5 +428,122 @@ describe('listPendingApprovals', () => {
     const pending = listPendingApprovals(paths);
     expect(pending).toHaveLength(1);
     expect(pending[0].id).toBe(id1);
+  });
+});
+
+// The regression these cover: updateApproval MOVES a decided approval from
+// pending/ to resolved/, and every read path used to look only at pending/.
+// An agent therefore could not answer "was I approved?" about its own request
+// once the decision landed. The inbox notice is delivered exactly once, so an
+// agent restarting past it had no recovery path.
+describe('getApproval — point lookup across both buckets', () => {
+  it('finds an approval that is still pending', async () => {
+    const id = await createApproval(paths, 'alice', 'TestOrg', 'Still pending', 'deployment', undefined, frameworkRoot);
+
+    const found = getApproval(paths, id);
+    expect(found?.id).toBe(id);
+    expect(found?.status).toBe('pending');
+  });
+
+  it('finds an approval AFTER it is resolved, and carries the decision', async () => {
+    const id = await createApproval(paths, 'alice', 'TestOrg', 'Ship it', 'deployment', undefined, frameworkRoot);
+    updateApproval(paths, id, 'approved', 'approved by boss');
+
+    // The exact lookup that was impossible before: the approval has left
+    // pending/, and its outcome exists nowhere the CLI could reach.
+    const found = getApproval(paths, id);
+    expect(found?.id).toBe(id);
+    expect(found?.status).toBe('approved');
+    expect(found?.resolved_by).toBe('approved by boss');
+    expect(found?.resolved_at).toBeTruthy();
+  });
+
+  it('preserves a rejected decision too', async () => {
+    const id = await createApproval(paths, 'alice', 'TestOrg', 'Nope', 'deployment', undefined, frameworkRoot);
+    updateApproval(paths, id, 'rejected', 'denied — out of scope');
+
+    const found = getApproval(paths, id);
+    expect(found?.status).toBe('rejected');
+    expect(found?.resolved_by).toBe('denied — out of scope');
+  });
+
+  it('returns null ONLY when the id is in neither bucket', () => {
+    expect(getApproval(paths, 'approval_does_not_exist')).toBeNull();
+  });
+});
+
+// REGRESSION GUARD. `list-approvals` meant PENDING before it learned to read
+// resolved/, and its callers still mean that: the orchestrator heartbeat and
+// its approval-sweep cron, which reminds the user about anything pending for
+// over an hour. A build that widened the bare invocation to every bucket went
+// live briefly and turned 88 long-settled approvals into 88 would-be
+// reminders. The bare default must stay pending-only.
+describe('resolveListStatus — bare list-approvals stays pending-only', () => {
+  it('defaults to pending when no flags are given', () => {
+    expect(resolveListStatus(undefined, false)).toBe('pending');
+    expect(resolveListStatus(undefined, undefined)).toBe('pending');
+  });
+
+  it('returns undefined (no filter) only when --all is explicit', () => {
+    expect(resolveListStatus(undefined, true)).toBeUndefined();
+  });
+
+  it('honours an explicit --status over the default', () => {
+    expect(resolveListStatus('approved', false)).toBe('approved');
+    expect(resolveListStatus('rejected', false)).toBe('rejected');
+    expect(resolveListStatus('pending', false)).toBe('pending');
+  });
+
+  it('lets an explicit --status win over --all rather than silently widening', () => {
+    expect(resolveListStatus('approved', true)).toBe('approved');
+  });
+});
+
+describe('listApprovals — both buckets, optional status filter', () => {
+  it('returns pending and resolved together when unfiltered', async () => {
+    const pendingId = await createApproval(paths, 'alice', 'TestOrg', 'Pending one', 'deployment', undefined, frameworkRoot);
+    const approvedId = await createApproval(paths, 'alice', 'TestOrg', 'Approved one', 'deployment', undefined, frameworkRoot);
+    const rejectedId = await createApproval(paths, 'alice', 'TestOrg', 'Rejected one', 'deployment', undefined, frameworkRoot);
+    updateApproval(paths, approvedId, 'approved');
+    updateApproval(paths, rejectedId, 'rejected');
+
+    const ids = listApprovals(paths).map(a => a.id).sort();
+    expect(ids).toEqual([pendingId, approvedId, rejectedId].sort());
+  });
+
+  it('filters by status, and the three filtered sets partition the whole set', async () => {
+    const pendingId = await createApproval(paths, 'alice', 'TestOrg', 'Pending one', 'deployment', undefined, frameworkRoot);
+    const approvedId = await createApproval(paths, 'alice', 'TestOrg', 'Approved one', 'deployment', undefined, frameworkRoot);
+    const rejectedId = await createApproval(paths, 'alice', 'TestOrg', 'Rejected one', 'deployment', undefined, frameworkRoot);
+    updateApproval(paths, approvedId, 'approved');
+    updateApproval(paths, rejectedId, 'rejected');
+
+    expect(listApprovals(paths, 'pending').map(a => a.id)).toEqual([pendingId]);
+    expect(listApprovals(paths, 'approved').map(a => a.id)).toEqual([approvedId]);
+    expect(listApprovals(paths, 'rejected').map(a => a.id)).toEqual([rejectedId]);
+
+    // Equality against the unfiltered set, not merely "each filter returned
+    // something" — a filter that silently dropped rows would still pass the
+    // three assertions above if the counts were never reconciled.
+    const total = listApprovals(paths).length;
+    const partitioned = (['pending', 'approved', 'rejected'] as const)
+      .reduce((n, s) => n + listApprovals(paths, s).length, 0);
+    expect(partitioned).toBe(total);
+  });
+
+  it('returns [] for a status with no matches, without hiding the other buckets', async () => {
+    await createApproval(paths, 'alice', 'TestOrg', 'Pending only', 'deployment', undefined, frameworkRoot);
+
+    expect(listApprovals(paths, 'rejected')).toEqual([]);
+    expect(listApprovals(paths, 'pending')).toHaveLength(1);
+  });
+
+  it('treats a missing resolved/ directory as an empty bucket, not an error', async () => {
+    // Fresh store: nothing has ever been decided, so resolved/ does not exist.
+    await createApproval(paths, 'alice', 'TestOrg', 'Pending only', 'deployment', undefined, frameworkRoot);
+    expect(existsSync(join(paths.approvalDir, 'resolved'))).toBe(false);
+
+    expect(() => listApprovals(paths)).not.toThrow();
+    expect(listApprovals(paths)).toHaveLength(1);
   });
 });

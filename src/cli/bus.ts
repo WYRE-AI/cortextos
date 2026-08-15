@@ -1858,49 +1858,122 @@ busCommand
 // list-approvals — was missing from CLI, only available via dashboard
 // ---------------------------------------------------------------------------
 
+const APPROVAL_STATUSES = ['pending', 'approved', 'rejected'] as const;
+
+/** Every org directory under CTX_ROOT — mirrors dashboard syncAll() behaviour. */
+function listOrgDirs(instanceId: string): string[] {
+  const { readdirSync, existsSync } = require('fs');
+  const { join } = require('path');
+  const { homedir } = require('os');
+  const orgsDir = join(homedir(), '.cortextos', instanceId, 'orgs');
+  return existsSync(orgsDir)
+    ? readdirSync(orgsDir, { withFileTypes: true })
+        .filter((d: { isDirectory(): boolean }) => d.isDirectory())
+        .map((d: { name: string }) => d.name)
+    : [];
+}
+
 busCommand
   .command('list-approvals')
-  .description('List pending approval requests')
+  .description('List pending approval requests (--status/--all also reach resolved ones)')
   .option('--format <fmt>', 'Output format: json|text', 'json')
+  .option('--status <status>', `Filter by status: ${APPROVAL_STATUSES.join('|')}`)
+  .option('--all', 'Include resolved approvals, not just pending', false)
   .option('--all-orgs', 'Scan all orgs under CTX_ROOT (matches dashboard view)', false)
-  .action((opts: { format?: string; allOrgs?: boolean }) => {
-    const { listPendingApprovals } = require('../bus/approval.js');
-    const { readdirSync, existsSync } = require('fs');
-    const { join, homedir: _homedir } = require('path');
-    const { homedir } = require('os');
+  .action((opts: { format?: string; status?: string; all?: boolean; allOrgs?: boolean }) => {
+    const { listApprovals, resolveListStatus } = require('../bus/approval.js');
     const env = resolveEnv();
+
+    // Reject an unknown status loudly. Silently returning [] would be
+    // indistinguishable from "no approvals have that status" — the same
+    // false-absence this command was fixed to stop producing.
+    if (opts.status && !(APPROVAL_STATUSES as readonly string[]).includes(opts.status)) {
+      console.error(
+        `Unknown status '${opts.status}'. Valid: ${APPROVAL_STATUSES.join(', ')}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    const effectiveStatus = resolveListStatus(opts.status, opts.all);
 
     let approvals: unknown[] = [];
 
     if (opts.allOrgs) {
-      // Scan every org directory under CTX_ROOT — mirrors dashboard syncAll() behaviour
-      const ctxRoot = join(homedir(), '.cortextos', env.instanceId);
-      const orgsDir = join(ctxRoot, 'orgs');
-      const orgs: string[] = existsSync(orgsDir)
-        ? readdirSync(orgsDir, { withFileTypes: true })
-            .filter((d: { isDirectory(): boolean }) => d.isDirectory())
-            .map((d: { name: string }) => d.name)
-        : [];
-      for (const org of orgs) {
+      for (const org of listOrgDirs(env.instanceId)) {
         const orgPaths = resolvePaths(env.agentName, env.instanceId, org);
-        approvals = approvals.concat(listPendingApprovals(orgPaths));
+        approvals = approvals.concat(listApprovals(orgPaths, effectiveStatus));
       }
     } else {
       const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-      approvals = listPendingApprovals(paths);
+      approvals = listApprovals(paths, effectiveStatus);
     }
 
     if (opts.format === 'text') {
-      if (approvals.length === 0) { console.log('No pending approvals'); return; }
-      for (const a of approvals as Array<{ id: string; title: string; category: string; requesting_agent: string; created_at: string; description?: string; org?: string }>) {
+      const label = effectiveStatus ? `${effectiveStatus} ` : '';
+      if (approvals.length === 0) { console.log(`No ${label}approvals`); return; }
+      for (const a of approvals as Array<{ id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string }>) {
         console.log(`[${a.id}] ${a.title}`);
-        console.log(`  Category: ${a.category} | Agent: ${a.requesting_agent} | Org: ${a.org ?? env.org} | Created: ${a.created_at}`);
+        console.log(`  Status: ${a.status} | Category: ${a.category} | Agent: ${a.requesting_agent} | Org: ${a.org ?? env.org} | Created: ${a.created_at}`);
+        if (a.resolved_at) console.log(`  Resolved: ${a.resolved_at}${a.resolved_by ? ` — ${a.resolved_by}` : ''}`);
         if (a.description) console.log(`  Context: ${a.description}`);
         console.log('');
       }
-      console.log(`Total: ${approvals.length} pending`);
+      console.log(`Total: ${approvals.length} ${label}approval(s)`);
     } else {
       console.log(JSON.stringify(approvals, null, 2));
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// get-approval — point lookup across pending/ AND resolved/.
+//
+// The recovery path for "what happened to the approval I filed?". updateApproval
+// notifies the requesting agent by inbox exactly once; an agent that restarts
+// past that message previously had no way to retrieve the decision, because
+// every CLI read path looked only at pending/ and a decided approval has moved
+// to resolved/. An agent knows its own approval id, so a point lookup — not a
+// list — is what actually closes that hole.
+// ---------------------------------------------------------------------------
+
+busCommand
+  .command('get-approval')
+  .argument('<approval-id>', 'Approval id (e.g. approval_1786668730_wllgx)')
+  .description('Show one approval and its decision, searching pending and resolved')
+  .option('--format <fmt>', 'Output format: json|text', 'json')
+  .option('--all-orgs', 'Search all orgs under CTX_ROOT', false)
+  .action((approvalId: string, opts: { format?: string; allOrgs?: boolean }) => {
+    const { getApproval } = require('../bus/approval.js');
+    const env = resolveEnv();
+
+    const orgs = opts.allOrgs ? listOrgDirs(env.instanceId) : [env.org];
+    let found: { id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; updated_at?: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string } | null = null;
+    for (const org of orgs) {
+      found = getApproval(resolvePaths(env.agentName, env.instanceId, org), approvalId);
+      if (found) break;
+    }
+
+    // Absent from BOTH buckets is the only real "does not exist". Say so on
+    // stderr and exit non-zero so a caller cannot mistake it for a result.
+    if (!found) {
+      console.error(
+        `Approval ${approvalId} not found in pending or resolved` +
+        (opts.allOrgs ? ' (searched all orgs)' : ` for org '${env.org}' — retry with --all-orgs`),
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    if (opts.format === 'text') {
+      console.log(`[${found.id}] ${found.title}`);
+      console.log(`  Status: ${found.status}`);
+      console.log(`  Category: ${found.category} | Agent: ${found.requesting_agent} | Org: ${found.org ?? env.org}`);
+      console.log(`  Created: ${found.created_at}`);
+      if (found.resolved_at) console.log(`  Resolved: ${found.resolved_at}`);
+      if (found.resolved_by) console.log(`  Decision note: ${found.resolved_by}`);
+      if (found.description) console.log(`  Context: ${found.description}`);
+    } else {
+      console.log(JSON.stringify(found, null, 2));
     }
   });
 
