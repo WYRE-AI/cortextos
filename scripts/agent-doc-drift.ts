@@ -292,6 +292,11 @@ function printReport(report: AgentReport): void {
       'A PROPERTY drift means specific template content is MISSING from the deployed file — it is NEVER triggered by an agent\'s own legitimate ' +
       'additions (those are expected and healthy, and this tool does not flag them). A high PROPERTY drift count is a real gap, not noise.',
   );
+  console.log(
+    'CAVEAT (both equality and property checks): comparison is by LINE-SET MEMBERSHIP, not position or count — a clean result does NOT rule out ' +
+      'reordered or duplicated content. A "clean" EQUALITY file could still have a section repeated or moved and this run would not see it ' +
+      '(a duplicated section is the signature artifact of a botched bulk write — do not treat a clean report here as proof a bulk edit landed correctly).',
+  );
   if (report.unexamined.length > 0) {
     console.log(
       `\nUNEXAMINED (${report.unexamined.length} template entr${report.unexamined.length === 1 ? 'y' : 'ies'} not covered by any category — ` +
