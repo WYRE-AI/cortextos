@@ -86,15 +86,20 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   **It was also NOT WEDGED:** it replied within a second every time, session jsonl advancing,
   `type=<synthetic>`. **Every liveness check keyed on "is it responding" reads healthy.** It was
   responding perfectly and doing nothing.
-  **Remedy is RESTART** (verified 3/3: `adoption` 05:51Z, `grower` 05:07Z, `marketing` 13:42Z all
-  recovered) — `model` is unset in every config, so a restart re-resolves off the exhausted Fable-5 pool
-  onto `claude-opus-5`. `maintainer` last restarted `00:28Z`, *before* onset, which is the entire reason
-  it was the only one still dead. **Pool is per-model, NOT shared** (infra) — so a dying agent here is
-  not a fleet leading-indicator.
-  **Discriminator for counting incidence (infra's, adopt it):** `message.model=="<synthetic>" AND
-  isApiErrorMessage`; real errors carry `apiErrorStatus`/`requestId`, an agent merely *discussing* the
-  outage is `type:"queue-operation"`. **A defect-string grep cannot tell a defect from a discussion of
-  it** — infra's second scan counted its own outbound messages about the incident.
+  **Remedy is RESTART — verified 4/4**, all four affected agents recovered by restart and beating after
+  it: `grower` 05:07:00Z, `adoption` 05:51:28Z, `marketing` 13:42:36Z, `maintainer` 13:58:50Z. `model` is
+  unset in every config, so a restart re-resolves off the exhausted Fable-5 pool onto `claude-opus-5`.
+  `maintainer` had last restarted `00:28Z`, *before* onset — the entire reason it was the one that stayed
+  dead for 11h. **Pool is per-model, NOT shared** (infra) — a dying agent here is not a fleet
+  leading-indicator.
+  **Discriminator for counting incidence (infra's — adopt it, and do not use a plain grep):**
+  `message.model=="<synthetic>" AND isApiErrorMessage`; real errors carry `apiErrorStatus`/`requestId`,
+  an agent merely *discussing* the outage is `type:"queue-operation"`. **A defect-string grep cannot tell
+  a defect from a discussion of it.** infra's second scan counted its own outbound messages; and when I
+  re-verified the 4/4 above with a naive grep it returned `marketing`=14 hits / `grower`=3 — **all of
+  them agents writing about the incident, with ZERO real errors under the discriminator.** The naive
+  instrument would have reported three of four agents still failing, *while they were demonstrably
+  healthy and talking to each other about it*. Third time this same instrument misled someone in one day.
 
 - **THE HANG DETECTOR HAS A DETERMINISTIC BLIND SPOT: any agent whose tightest cron interval ≤ `graceMs`
   (15 min) can NEVER be flagged hung.** Not a fail-open that fires under some condition — structural.
