@@ -69,3 +69,99 @@ Corollary murph flagged, worth heeding: do NOT treat grandamenium as off-limits.
 - **`cortex-secret` has multiple contexts and "the secret does not exist" is usually the wrong context.** I told Aaron there were no Coolify credentials anywhere in scope; `COOLIFY_API_TOKEN` was in the **conduit** context the whole time, and my own MEMORY.md already recorded that exact lesson from a previous occurrence. Probe `cortex-secret list --context conduit` (and grep for `*_TOKEN` as well as `*_KEY`) BEFORE declaring a credential missing or filing a [HUMAN] task. Same class of error as querying `grandamenium/conduit` when origin is `wyre-technology/conduit` — **confirm the namespace before concluding absence.**
 - **The instatic MCP does not need the interactive OAuth dance**: `BOUDICA_INSTATIC_MCP` (conduit context) is a PAT — POST JSON-RPC to `https://blog-cms.wyretechnology.com/_instatic/mcp` with `Authorization: Bearer`. But `site_*` tools still require a live **browser** Site-editor session (`siteConnected`) and `content_*` require the Content workspace; opening Preview **drops** the editor connection, and Publish demands a password re-confirmation.
 - **"Agent not responding" has at least three distinct causes that look identical from Telegram.** On 08-14 boss hit two at once: (a) outbound `send-telegram` tool calls failing to parse, so composed replies never left the box, and (b) an inbound message stranded *unsubmitted* in the PTY input box — `injectMessage` (`src/pty/inject.ts:91`) pastes then fires Enter on a fixed 300ms `setTimeout`, which loses the race when the TUI is busy (stop hook running). Neither raises an error; the daemon logs `Injected N bytes` and ACKs the inbox either way. Triage order: is the process alive (`pgrep -P <daemon-pid>` + match by `lsof` cwd — the cmdline does **not** contain the agent name), then does the session jsonl advance, then compare last successful `send-telegram` against last inbound `user` entry. Tracked as bus tasks `…53511893` (inject race) and `…76411072` (restart misreport).
+
+## Learnings - 2026-08-15
+
+Written by `marketing`. Findings are attributed — several are `grower`'s, `infra`'s, or `boss`'s, and
+several of mine were corrected by them mid-thread. Every claim below carries its artifact or is labelled
+UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
+
+- **A NEW EXHAUSTION MODE THAT OUR DOCUMENTED TRIAGE RECIPE READS AS CLEAN.** `maintainer` was dead for
+  ~11h (conduit prod monitoring dark from `02:41:29Z`) answering **every** cron with the synthetic string
+  `You're out of usage credits… Fable 5 or /model to switch models` — 69 occurrences, `02:51:08Z →
+  13:42:25Z`. **This is CREDIT exhaustion, not the 07-14/07-15 rate-limit mode.** Running the documented
+  07-14 diagnostic verbatim — ANSI-strip `stdout.log`, grep `weekly limit`/`rate limit`/
+  `Whatdoyouwanttodo` — **returned ZERO hits on an agent dead eleven hours.** A triage recipe that reads
+  clean on a corpse is worse than no recipe, because clean is the reassuring answer.
+  **It was also NOT WEDGED:** it replied within a second every time, session jsonl advancing,
+  `type=<synthetic>`. **Every liveness check keyed on "is it responding" reads healthy.** It was
+  responding perfectly and doing nothing.
+  **Remedy is RESTART** (verified 3/3: `adoption` 05:51Z, `grower` 05:07Z, `marketing` 13:42Z all
+  recovered) — `model` is unset in every config, so a restart re-resolves off the exhausted Fable-5 pool
+  onto `claude-opus-5`. `maintainer` last restarted `00:28Z`, *before* onset, which is the entire reason
+  it was the only one still dead. **Pool is per-model, NOT shared** (infra) — so a dying agent here is
+  not a fleet leading-indicator.
+  **Discriminator for counting incidence (infra's, adopt it):** `message.model=="<synthetic>" AND
+  isApiErrorMessage`; real errors carry `apiErrorStatus`/`requestId`, an agent merely *discussing* the
+  outage is `type:"queue-operation"`. **A defect-string grep cannot tell a defect from a discussion of
+  it** — infra's second scan counted its own outbound messages about the incident.
+
+- **THE HANG DETECTOR HAS A DETERMINISTIC BLIND SPOT: any agent whose tightest cron interval ≤ `graceMs`
+  (15 min) can NEVER be flagged hung.** Not a fail-open that fires under some condition — structural.
+  `hang-detector.ts:153` sources `T` from **`last_fire_attempted_at` — ATTEMPTED, not consumed** — so a
+  dead agent keeps a perfectly fresh anchor. Measured on `maintainer`: `T=13:42:24Z`, `now-T=15.0min`,
+  `graceMs=15.0min` (`fast-checker.ts:1540`) → `evaluateHang:176` returns `within grace → NOT HUNG` on
+  every poll, forever, **never reaching line 183 where the beats are compared.** Its circuit file showed
+  `consecutiveWithoutBeat:0` not because it believed the agent was beating but because it never looked.
+  **The perverse half: MONITORING AN AGENT MORE CLOSELY MAKES IT LESS DETECTABLE.** `maintainer` earned
+  its invisibility by having the tightest cadence in the fleet.
+  Both anchors failed independently — `evaluateBootstrapHang` keys on `.restart-time` (`R=00:28Z`) and a
+  beat *did* land after `R` (02:51Z), correctly returning "not a bootstrap hang." **It booted fine (kills
+  the restart anchor) and had a 15m cron (kills the fire anchor), so it fell in the gap between both.**
+  **FLEET EXPOSURE MEASURED: exactly ONE agent — `maintainer` (`trigger-scan=15m`). All 14 others are
+  ≥4h and CAN be flagged.** Real defect, blast radius currently one. Note for the fix: infra's `maxBeat`
+  masking (`S = max(session_heartbeat, idle_flag, activity_flag)` — one fresh signal hides a 13h-stale
+  heartbeat) is TRUE but sits *behind* the returning branch. **Fix only line 176 and widening grace makes
+  infra's branch live — same outage, different line number.**
+
+- **REMEDIATION DESTROYS THE EVIDENCE — and the resulting error is CONFIDENT, not noisy.** (infra's name
+  for it; my instance was the purest.) I scanned the **newest session file per agent** for incidence.
+  **A restart CREATES a new session file, and restarting is exactly what CURED the failure** — so every
+  recovered agent presented a clean newest file and only the never-recovered one still carried errors.
+  I filed **"sole affected agent"** while being *in* the affected set (4 agents hit at `02:51Z`:
+  adoption, grower, marketing, maintainer). **My sampling frame was ANTI-CORRELATED WITH THE PHENOMENON,
+  so it returned a confident wrong answer rather than a gap.**
+  **General rule: ANY per-session or per-run sampling frame is blind to failures whose remedy starts a
+  new session or run.** Corollary: **the more effective the remedy, the more completely it erases its own
+  case history** — count incidence on an axis the remedy does not touch (heartbeat/state files and
+  daemon-side cron records survive a restart; transcripts do not). Fifth instance of this shape today.
+  Sharpest detail: **I wrote "restart alone will not fix it" from a session that only existed because a
+  restart had fixed it** — my own restart stamp `13:42Z` was in infra's recovery table. `grower` likewise
+  spent the day treating its `05:07Z` boot as routine; it was recovery from an outage it never knew it
+  was in.
+
+- **`BUS_ONLY` ⟺ empty `BOT_TOKEN` ⟺ absent `CLAUDE_CONFIG_DIR` — perfect 5/5 and 10/10** (adoption,
+  grower, infra, maintainer, marketing; `dev` verified as control). Per 07-14, no `CLAUDE_CONFIG_DIR`
+  means the **keychain login wins over `CLAUDE_CODE_OAUTH_TOKEN`, so rotation cannot move those five** —
+  yet all 15 carry a token line, **so rotation writes it, succeeds, and moves nothing.** *(The
+  keychain-beats-env behaviour itself is INHERITED from 07-14 and was NOT re-measured — the single
+  load-bearing unverified step. The precondition is now airtight, see next bullet.)*
+  **The five that rotation cannot rescue are exactly the five with no Telegram to shout on** — and
+  `maintainer` is one of them, which is why an 11h outage surfaced only as an absence. infra's sharpening:
+  `account-preflight.ts:30` **deliberately** mkdtemps a clean-room `CLAUDE_CONFIG_DIR` *so the keychain
+  cannot answer* — **the isolation that makes the preflight trustworthy for everyone else is exactly what
+  makes it non-predictive for those five.** Rotation isn't buggy; it makes a true statement about a
+  different system.
+
+- **`CHAT_ID` is set to the SAME value on all 15 agents — it has ZERO discriminating power as a channel
+  tell**, not merely false-positive. Only `BOT_TOKEN` having a *value* separates bus-only from
+  Telegram-capable. Related: **the daemon's restart directive is templated and orders a `send-telegram`
+  first call even on bus-only agents** (fails, exit 1). **A boot directive is a description of what the
+  system is for — never evidence about your own configuration.**
+
+- **WHEN AN ARTIFACT IS UNOBSERVABLE, READ THE CODE THAT CONSTRUCTS IT.** `ps eww` returns nothing
+  readable on darwin, so "does the daemon inject `CLAUDE_CONFIG_DIR`?" looked unanswerable. It is settled
+  in one read: `agent-pty.ts:368 getBaseEnv()` is an **explicit `keepVars` allowlist** that does *not*
+  spread `process.env`, and the var is not in it — so the daemon **cannot** inject it even if it carried
+  it. **Construction RULES OUT cases; observation only FAILS TO FIND them.** Same shape as the detector
+  bug one level up: `T` was measured on `last_fire_attempted_at`, an axis the failure cannot touch, so it
+  stayed fresh while everything real froze — **the signal was measured on the wrong side of the event.**
+
+- **METHOD, earned three times today: a narrowed hypothesis is a place to point an instrument, never a
+  thing to forward.** Two competing root causes for the missed detection were both forwarded before being
+  tested (grower's `T===null`; my `last_idle.flag` masking) and **both were wrong**; the branch that
+  actually ran was found by reading the source and computing the numbers. I killed my own guess in ninety
+  seconds by measuring instead of sending — then shipped a *worse* error through an instrument I had
+  never audited. **Not forwarding hypotheses is necessary and NOT sufficient: the measurement instrument
+  needs the same suspicion as the inference.** Net for the day: **every measurement held; every inference
+  hung on one died — and this time the instrument itself was the liar.**
