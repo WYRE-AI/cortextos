@@ -5,6 +5,7 @@ import { join } from 'path';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
+import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
@@ -74,10 +75,11 @@ busCommand
   .command('send-message')
   .argument('<to>', 'Target agent')
   .argument('<priority>', 'Message priority (urgent, high, normal, low)')
-  .argument('<text>', 'Message text')
+  .argument('[text]', 'Message text. Omit to read the body from stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical.')
   .argument('[reply-to]', 'Reply to message ID (optional positional form)')
   .option('--reply-to <id>', 'Reply to message ID')
-  .action((to: string, priority: string, text: string, replyToArg: string | undefined, opts: { replyTo?: string }) => {
+  .option('--body-file <path>', 'Read the message body from a file instead of the shell argument or stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical')
+  .action((to: string, priority: string, text: string | undefined, replyToArg: string | undefined, opts: { replyTo?: string; bodyFile?: string }) => {
     // Accept reply-to as either positional arg or --reply-to flag (P2 fix #9)
     const effectiveReplyTo = opts.replyTo ?? replyToArg;
     const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
@@ -85,6 +87,21 @@ busCommand
       console.error(`Invalid priority '${priority}'. Must be one of: ${validPriorities.join(', ')}`);
       process.exit(1);
     }
+    // Fail-closed body resolution (2026-08-15 fleet incidents — see
+    // src/utils/resolve-message-body.ts): --body-file/stdin are the safe
+    // default path; an inline body containing a surviving backtick/$( is
+    // rejected loud rather than sent with silently-substituted holes in it.
+    let resolvedText: string;
+    try {
+      resolvedText = resolveMessageBody({ inlineText: text, bodyFile: opts.bodyFile });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
+    text = resolvedText;
     // Security (H9): Validate agent name (bare or qualified) before any filesystem access.
     // parseQualifiedName accepts both "boss" and "aaron/dev" forms, validating each segment.
     try {
@@ -152,18 +169,32 @@ busCommand
   .command('create-task')
   .argument('<title>', 'Task title')
   .option('--desc <description>', 'Task description')
+  .option('--desc-file <path>', 'Read the task description from a file instead of --desc — the safe way to include backticks, $(, or apostrophes byte-identical')
   .option('--assignee <agent>', 'Assigned agent')
   .option('--priority <p>', 'Priority (urgent, high, normal, low)', 'normal')
   .option('--project <name>', 'Project name')
   .option('--needs-approval', 'Require human approval before execution')
   .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
   .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
-  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+  .action((title: string, opts: { desc?: string; descFile?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+    // Fail-closed body resolution (2026-08-15) — same construction that
+    // corrupts a send-message body corrupts --desc: a description is
+    // free text through the identical double-quoted shell argument.
+    let resolvedDesc: string | undefined;
+    try {
+      resolvedDesc = resolveOptionalTextField({ inlineText: opts.desc, bodyFile: opts.descFile, fileFlagName: '--desc-file' });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
     const taskId = createTask(paths, env.agentName, env.org, title, {
-      description: opts.desc,
+      description: resolvedDesc,
       assignee: opts.assignee,
       priority: opts.priority as Priority,
       project: opts.project,
@@ -325,9 +356,23 @@ busCommand
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
   .option('--result <text>', 'Completion result')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string }) => {
+  .option('--result-file <path>', 'Read the completion result from a file instead of the argument/--result — the safe way to include backticks, $(, or apostrophes byte-identical')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; resultFile?: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
-    const effectiveResult = opts.result ?? resultArg;
+    const inlineResult = opts.result ?? resultArg;
+    // Fail-closed body resolution (2026-08-15) — same construction that
+    // corrupts a send-message body corrupts a completion result: free
+    // text through the identical double-quoted shell argument.
+    let effectiveResult: string | undefined;
+    try {
+      effectiveResult = resolveOptionalTextField({ inlineText: inlineResult, bodyFile: opts.resultFile, fileFlagName: '--result-file' });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
@@ -1110,11 +1155,25 @@ busCommand
   .command('send-telegram')
   .description('Send a message to a Telegram chat')
   .argument('<chat-id>', 'Telegram chat ID')
-  .argument('<message>', 'Message text (supports Telegram Markdown unless --plain-text is set)')
+  .argument('[message]', 'Message text (supports Telegram Markdown unless --plain-text is set). Omit to read the body from stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical.')
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
+  .option('--body-file <path>', 'Read the message body from a file instead of the shell argument or stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical')
+  .action(async (chatId: string, message: string | undefined, opts: { image?: string; file?: string; plainText?: boolean; bodyFile?: string }) => {
+    // Fail-closed body resolution (2026-08-15 fleet incidents — see
+    // src/utils/resolve-message-body.ts): --body-file/stdin are the safe
+    // default path; an inline body containing a surviving backtick/$( is
+    // rejected loud rather than sent with silently-substituted holes in it.
+    try {
+      message = resolveMessageBody({ inlineText: message, bodyFile: opts.bodyFile });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
