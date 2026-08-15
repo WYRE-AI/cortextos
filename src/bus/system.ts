@@ -577,6 +577,19 @@ export interface BuildDrift {
 
 export interface DeployDriftReport {
   status: 'clean' | 'drift' | 'error';
+  /**
+   * WHICH drift is present. `status` deliberately collapses both so a cron can
+   * alert on one field (see checkDeployDrift's docstring) — but the two have
+   * OPPOSITE remedies, so a consumer that acts must read this, not `status`.
+   *
+   * - `pull`  — main has something the tree does not. Benign. Fix: pull, then build.
+   * - `build` — dist has something main does not, or is behind it. Fix: build.
+   * - `both`  — pull-and-build, as one action; the gap between the steps is the exposure.
+   *
+   * Added after 2026-08-15, where a cron offered a rebuild for pull drift in the
+   * language of restoring sync. It was right that day by accident.
+   */
+  drift_kind?: 'pull' | 'build' | 'both';
   checked_at: string;
   pull_drift?: PullDrift;
   build_drift?: BuildDrift;
@@ -695,7 +708,33 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
       const stale = shaMismatch || builtDirty;
       let reason: string | undefined;
       if (shaMismatch) {
-        reason = 'dist/ was built from a different commit than local HEAD — run npm run build';
+        // BEHIND vs DIVERGENT — same symptom, very different situations, and
+        // until 2026-08-15 both produced the identical "run npm run build".
+        // If built_sha is an ANCESTOR of HEAD, dist is merely old: everything
+        // in it is reviewed code that was on main. If it is NOT an ancestor,
+        // dist was built from a commit that is not in this history at all —
+        // a branch checked out in the shared tree — so the fleet is running
+        // code nobody chose to deploy. Asked of git rather than by comparing
+        // symbols: a name-based probe against a minified bundle collides
+        // (`hasTelegram` matching `hasTelegramMessage` cost an hour that day).
+        let ancestor: boolean | null = null;
+        // Shape-guard before interpolation: builtSha is read from a file on
+        // disk, so it is not trusted input for a shell string. A non-SHA value
+        // leaves ancestor null and falls through to the neutral wording.
+        if (builtSha && /^[0-9a-f]{7,40}$/.test(builtSha)) {
+          try {
+            execSync(`git merge-base --is-ancestor ${builtSha} HEAD`, execOpts);
+            ancestor = true;
+          } catch {
+            // Non-zero means "not an ancestor" — but it also means "unknown
+            // commit" (a build from a branch since deleted/pruned). Both are
+            // divergent provenance for this purpose; neither is plain staleness.
+            ancestor = false;
+          }
+        }
+        reason = ancestor === false
+          ? `dist/ was built from a different commit than local HEAD — ${builtSha} is NOT an ancestor of HEAD, so dist contains code that is not in this history (a branch build in the shared tree, or a commit since pruned). Verify what is in it BEFORE rebuilding; a rebuild silently discards it.`
+          : 'dist/ was built from an earlier commit than local HEAD — dist is behind; run npm run build';
       } else if (builtDirty) {
         reason = 'dist/ was built from a dirty working tree (uncommitted changes present at build time) — commit or stash, then run npm run build';
       }
@@ -718,8 +757,15 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
     }
   }
 
+  const drift_kind: DeployDriftReport['drift_kind'] =
+    pull_drift.behind && build_drift.stale ? 'both'
+      : pull_drift.behind ? 'pull'
+        : build_drift.stale ? 'build'
+          : undefined;
+
   return {
     status: (pull_drift.behind || build_drift.stale) ? 'drift' : 'clean',
+    ...(drift_kind ? { drift_kind } : {}),
     checked_at,
     pull_drift,
     build_drift,
