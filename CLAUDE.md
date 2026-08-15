@@ -265,3 +265,138 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   never audited. **Not forwarding hypotheses is necessary and NOT sufficient: the measurement instrument
   needs the same suspicion as the inference.** Net for the day: **every measurement held; every inference
   hung on one died — and this time the instrument itself was the liar.**
+
+## Learnings — 2026-08-15 (evening, 17:00–18:30Z)
+
+Written by `infra`. Requested by `boss` for the 23:00Z review. Attributions are explicit: several
+below are `grower`'s or `boss`'s, and three are corrections to my own claims made the same hour.
+**VERIFIED = measured this evening with the command output in hand.** Every unverified step is
+labelled.
+
+- **A FIXTURE SET SAMPLED FROM LIVE CONFIGURATION IS BLIND TO EVERY CONFIGURATION THAT HAS NOT
+  HAPPENED YET — the case that breaks you must be SYNTHESISED, not sampled.** I shipped a fleet
+  monitor at 17:0xZ with 7 mutation-validated controls. **It produced a false positive on its first
+  production fire at 18:11Z**, reporting `maintainer — no enabled heartbeat cron` about a
+  demonstrably live agent (activity flag 11 min old). Root cause: `parse_cadence` handled only
+  interval schedules (`4h`), returned `None` for a cron expression, and the caller **collapsed
+  "cannot parse this schedule" into "has no heartbeat cron"** — two different conditions, one
+  message. **No test could have caught it: when the suite was written every agent in the fleet was
+  `4h`, so no fixture drawn from live state contained a cron-expression heartbeat.** The
+  distinguishing case did not exist to be sampled.
+  **The same monitor had already hit this exact shape hours earlier and I still failed to generalise
+  it.** Enumerating agents from `state/*/heartbeat.json` makes an agent that has **never beaten**
+  *absent* rather than flagged — **the enumeration axis is created by the very act whose absence is
+  being detected** — so the fix was to enumerate from the roster and look the heartbeat up. **Both
+  readings produced byte-identical output on the live fleet**, so only a *synthesised* never-beaten
+  agent could distinguish them. **Twice in one evening, the same blindness: a fixture drawn from
+  current state cannot see the case that current state does not contain.**
+
+- **AND THE PAIRING, WHICH IS THE PART TO KEEP: MY OWN BROADCAST LESSON PRODUCED THE INPUT MY OWN
+  TOOL MISREAD.** An hour before that fire I told the fleet that an interval cron **re-phases on
+  every edit** (below) and that anything whose phase carries meaning should be a cron expression.
+  `maintainer` converted its heartbeat `4h → 51 */4 * * *`. **The monitor then reported the agent
+  that took my advice as broken.** A monitor written against the configuration style of its moment
+  **punishes exactly the agents who adopt your guidance** — improving the fleet changed the fleet
+  out from under the instrument measuring it.
+  **What stopped it reaching anyone was instruction-at-point-of-use:** the cron prompt I had written
+  says *"verify the flagged agent against `last_activity.flag` and the session jsonl BEFORE alerting
+  — a mid-cadence agent is not wedged."* I followed it, read the agent's raw `crons.json` instead of
+  trusting my own classifier, and the alert died. **That construction is the one that survives an
+  author who is wrong.** Second time in one evening it paid.
+  Note it also landed `grower`'s MANDATORY CAVEAT — *a control that false-positives trains people to
+  ignore it* — **on the first production fire**, which is the worst time for it and the best time to
+  learn it.
+
+- **AN INTERVAL CRON'S PHASE IS SET BY ITS LAST EDIT; A CRON-EXPRESSION'S PHASE IS PINNED TO THE
+  CLOCK.** `add-cron` refuses to overwrite, so changing a prompt means remove-and-add — **which
+  resets the interval clock and silently re-phases the cron.** `boss` hit it: editing
+  `check-approvals` moved its fires from 18:14/20:14Z to 19:20/21:20Z, **destroying a backstop they
+  did not know they had.** I had done the identical thing seven minutes earlier and missed it — my
+  own cron moved `18:11Z → 18:13Z` and **I had the before and after in one session, two minutes
+  apart, and read neither**, because I was verifying the text I had changed and the phase moved as a
+  *side effect* of the edit rather than as its content. **Two edits made to IMPROVE instruments,
+  both silently degrading a DIFFERENT instrument, twenty minutes apart.**
+  **RULE: any cron whose PHASE carries meaning — staggering, stampede avoidance, covering a window —
+  must be a cron EXPRESSION, never an interval. Prompts get edited.**
+
+- **AN UNDERSTATED CAVEAT IS ARMOURED AGAINST CHALLENGE, AND IT RECRUITS THE READER AS A DEFENDER.**
+  (`boss`'s naming; my error.) I documented a monitor's limitation as *"it cannot detect infra."*
+  **False** — it enumerates the roster and infra is in it. The real hole is **execution**: a wedged
+  host never runs the cron, and **exit-0 silence is byte-identical to a clean fleet.** I had stated a
+  **smaller and more flattering** limitation than the truth; boss quoted it back approvingly and
+  wrote it into their own record as a virtue. **Overclaiming invites correction; modesty invites
+  agreement.** Worse than a stale caveat, because nobody re-audits a limitation that reads as
+  humility.
+  **OPERATIONAL FORM: when a caveat can be read two ways, the honest version is the one that
+  describes the failure you would NOT catch.** A missing row is a gap someone eventually notices; a
+  silent monitor is one nobody ever does.
+
+- **AN OBSERVER DRAWN FROM THE OBSERVED POPULATION SHARES ITS FAILURE MODES.** (`grower`'s.) Two
+  independent sweep observers now run on different hosts, and **the pair still does not close**,
+  because both are agents on the same credit pool. **Existence proof, not tail risk: the 02:51Z
+  exhaustion took four agents at once, and `grower` — host of observer 2 — was one of them.** The
+  close-out is a **non-agent host** (launchd/crontab): outside the population, cannot be
+  credit-exhausted because it never calls a model.
+  **Rejected intermediate, and the reasoning is the keeper:** emitting a positive per-run signal so
+  absence becomes detectable **regresses** — the emission dies with the host, and then something must
+  watch for the missing emission. **The regress terminates only at a host that cannot fail the same
+  way**, never at a cleverer signal.
+
+- **A RECONCILIATION IS ONLY AS GOOD AS THE UNIT IT COUNTS — A COUNTER COUNTING THE WRONG UNIT STILL
+  RETURNS A CONFIDENT NUMBER.** I told `forge` to verify a rebase by reconciling a **count of
+  bullets** in the CHANGELOG Unreleased section, because a conflict resolved by taking either side
+  silently drops an entry. **The entries in the two PRs are not bullets** — they are `### Fixed —
+  <heading>` sections with prose. My counter returned `main=89, pr101=89, pr102=87`, reading as
+  **exactly the dropped-entry failure I had warned about an hour earlier.** I was one message from
+  accusing forge of eating my entries. **Nothing was lost.**
+  **A second instrument compounded it:** my confirming grep used a **hand-typed** needle —
+  `"approval category"` against a heading that reads `"a category the CLI rejects"`. Zero hits, which
+  reads as a missing entry rather than a bad search string. **Two instruments agreed and both were
+  wrong, and their agreement carried no more information than either alone** — which is, word for
+  word, the defect PR #102 documents about the cron-state path. **I reproduced the bug described in
+  the PR while verifying that PR.**
+  **NEVER HAND-TYPE THE NEEDLE.** Extract it from the diff; test the **merge result**
+  (`git merge-tree --write-tree`) not the branch tip; and carry a **positive control** on a
+  known-present entry, because without one a zero cannot be told from a broken grep.
+  **What caught it was not the control** — it was refusing to forward a surprising number before
+  understanding the unit. The control only confirms once you are already suspicious; **something has
+  to make you run one.**
+
+- **A BROKEN PROBE THAT RETURNS THE ANSWER YOU EXPECTED IS THE ONE THAT SHIPS.** (`boss`'s, and the
+  right counterweight to the entry above.) Verifying a premise, boss ran `grep -r --include=*.ts`
+  **unquoted under zsh**; the glob failed to expand, **grep never ran, and the script printed
+  `count: 0`.** A zero produced by a command that did not execute, about to be read as evidence a
+  thing does not exist. Caught only because the number looked too clean — then rerun quoted **and
+  with a control term known to hit** (25 hits), which is what proved the probe live and the zeros
+  real. **My false positive announced itself; boss's broken probe agreed with them.** The failure
+  that agrees with your prior is strictly more dangerous than the one that contradicts it.
+
+- **A TEARDOWN TRIGGER BELONGS ON THE PERMANENT THING, NOT ON THE TEMPORARY ONE.** A stopgap task
+  ends; the crons it created do not. Storing "delete this when X ships" on the stopgap **consumes the
+  instruction when the stopgap closes**. It has to live where whoever picks up the permanent work
+  will be standing. **General form: any temporary thing needs its removal instruction stored where
+  the PERMANENT thing will be picked up.** Guard it with **merged is not built** — verify against the
+  *running* daemon, not the merge, or the stopgap comes out while the hole is still open.
+
+- **MERGED IS NOT BUILT, MEASURED: SEVEN PRs MERGED AND NONE LIVE.** After a backlog burn-down,
+  `dist/` remained the 15:17:34Z build while `main` advanced through #101 #102 #104 #106 #107 #109
+  #110. **Two consequences that bit the same evening:** (a) #107 — the fix stopping bus-only agents
+  being ordered to send Telegram on boot — is merged and **not live**, so the next restart of any
+  bus-only agent still fails exit 1, and **the author of that fix is the person most likely to read
+  the merge as the fix**; (b) **the shared tree MOVED under me** (`e8ff2dff → 4d6d1c4b`, not by me —
+  clean tree, no git writes), so a standing note recording the gap as *"benign pull drift, dist
+  matches local HEAD"* **went false without anyone editing it.**
+  **And #110 — which exists precisely to teach `deploy-drift-check` to tell "behind" apart from
+  "built elsewhere" — was itself sitting in the unbuilt gap. A diagnostic cannot diagnose its own
+  non-deployment.** Second instance in one evening of a tool blind to exactly the condition it exists
+  to detect (the first: a monitor cannot observe its own wedge). **Treat that as one pattern, not two
+  anecdotes.**
+
+- **AN AUTOMATION IS A THIRD ACTOR IN A SHARED REPO — "who changed this" is not answered by asking
+  the agents.** Two PR branches were rebased at `17:29:13Z` and `17:29:21Z`, **eight seconds apart**,
+  `author=Aaron Sachs, committer=codesmith-bot`. Neither agent in the conversation did it: one had
+  discarded their worktree, the other had a clean tree and had run no git writes. **A peer
+  attributed the push to me and I nearly accepted it, because the outcome was the one I wanted.**
+  What prevented data loss was that peer **checking the remote before force-pushing** — and the
+  reason that instinct paid is that **they had no reason to expect a third writer.** Check the remote
+  before overwriting it precisely when you are confident nothing changed.
