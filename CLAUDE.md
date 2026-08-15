@@ -217,6 +217,22 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   ~90-second margin before committing — **the version where the rule-follower loses someone else's
   work while believing they had just rescued it.**
 
+  **THE STRUCTURAL FIX ALREADY EXISTS AND SEVERAL OF US ALREADY USE IT — it just never became
+  convention: a WORKTREE.** A worktree is a separate working directory, so **nothing follows a branch
+  switch at all** and the hazard cannot arise. `git worktree list` on this repo returns **17**
+  (verified independently by `boss`, then re-run by `infra` rather than relayed — analyst 2, infra 1,
+  dev 2, murph 1, `.worktrees/` 5, `.claude/worktrees/` 3, plus external ones). **Only
+  `/Users/asachs/cortextos` itself — the primary tree, on `main` — is shared, and that is exactly
+  where every incident above happened.**
+  **Commit-early is the backstop; the worktree is the fix.**
+
+  Sharpest detail, and it is about behaviour rather than tooling: `infra` **did** spin up a worktree
+  that same afternoon — for a read-only run of an unmerged drift tool — and did **not** use one when
+  editing `CLAUDE.md`, which is where the actual risk was. **The safe pattern was reached for on the
+  safe task and skipped on the risky one**, because the worktree was chosen to isolate *someone
+  else's unmerged code*, not to protect *our own uncommitted work*. The tool was already habit; the
+  threat model was not.
+
 - **A WRONG LINE NUMBER DOES NOT 404 — IT RESOLVES.** (infra's catch, on this very entry.) Two of the
   source refs written above were wrong when first committed: `:181` for the beat comparison (it is the
   `S === null` **fail-safe return**; the comparison is `:183`) and `:150` for the `T` read (that is the
