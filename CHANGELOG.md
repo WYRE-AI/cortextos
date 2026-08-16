@@ -2,6 +2,57 @@
 
 ## [Unreleased]
 
+### Fixed — editing a cron's prompt silently re-phased it
+
+`computeReferenceMs` (`src/daemon/cron-scheduler.ts`) took `Math.max` over
+`created_at` **and** every fire record, so a freshly-stamped `created_at`
+always won. Its own docblock four lines above already stated the correct
+rule — *"created_at anchors a cron that has NEVER fired"* — which the code
+did not implement.
+
+That combination is only reachable through a prompt edit, and a prompt edit
+always reaches it. `add-cron` refuses to overwrite an existing name, so the
+only way to change a prompt is remove-then-add; `handleAddCron`
+(`src/daemon/ipc-server.ts:419`) stamps a fresh `created_at` on every add;
+and `removeCron` (`src/bus/crons.ts:228`) deletes only the `crons.json`
+entry, leaving `cron-state.json`'s `last_fire` — the real phase anchor —
+intact but outvoted.
+
+An interval cron's phase is invisible state that carries real meaning:
+staggering paired observers, avoiding a stampede, covering a specific
+window. Nothing announced the change — the listing still showed the same
+schedule, the same enabled flag and the same count. Two measured incidents
+on 2026-08-15: `check-approvals` moved 18:14/20:14Z → 19:20/21:20Z, losing
+coverage of a window it had been covering and forcing a one-shot backstop;
+a sweep cron moved 18:11Z → 18:13Z unnoticed.
+
+Two halves, and the first is the load-bearing one:
+
+1. **`removeCron` now leaves a tombstone.** Before deleting the entry it
+   persists the cron's last fire to `state/<agent>/cron-state.json` — a file
+   that lives outside `crons.json`, that the scheduler already reads and
+   threads through as `stateFire`, and that is written here through its
+   existing writer so the record shape stays identical to the one
+   `bus update-cron-fire` produces. Best-effort: a cron must still be
+   removable if the tombstone cannot be written.
+2. **`created_at` is now a fallback, not a candidate** in
+   `computeReferenceMs`, so the surviving fire record actually wins over the
+   fresh stamp. Never-fired anchoring (`10e3011f`) is unchanged; the only
+   behavioural difference is `created_at` newer than every fire record.
+
+Known and accepted edge: a name deleted permanently and recreated much later
+inherits the old anchor, so an interval cron computes a next-fire in the past
+and takes **one** catch-up fire before re-phasing to now. Bounded and
+self-correcting, and it cannot arise for cron expressions, whose phase is
+pinned to the wall clock.
+
+Two notes for anyone reading the original bug report, both wrong there:
+the proposed fix "preserve `created_at` on re-add" is **not implementable**
+(`removeCron` deletes the entry, so nothing survives to inherit from), and
+`bus update-cron` is **not** a fix anyone shipped for this — it landed in
+`dad07797`, the original external-crons feature, and was available the
+whole time. It remains the right way to edit a prompt.
+
 ### Fixed — a task lookup and an inbox check both reported "nothing there" when they meant "I did not look"
 
 `findTaskFile` returned `null` both when it had scanned every candidate

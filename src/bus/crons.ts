@@ -19,6 +19,7 @@ import { join, dirname } from 'path';
 import type { CronDefinition, CronExecutionLogEntry } from '../types/index.js';
 import { CRONS_DIRECTORY, CRONS_FILENAME, cronExecutionLogPathFor } from './crons-schema.js';
 import { atomicWriteSync } from '../utils/atomic.js';
+import { updateCronFire } from './cron-state.js';
 import { withFileLockSync } from '../utils/lock.js';
 
 // ---------------------------------------------------------------------------
@@ -232,8 +233,43 @@ export function removeCron(agentName: string, name: string): boolean {
     if (idx === -1) {
       return false;
     }
+    const doomed = existing[idx];
     const updated = [...existing.slice(0, idx), ...existing.slice(idx + 1)];
     writeCrons(agentName, updated);
+
+    // Leave the fire record behind as a tombstone before the definition goes.
+    //
+    // `add-cron` refuses to overwrite an existing name, so editing a cron's
+    // prompt is remove-then-add — and deleting the crons.json entry takes
+    // last_fired_at / last_fire_attempted_at with it. Without this the re-added
+    // cron has no fire history at all, so computeReferenceMs falls back to the
+    // freshly-stamped created_at and the cron silently re-phases off the edit
+    // (2026-08-15: check-approvals 18:14/20:14Z -> 19:20/21:20Z, losing a
+    // window it had been covering; a sweep cron 18:11Z -> 18:13Z unnoticed).
+    //
+    // cron-state.json is where a fire survives a definition: it lives outside
+    // crons.json, the scheduler already reads it and threads it through as
+    // `stateFire`, and this reuses its existing writer so the record shape is
+    // identical to the one `bus update-cron-fire` produces — one writer, one
+    // shape, not a second parallel format.
+    //
+    // Known and accepted edge: a name deleted permanently and recreated much
+    // later inherits the old anchor, so an interval cron computes a next-fire
+    // in the past and takes ONE catch-up fire before re-phasing to now. Bounded
+    // and self-correcting, and it does not arise for cron expressions, whose
+    // phase is pinned to the wall clock. A time threshold to tell "edit" from
+    // "recreate" would buy less than it costs.
+    const lastFire = doomed.last_fired_at ?? doomed.last_fire_attempted_at;
+    if (lastFire) {
+      try {
+        const ctxRoot = process.env.CTX_ROOT ?? process.cwd();
+        updateCronFire(join(ctxRoot, 'state', agentName), name, doomed.schedule, lastFire);
+      } catch {
+        // Best-effort: a cron must still be removable if the tombstone cannot
+        // be written. Losing the phase is strictly better than a remove that
+        // fails, which is what the caller actually asked for.
+      }
+    }
     return true;
   });
 }

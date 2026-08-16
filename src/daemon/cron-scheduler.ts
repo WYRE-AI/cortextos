@@ -239,19 +239,34 @@ export interface NextFireReferenceInputs {
  * scheduler, every query for the CLI/dashboard), which can make an interval
  * close to (or longer than) how often this gets recomputed structurally
  * never actually arrive.
+ *
+ * created_at is therefore a FALLBACK, not a candidate: once any fire is on
+ * record that fire is the authoritative phase anchor and created_at must not
+ * compete with it in the max. Editing a cron's prompt is remove-then-add
+ * (add-cron refuses to overwrite an existing name), handleAddCron stamps a
+ * fresh created_at on every add, and removeCron leaves cron-state.json's
+ * last_fire intact — so including created_at unconditionally meant a prompt
+ * edit presented a brand-new timestamp that won the max and silently
+ * re-phased the cron. An interval cron's phase is invisible state that
+ * carries real meaning (staggering paired observers, stampede avoidance,
+ * covering a window), and nothing in the CLI output announced the change:
+ * the listing still read the same schedule, enabled, and count.
  */
 export function computeReferenceMs(inputs: NextFireReferenceInputs, now: number): number {
-  const candidates: number[] = [];
-  const push = (iso: string | undefined) => {
-    if (!iso) return;
+  const toMs = (iso: string | undefined): number | undefined => {
+    if (!iso) return undefined;
     const ms = new Date(iso).getTime();
-    if (!isNaN(ms)) candidates.push(ms);
+    return isNaN(ms) ? undefined : ms;
   };
-  push(inputs.createdAt);
-  push(inputs.lastFiredAt);
-  push(inputs.lastFireAttemptedAt);
-  push(inputs.stateFire);
-  return candidates.length > 0 ? Math.max(...candidates) : now;
+
+  const fires = [inputs.lastFiredAt, inputs.lastFireAttemptedAt, inputs.stateFire]
+    .map(toMs)
+    .filter((ms): ms is number => ms !== undefined);
+
+  if (fires.length > 0) return Math.max(...fires);
+
+  const created = toMs(inputs.createdAt);
+  return created !== undefined ? created : now;
 }
 
 /**

@@ -51,20 +51,27 @@ export function readCronState(stateDir: string): CronStateFile {
 }
 
 /**
- * Record that a cron just fired. Creates or updates the entry for `cronName`.
+ * Record that a cron fired. Creates or updates the entry for `cronName`.
  * Called by agents via `cortextos bus update-cron-fire <name> --interval <interval>`.
+ *
+ * `at` overrides the recorded timestamp, which is what `removeCron` uses to
+ * leave a tombstone: the fire being recorded there already happened, so
+ * stamping it "now" would be a fabrication AND would defeat the purpose —
+ * the whole point is to carry the ORIGINAL phase across the delete.
  */
 export function updateCronFire(
   stateDir: string,
   cronName: string,
   interval?: string,
+  at?: string,
 ): void {
   ensureDir(stateDir);
   const state = readCronState(stateDir);
   const now = new Date().toISOString();
+  const lastFire = at ?? now;
 
   const idx = state.crons.findIndex(r => r.name === cronName);
-  const record: CronFireRecord = { name: cronName, last_fire: now, ...(interval ? { interval } : {}) };
+  const record: CronFireRecord = { name: cronName, last_fire: lastFire, ...(interval ? { interval } : {}) };
 
   if (idx === -1) {
     state.crons.push(record);
