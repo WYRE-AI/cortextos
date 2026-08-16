@@ -168,6 +168,35 @@ land, so it could never present as a silent loss), and the **stale-lock steal**
 path is excluded by construction (`STALE_LOCK_MS` 30s exceeds the 5s lock
 timeout, so a steal cannot occur within a single acquisition wait).
 
+### Fixed — the hang sensor's anchor refreshed itself, blinding it to frequent-cron agents
+
+`evaluateHang` was anchored on the most recent `last_fire_attempted_at`.
+That field records the **attempt**, so it keeps advancing whether or not the
+agent is alive to receive the fire. For any agent whose tightest cron
+interval is at or below the 15-minute grace window, `now - T` was therefore
+always within grace: the sensor returned "within grace" on every poll and
+never reached the comparison that decides whether a session beat has landed.
+The anchor refreshed itself faster than the window could expire.
+
+The perverse consequence was that monitoring an agent more closely made it
+*less* detectable. On 2026-08-15 the fleet's tightest-cadence agent (15m)
+went unflagged for 11 hours and escaped only when a fire happened to land
+late.
+
+The anchor is now the most recent fire the agent has already had a full grace
+window to answer. Detection latency becomes bounded by roughly one cron
+interval plus grace regardless of cadence, and agents on infrequent crons are
+unaffected — for a 4h cron the newest fire is virtually always older than
+grace already, so the anchor is identical. The grace window is now a single
+constant feeding both the anchor and the evaluator, since divergence between
+them would silently restore the blind spot.
+
+**This does not detect an agent that is responsive but doing no useful work.**
+That is a different failure — the agent completes a turn every cycle, the
+Stop hook writes `last_idle.flag` unconditionally, and the sensor correctly
+reports it as not wedged. Tracked separately; a test pins that boundary so
+this fix is not misread as closing it.
+
 ### Fixed — the agent pid record went stale on every self-restart
 
 `writeAgentPid` was called by `AgentManager` immediately after

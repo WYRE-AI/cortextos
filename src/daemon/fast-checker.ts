@@ -4,7 +4,18 @@ import { join } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import { readCrons } from '../bus/crons.js';
-import { evaluateHang, evaluateBootstrapHang, mostRecentDeliveredFireMs, hasBeatSinceRestart } from './hang-detector.js';
+import { evaluateHang, evaluateBootstrapHang, mostRecentAnswerableFireMs, hasBeatSinceRestart } from './hang-detector.js';
+
+/**
+ * Grace window for the hang sensors.
+ *
+ * Single source of truth on purpose: it feeds BOTH the fire anchor
+ * (mostRecentAnswerableFireMs) and evaluateHang. If those two ever used
+ * different values the anchor could hand back a fire that evaluateHang then
+ * rejects as within grace, silently restoring the blind spot this constant
+ * was extracted to close.
+ */
+const HANG_GRACE_MS = 15 * 60_000;
 import { isLimitBlocked } from './rotation-manager.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
@@ -1496,7 +1507,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // Sensor inputs (fail-safe: any read error → return, i.e. treated as not-hung).
     let deliveredFireAt: number | null;
     try {
-      deliveredFireAt = mostRecentDeliveredFireMs(readCrons(this.agent.name));
+      // Anchor on the newest fire the agent has ALREADY had grace to answer,
+      // not the newest fire attempted. last_fire_attempted_at advances whether
+      // or not the agent is alive, so anchoring on it means any agent whose
+      // cron interval is <= graceMs keeps a permanently fresh anchor and can
+      // never leave the grace branch. See mostRecentAnswerableFireMs.
+      deliveredFireAt = mostRecentAnswerableFireMs(readCrons(this.agent.name), now, HANG_GRACE_MS);
     } catch { return; }
 
     let lastSessionHeartbeat: number | null = null;
@@ -1537,7 +1553,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     } catch { return; }
 
-    const fireVerdict = evaluateHang({ now, graceMs: 15 * 60_000, deliveredFireAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt });
+    const fireVerdict = evaluateHang({ now, graceMs: HANG_GRACE_MS, deliveredFireAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt });
     if (fireVerdict.hung) {
       if (this.hangSuppressedByLimit()) return;
       this.log(`Hang detected for ${this.agent.name}: ${fireVerdict.reason}`);
@@ -1558,7 +1574,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     } catch { return; }
 
-    const bootVerdict = evaluateBootstrapHang({ now, graceMs: 15 * 60_000, restartAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt });
+    const bootVerdict = evaluateBootstrapHang({ now, graceMs: HANG_GRACE_MS, restartAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt });
 
     // Confirmed recovery: a genuine beat landed at/after this restart, so the loop
     // actually broke — reset the halt counter. Gated on hasBeatSinceRestart (not on
