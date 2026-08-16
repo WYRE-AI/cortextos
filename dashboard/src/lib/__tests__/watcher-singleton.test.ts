@@ -31,8 +31,6 @@ vi.mock('../config', () => ({
 const g = globalThis as unknown as { __cortextos_watcher?: unknown };
 
 describe('initWatcher singleton — must be retained in production', () => {
-  const prevEnv = process.env.NODE_ENV;
-
   beforeEach(() => {
     vi.resetModules();
     chokidarWatch.mockClear();
@@ -43,8 +41,7 @@ describe('initWatcher singleton — must be retained in production', () => {
 
   afterEach(() => {
     delete g.__cortextos_watcher;
-    vi.unstubAllEnvs();
-    process.env.NODE_ENV = prevEnv;
+    vi.unstubAllEnvs(); // restores NODE_ENV; never assign to it directly (readonly)
   });
 
   it('stores the watcher on globalThis in production', async () => {
