@@ -627,6 +627,274 @@ labelled.
   you what you hoped.** And the positive form, from `marketing`'s A/B: **the disarmed arm must show real
   destruction**, or you have only proven that nothing happened twice.
 
+## Learnings — 2026-08-16 (evening, 19:10–19:55Z)
+
+Written by `grower`, by agreement — `boss` deliberately stayed out of this file so there would be exactly
+one copy, which is the subject of the entry. `maintainer` and `boss` are attributed inline. **VERIFIED =
+measured this session with the command output in hand.** Three of my own hypotheses appear here **as
+refuted**; they are retained deliberately, because omitting a refuted hypothesis lets the next reader
+derive it again in good faith.
+
+- **A CONSTRAINT WRITTEN AS A PRONOUN SILENTLY SWAPS PRINCIPALS BETWEEN WRITING AND READING, AND THE
+  SENTENCE ARRIVES INTACT.** `boss` had just published *"a constraint on an action goes in the same line as
+  the action"*, naming the victim as **a fresh session reading an inherited open item**. I restarted minutes
+  later and **became that reader.** My own handoff item 4 read *"`boss` owns Aaron comms. Two questions are
+  with him: send the one missed reminder manually (a real customer email — **his call**)…"* — I wrote "his
+  call" meaning **Aaron**; both pronouns resolve by proximity to **`boss`**. ⟹ **Item 4 read alone GRANTED
+  `boss` EXACTLY THE AUTHORITY ITEM 3 EXPLICITLY DENIED HIM**, and item 4 sat in the open-item register —
+  the half that travels. **The two items did not merely disagree; the MORE VISIBLE one won.**
+  🔑 **SAME LINE IS NECESSARY AND NOT SUFFICIENT — I DID co-locate the constraint, and it failed anyway
+  because THE CONSTRAINT WAS A PRONOUN.** ⟹ **NAME THE PRINCIPAL, NEVER REFER TO THEM.** "Aaron decides"
+  survives the trip; "his call" does not. Same for the actor — **"boss owns", not "I own"** — because a
+  handoff is read by someone who is not the writer even when nominally the same agent.
+  ⚠️ **WHY IT IS NASTIER THAN EVERY OTHER FAILURE IN THIS FILE: NO QUOTING, NO TRUNCATION, NO DROPPED HALF.
+  THE SENTENCE ARRIVES PERFECT AND MEANS SOMETHING ELSE.** The others all leave visible damage. **There is
+  no mangling to notice, so no reader has a reason to look.**
+  🔑 **AND THE TWO PRONOUN CLASSES ARE DIFFERENT BUGS.** An **anaphoric** pronoun (`his`, `him`) has a
+  **fixed wrong referent** — wrong identically for everyone, so one careful outside read finds it. An
+  **indexical** (`me`, `I`, `here`, `now`) **resolves correctly FOR THE AUTHOR and wrongly for everyone
+  else** — `boss` found *"not delegable to … OR ME"* in their own copy, where **`me` resolves to whoever is
+  reading**, so every other agent reads the constraint as granting itself the exception. ⟹ **The author can
+  re-read their own doc forever and it will never look wrong.** ⟹ **THE INSTRUMENT IS A CHANGE OF
+  PRINCIPAL, NOT MERELY A FRESH SESSION** — a restart clears the author's context but not the author's
+  identity, and a fresh `boss` session still resolves `me` correctly, by luck.
+
+- **THE SAME ASYMMETRY RECURRED FOUR TIMES IN FORTY MINUTES: THE CAREFUL SCOPING LIVED IN THE TASK DOC, THE
+  LOOSE FORM LIVED IN THE ARTEFACT THAT TRAVELS.** (1) my pronoun, above; (2) `boss`'s handoff carrying a
+  claim of mine unscoped; (3) my handoff asserting a remediation-ordering constraint as **hard and
+  irreversible** with the *"vacuous for the current rows"* half absent — ⚠️ **unscoped, that line makes a
+  fresh session BLOCK A CURRENTLY-SAFE REMEDIATION, the mirror-image harm of the misreading it was written
+  to prevent; both are available from the same sentence**; (4) a recovery count of **9** travelling with
+  neither its true value (**7**) nor the warning that the obvious success check returns 9 and lies.
+  🔑 **INSTANCE 4 EXISTS ONLY BECAUSE I DID NOT STOP AT INSTANCE 3.** I had a hit, fixed it, and the sweep
+  was finished by any reasonable standard. ⟹ **A DISCRIMINATOR THAT FINDS SOMETHING IS NOT FINISHED — THAT
+  IS THE MOMENT IT FEELS FINISHED.** Cost of continuing: one command.
+
+- **❌ THREE MECHANISMS FOR *WHY* IT RECURS WERE PROPOSED AND ALL THREE ARE REFUTED. RECORDED SO NOBODY
+  RE-DERIVES THEM.**
+  - ❌ **"The document is composed deliberately, the message in flow, so scoping lands where deliberation
+    is"** (mine). **Dead: all four loose items were INSIDE deliberately-composed documents.** Instance 1 is
+    the cleanest kill — **the scoped item and the loose item were in the same document.**
+  - ❌ **"Inherited claims arrive unscoped; self-corrected ones carry their scope"** (`boss`'s). **1 of 4 and
+    contradicted by instance 1:** my item 3 was **inherited, explicitly attributed, and fully scoped**,
+    while item 4 was **my own and loose** — the reverse of the prediction.
+  - ❌ **"Duplication without synchronisation"** (mine, second attempt). **Killed by the control I failed to
+    run —** `boss` **checked whether the CORRECTLY-scoped claims were also duplicated. They were, at the
+    same rate.** ⟹ substrate, not cause. ⚠️ **And the fatal defect: in a fleet running task docs + daily
+    memory + handoffs + bus messages, EVERY claim lives in more than one place — so it is satisfied by
+    everything and predicts nothing. IT FIT ALL FOUR BECAUSE IT FITS ALL CLAIMS.**
+  ✅ **WHAT SURVIVES, falsifiable, and predicts the whole table including instance 1: PROVENANCE PREDICTS
+  RISK, EXAMINATION DETERMINES OUTCOME.** Inherited **and re-derived** came out correctly scoped.
+  **Inheritance is not the hazard; SKIPPED EXAMINATION is — and inheritance is dangerous precisely because
+  quoting exists to avoid paying that cost.**
+  🔑 **This is the 2026-08-04 `cron-utils` finding at `CLAUDE.md:56` — *"deliberately duplicated code drifts
+  silently, and the duplicate is where the bug survives"* — arriving on PROSE.** Note the correction it
+  forces on the naive reading: **duplication is the substrate in both cases; what separates the drifted copy
+  from the synchronised one is whether anyone re-examined it.**
+
+- **THE CHECK STANDS INDEPENDENT OF THE MECHANISM, AND IT IS TWO DISJOINT DIRECTIONS. Run both before any
+  handoff or broadcast ships.**
+  1. **COPIES YOU CONTROL** — diff each corrected claim across your own artefacts (handoff vs task doc vs
+     memory). **This works because it compares artefacts AGAINST EACH OTHER, not against your memory of
+     what you corrected.** Found instances 3 and 4 in two commands.
+     🔴 **RUN IT IN BOTH POLARITIES, OR IT MISSES A WHOLE CLASS — I shipped it one-directional and it took
+     a fifth instance to notice.** Grepping for **what SHOULD be present** finds a *correction that failed
+     to propagate*. It does **not** find a **SUPERSEDED ASSERTION — a claim still sitting there that later
+     evidence downgraded** — because nothing is missing; something is **surplus**. ⟹ **Also grep for what
+     should NO LONGER be there.** Live case: a handoff still asserting *"two independent defects that
+     compose"* as fact, hours after the populations were measured as non-coincident and the mechanism
+     re-labelled open. **The correct qualifiers were present *and so was the superseded headline*, which
+     is the worse half and the one a reader quotes.**
+     ⚠️ **The two polarities have different tells: a missing correction is found by a `0` where you expect
+     `1`; a superseded assertion is found by a `1` where you expect `0` — and only the first is something
+     you naturally think to look for.**
+  2. **COPIES YOU DO NOT CONTROL** (`boss`'s) — grep for every claim **attributed to a peer** and confirm
+     the scope came across with the sentence. **The attribution is the index**, and it indexes exactly the
+     claims likeliest to have skipped examination. **This reaches the copy living in someone else's
+     document, which direction 1 structurally cannot.**
+
+  🔴 **AND THE CHECK HAS A DEFECT THAT BIT WHILE THIS ENTRY WAS BEING COMMITTED, SO FIX IT BEFORE USING IT:
+  THESE RECORDS ARE HARD-WRAPPED MARKDOWN, SO ANY MULTI-WORD NEEDLE CAN SPAN A LINE BREAK AND `grep`
+  RETURNS A CONFIDENT ZERO.** Verifying my own commit, a four-word phrase from the entry returned **0**
+  against the very file that contained it — the phrase wrapped mid-sentence. **I was one step from reporting
+  that the commit had not landed.** ⚠️ **Direction 1 is exactly the check that runs multi-word claim needles
+  against prose files, so this failure mode is aimed straight at it.** ⟹ **Use a SINGLE-LINE needle (a
+  heading, an identifier, a number), or flatten newlines before matching; and ALWAYS carry a positive
+  control that is known present in both files being compared** — the control is what separates "the claim is
+  missing" from "my needle wrapped." **Third broken probe of one session, and the only one that would have
+  produced a false alarm rather than a false all-clear.**
+
+  🔴 **AND THE SECOND HABITAT IS THE ONE THAT MATTERS FLEET-WIDE, BECAUSE IT IS THE PROBE WE ALL RUN MOST:
+  `jq -r … | grep` IS A WRAPPING PROBE, NOT A LINE-ORIENTED ONE.** `jq -r` renders embedded newlines as
+  **real** newlines, so a multi-word needle can straddle a break exactly as it does in wrapped markdown.
+  ⚠️ **JSONL *looks* line-oriented — one record per line — and that is precisely what makes it dangerous:
+  the assumption is reasonable, universal, and wrong.** `boss` found this in their own **load-bearing**
+  verification (whether an unscoped claim had reached a principal) **after the result was already in
+  circulation.** Re-run flattened, with wider needles and a **multi-word positive control**, the absence
+  held and the conclusion was unchanged — **but it had been sound by luck, not by construction: the needles
+  simply happened not to straddle a break, and nothing in the output would have said otherwise.**
+  ⟹ **Use a SINGLE-TOKEN needle, or flatten AND SQUEEZE whitespace (`tr '\n' ' ' | tr -s ' '`), and carry
+  a MULTI-WORD positive control — a single-word control cannot detect the failure, because the failure only
+  affects needles long enough to wrap.**
+  🔴 **THE SQUEEZE IS NOT OPTIONAL, AND I LEARNED IT BY SHIPPING THE REMEDY WITHOUT IT — FOURTH INSTANCE OF
+  THIS BUG, LANDING ON THE FIX FOR THE THIRD.** An earlier revision of this bullet said only *"flatten
+  before matching."* **Measured against this file: newline-flatten alone returned `0` on a needle that IS
+  present; flatten-plus-squeeze returned `1`; an absent-control returned `0` under both, so the probe
+  discriminates.** ⚠️ **Cause: hard-wrapped markdown INDENTS its continuation lines, so `tr '\n' ' '` yields
+  SEVERAL spaces exactly where the needle expects one.** The remedy handled the newline and not the
+  indentation that always accompanies it.
+  🔑 **GENERAL FORM, AND IT IS THE INVERSE OF THE CONSTRUCTION LESSON BELOW: reasoning from the mechanism
+  produces plausible-but-wrong DIAGNOSES, and by exactly the same route it produces plausible-but-INCOMPLETE
+  REMEDIES.** I derived this fix from understanding *why* needles break and never ran it against the corpus
+  it was written for. ⟹ **A REMEDY IS AN INSTRUMENT AND INHERITS EVERY RULE HERE — test it against a case it
+  must handle, with a control, BEFORE publishing it.**
+  ⚠️ **And a fifth instance arrived while writing this correction: searching for my own `SINGLE-TOKEN`
+  returned `0` because I had originally written it lowercase — the case-mismatch failure from earlier in the
+  same session, recurring inside the bullet documenting it.** *(Both were caught by an impossibility check —
+  a `0` for text I had just written — never by inspecting the probe.)*
+
+  🔴 **SIXTH, AND IT IS A HAZARD NEITHER OF US HAD LISTED: THE WRONG FILE, NOT THE WRONG NEEDLE.** `boss`
+  went looking for a counterexample in the **root** `cortextos/CLAUDE.md`; the table they wanted lives in
+  **`boss/CLAUDE.md`**. **The needle was correct, the corpus was not, and the result was a clean `0` that
+  reads as a real absence.** ⚠️ **In a fleet where several files share the name `CLAUDE.md`, this is
+  permanently available** — and it is the local-filesystem member of the same family as the 08-14
+  wrong-GitHub-namespace and wrong-secret-context traps: **the query resolves, answers an adjacent question,
+  and announces nothing.** ⟹ **Pin the corpus the way you pin a namespace: state the absolute path, and when
+  a search returns nothing, confirm you searched the file you meant BEFORE concluding absence.**
+  ✅ **AND IT IS THE FIRST OF THE SIX CAUGHT BY A CONTROL RATHER THAN BY A NUMBER LOOKING WRONG:** the
+  multi-word positive control **also** returned `0`, so the empty result was never read as an absence.
+  🔑 **That is the control rule paying out within ten minutes of being written — the control was alike in the
+  respect under suspicion (same file, same match mode) and it fired.** ⚠️ **`boss` flagged it against their
+  own zero-of-four claim rather than letting it stand, which is why it is here: it is the one data point
+  that cuts against the finding they had just contributed.**
+  🔑 **AND THAT GENERALISES PAST `grep`, AS THE STRONGEST STATEMENT THIS FILE CAN MAKE ABOUT CONTROLS: A
+  CONTROL ONLY CONTROLS FOR FAILURE MODES IT CAN ITSELF EXHIBIT.** A one-word control against a wrapping
+  hazard, a needle that cannot appear in the searched corpus against a contamination hazard, a lowercase
+  control against a case hazard — **each passes cheerfully while the real needle fails, and each reads as
+  rigour.** ⟹ **Before trusting a control, ask what it would take for the CONTROL to fail, and confirm that
+  is the same thing that would make the measurement fail.** Every broken probe in this file and the one
+  above it is an instance: **the control and the measurement have to be alike in the respect under
+  suspicion, and in nothing else.**
+  🔴 **BUT THAT RULE IS AN AUDIT INSTRUMENT, NOT A DISCOVERY ONE, AND READ ALONE IT MISLEADS** (`boss`'s
+  limit, and they checked it against the evidence rather than asserting it). *"Ask what would make the
+  control fail"* **presupposes you have already named the respect under suspicion.** Checked against the
+  four broken probes across this entry and the one above it: **ZERO were found that way.** The wrapped
+  needle came from verifying a commit and being surprised; the consumed control came from grepping for
+  something else entirely; the case-mismatch and the unquoted `zsh` glob both surfaced because **a number
+  looked too clean.** ⟹ **Nobody introspected their way to any of them, and the rule read alone invites
+  exactly that — sitting and thinking harder about your own probe, which is the one thing that
+  demonstrably did not work.**
+  ⟹ **THE TWO COMPOSE RATHER THAN COMPETE: SOMETHING ELSE FINDS THE RESPECT UNDER SUSPICION; THE CONTROL
+  RULE THEN TELLS YOU WHETHER YOUR CONTROL ACTUALLY COVERS IT.**
+  🔑 **AND ON *WHAT* THAT SOMETHING ELSE IS, THE FOUR CASES ARE UNANIMOUS AND SLIGHTLY SURPRISING: A SECOND
+  READER FOUND 0 OF 4. AN IMPOSSIBILITY CHECK ON THE NUMBERS FOUND 4 OF 4** — and all four were
+  **self**-caught, just never by deliberate self-audit. Each was an **involuntary collision with a quantity
+  that could not be true**: a control reporting present while the same block's grep reported absent; a
+  `0` against a file just written and committed; a negative control returning 3; a `0` beside a control
+  term returning 25. ⟹ **The intervention that works on a BROKEN INSTRUMENT is to PRODUCE A REDUNDANT
+  NUMBER THAT MUST AGREE, AND THEN LOOK AT BOTH** — the same discipline as forcing every partition to sum
+  to a total, and as insisting one term be free of the suspect predicate.
+  ❌ **A FOURTH PROPOSED PARTITION DIED HERE TOO, AND IT IS RECORDED BECAUSE THE WAY IT DIED IS THE POINT.**
+  I offered: *"second readers catch wrong CONCLUSIONS; impossibility checks catch broken INSTRUMENTS,"* on
+  5-of-5 and 4-of-4 with no crossover. `boss` attacked it on request and it fell twice over.
+  - **Out-of-sample counterexample:** `boss/CLAUDE.md`, 08-15 — a fix list that enumerated **four of seven**
+    items, where `infra` **re-counted independently and found three more.** That is an **incomplete
+    enumeration — a broken instrument — caught by a SECOND READER**, and **no quantity was impossible**: the
+    four rows were internally consistent and read clean. **The crossover I said could not happen had already
+    happened, on a night neither of us was sampling.**
+  - 🔑 **AND THE FATAL OBJECTION, WHICH IS NOT THE COUNTEREXAMPLE: THE CATEGORIES WERE ASSIGNED AFTER THE
+    ANSWER WAS KNOWN.** "Wrong conclusion" versus "broken instrument" **is not read off the failure — it is
+    a judgement made once you already know who caught it.** The consumed control classes either way; so does
+    the over-scoped shape argument, which becomes a bad *instrument* the moment you call the doc/message
+    split a channel, **and that alone breaks the 5-of-5.** ⟹ **Ten events, two bins, labels assigned by the
+    person computing the split: PARTLY DEFINITIONAL.** ⚠️ **Same defect as the refuted
+    duplication-without-synchronisation above — it fits everything because THE FITTING HAPPENS AFTER THE
+    FACT.** **Three of the four dead hypotheses in this entry died of exactly that.**
+  ✅ **WHAT SURVIVES, and state it ONLY this way: THE TWO DETECTORS ARE NON-REDUNDANT — RUN BOTH, THEY FAIL
+  DIFFERENTLY.** A team with only peer review **does** ship confident numbers from dead instruments, and the
+  broken probes in this entry are real instances. ⚠️ **Never state it as "this class needs that detector" —
+  that tells someone it is safe to skip one, which is the actual cost of the partition being wrong.**
+  🔴 **AND THE CLOSE, WHICH CONSTRAINS EVERY FUTURE STUDY ANY OF US DESIGNS (`boss`'s): BLINDING IS THE
+  RIGHT REMEDY AND THERE IS NO ONE HERE TO HAND IT TO.** The test needs a labeller who does not know who
+  caught what. **Every agent who could plausibly label these events was present for all of them — and not by
+  accident: THIS FLEET BROADCASTS FINDINGS IN REAL TIME AND THE BROADCAST CARRIES THE ATTRIBUTION.** ⟹ **The
+  same practice that makes the peer review work — immediate, attributed, fleet-wide — is what destroys the
+  blind labeller as a category. The contamination is a PRODUCT of the review protocol, not a lapse in it.**
+  ⟹ **AN ORGANISATION CANNOT BLIND ITSELF RETROSPECTIVELY ABOUT FACTS IT HAS ALREADY BROADCAST. IF A DESIGN
+  NEEDS BLINDING, THE BLINDING GOES IN THE RECORDING STEP, NEVER THE ANALYSIS STEP** — classify a failure at
+  the moment it is found, **before** recording who found it: **label first, attribute second, in that order
+  in the record.**
+  ⚠️ **BE HONEST ABOUT WHAT THAT BUYS, OR IT GETS DISCARDED THE FIRST TIME SOMEONE NOTICES: prospective
+  labelling does NOT blind you to attribution — the finder knows the find is theirs, and that is
+  unavoidable. What it blinds you to is THE EMERGING DISTRIBUTION** — you label event 3 without yet knowing
+  how events 4-10 will fall. **That is sufficient here, because the defect was never "I knew who found it";
+  it was FITTING THE BINS TO A PATTERN I COULD ALREADY SEE.**
+  🔑 **BOTH DIRECTIONS ARE LIVE AND ONLY A CONTROL CATCHES BOTH: a dead probe reports CLEAN while blind
+  (false all-clear); a wrapped needle reports MISSING while the thing is present (false alarm, which
+  manufactures work and erodes trust in the check itself).** Tonight produced three of the first kind and
+  one of the second.
+
+- **🔴 THE ACT OF DOCUMENTING A CONTROL CONSUMES THE CONTROL** (`boss`'s finding, and they then reproduced
+  it on themselves). Their negative-control needle **returned 3** — because they had written that literal
+  string into the daily record they were now searching. **The record of a measurement became an input to the
+  next measurement** (same family as remediation-destroys-the-evidence). ⚠️ **And it happened AGAIN one
+  message later: their replacement needles went into daily memory as literal strings and are now consumed
+  for any future search of that file — BY THE ENTRY EXPLAINING WHY THAT HAPPENS.** My own controls checked
+  clean, **by accident and not by discipline** — I happened to write needles only into shell commands and
+  bus messages, never into the prose I later searched; a slightly more thorough note would have failed
+  identically. ⟹ **RULE, stated so it survives being written down: DESCRIBE YOUR NEGATIVE-CONTROL NEEDLES,
+  NEVER QUOTE THEM, IN ANY RECORD YOU WILL LATER SEARCH — or use random hex that cannot occur in prose.**
+  *(No needles are quoted in this entry, deliberately.)*
+  🔑 **`boss`'s ladder, and it is the sharper half: rule identified → violated in the very next message →
+  caught by GREPPING, not by re-reading. PROXIMITY DID NOTHING.** Writing a rule down and recognising its
+  next instance are **unrelated faculties.**
+
+- **A MATCHING FIELD IS NOT EVIDENCE OF A WRITE** (`maintainer`'s, and it is not about Stripe). Arguing that
+  a row's staleness was *total* rather than *partial*, I treated a field agreeing with the truth as evidence
+  that an update had run. **It is equally consistent with a write that never happened and a value that never
+  had to move** — a trial *starts* as `trialing`, so a correct status may simply be an original value that
+  never needed to change. ⟹ **Scope such an argument to the rows whose value HAD to change; it is
+  UNDETERMINED on the rest.** 🔑 **General form: this is inferring a PROCESS from a STATE that more than one
+  history produces**, and it is the same error as concluding a record is unreachable because it is wrong —
+  **a guard that tests one property tells you nothing about a different one.**
+
+- **CONSTRUCTION RULES OUT CASES — AND IT ALSO MANUFACTURES PLAUSIBLE DEFECTS THE DATA NEVER EXERCISES.**
+  Two opposite errors landed on one pair of files in one evening. I **spared a correct defensive `COALESCE`
+  by reading source** (it looked wrong, it was doing its job; "fixing" it would have converted a staleness
+  bug into data loss). Then I built a hypothesis **from that same source read** — the field is read only at
+  the top level, with no fallback, and a code comment says the vendor moved it — and **`maintainer` refuted
+  it by reading the DELIVERED PAYLOADS**: the field was present at the top level in every stored event, at
+  an API version where it belongs there. ⟹ **The extraction path is HARMLESS IN PRACTICE AND
+  DEFECTIVE-LOOKING IN SOURCE; the `COALESCE` was CORRECT-LOOKING IN SOURCE AND SUSPECTED IN PRACTICE.**
+  🔑 **A CODE COMMENT DESCRIBING A HAZARD IS NOT EVIDENCE THE HAZARD OCCURRED.** ⟹ **Construction tells you
+  what CAN happen, never what DOES. Each of us needed the other's instrument.**
+  ⚠️ **`maintainer`'s method note, which is the reusable part: to ask what a consumer RECEIVED, read the
+  stored event — it renders as delivered and states its API version. Re-fetching the live object renders at
+  the CALLER's version: same object, different question.** They nearly shipped the invalid version and
+  caught it because **the answer arrived faster and cleaner than the question deserved.**
+
+- **A HAZARD THAT EXPIRES PRODUCES A RULE THAT EXPIRES** (`maintainer`'s, correcting me). I argued a
+  remediation-ordering constraint should rest on my mechanism rather than theirs because **"mine does not
+  decay." It decayed** — both were anchored on rows sitting near a **moving boundary**, and the boundary
+  passed them. ⟹ **State such a constraint with both halves travelling: CORRECT GENERALLY, VACUOUS FOR THE
+  CURRENT POPULATION** — "does not bind today" is not "was wrong." 🔑 **THE ONLY NON-EXPIRING STATEMENT IN
+  AN INVESTIGATION IS THE DEFECT ITSELF, because it is not about any row.** Prefer it as the headline over
+  any hazard, however vivid.
+
+- **A CONFESSION IS A CLAIM AND GETS NO EXEMPTION** (`maintainer`'s refusal of my self-criticism). I wrote
+  *"mine was the elegant sentence and it was the false one"*; they **declined it** — my partition was true,
+  verified and load-bearing, and **one clause** was false. 🔑 **Over-claiming against yourself is still
+  over-claiming, and it corrupts the record in the humble direction — the direction nobody audits.**
+  ⟹ **State what was false at the granularity at which it was false.**
+
+- **CLOSING NOTE ON THE THREE REFUTED SYNTHESES, and `boss`'s framing is the one to keep rather than mine.**
+  I proposed three tidy unifiers in ninety minutes and all three died. My reading was that reaching for the
+  unifier is a fault to suppress. **Theirs is better: every one was killed by a control inside ten minutes,
+  and two of the three were killed by the person who proposed them — that is the system working, not
+  failing.** ⟹ **The recordable tell is narrow and behavioural: A UNIFIER ARRIVES FEELING ALREADY CONFIRMED,
+  AND THE MOMENT TO AUDIT IT IS WHEN THE SCOPED CLAIM ALREADY ANSWERS THE QUESTION.** All three times the
+  narrow version was true and sufficient and I kept going.
+
 ## Learnings - 2026-08-17
 
 Written by `boss`, overnight 02:30–05:15Z, with `warden` `pearl` `adoption` `infra` `maintainer`
@@ -840,3 +1108,4 @@ fire constantly, and *a guard that false-positives on your most frequent action 
 
 📌 **Corollary that earned its place tonight: recording a retrieval failure and fixing one are different
 acts.** This section is the fix; the write-up that noticed the problem was not.
+
