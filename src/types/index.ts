@@ -98,6 +98,38 @@ export interface Event {
 
 // Heartbeat Types
 
+/**
+ * Which enumeration produced a heartbeat row.
+ *
+ * The roster and the `state/` directory answer DIFFERENT questions — "which agents
+ * exist" versus "which agents have ever written a heartbeat" — and reading only one
+ * of them collapses three distinct conditions into two. `state-only` is a dir with no
+ * roster entry (a phantom, reported as a live agent by a state-only scan);
+ * `roster-only` is an agent that has never beaten (absent entirely from such a scan,
+ * and an absence reads as "no such agent" rather than as a gap).
+ */
+export type HeartbeatSource = 'roster+state' | 'roster-only' | 'state-only';
+
+/** An agent as seen by BOTH enumerations, carrying which one(s) found it. */
+export interface HeartbeatRow {
+  /** Authoritative name: the roster key, or the state DIRECTORY name for orphans. */
+  agent: string;
+  org: string | null;
+  source: HeartbeatSource;
+  /** From the roster. `null` means "not in the roster", NOT "disabled". */
+  enabled: boolean | null;
+  /** `null` when the agent has never beaten, or its file could not be parsed. */
+  heartbeat: Heartbeat | null;
+  /** A heartbeat.json exists but does not parse — reported, never silently skipped. */
+  unreadable?: boolean;
+  /**
+   * The `agent` field inside the file, when it disagrees with the directory name.
+   * The directory is the enumeration axis and the field is what gets displayed, so an
+   * undetected disagreement renders as a plausible agent instead of as corruption.
+   */
+  nameMismatch?: string;
+}
+
 export interface Heartbeat {
   agent: string;
   org: string;

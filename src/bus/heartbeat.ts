@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, existsSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
-import type { Heartbeat, BusPaths } from '../types/index.js';
+import type { Heartbeat, BusPaths, HeartbeatRow } from '../types/index.js';
+import { listAgents } from './agents.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 
 /**
@@ -133,9 +134,16 @@ export function detectDayNightMode(timezone: string): 'day' | 'night' {
 }
 
 /**
- * Read all agent heartbeats.
- * Scans state/ directory for agent subdirs containing heartbeat.json.
- * Matches dashboard heartbeat path: state/{agent}/heartbeat.json
+ * Read every heartbeat FILE that exists.
+ *
+ * NARROW CONTRACT, and the narrowness is the point: this answers "which agents have
+ * written a heartbeat", NOT "which agents exist". It enumerates subdirectories of
+ * `state/` and consults no roster, so an agent that has never beaten is ABSENT from
+ * the result rather than reported as a gap, and a `state/` dir with no roster entry is
+ * returned as though it were an agent.
+ *
+ * Use {@link readAllHeartbeatRows} for anything that reports on the fleet. This is kept
+ * for callers that genuinely want the files and nothing more.
  */
 export function readAllHeartbeats(paths: BusPaths): Heartbeat[] {
   const heartbeats: Heartbeat[] = [];
@@ -160,4 +168,78 @@ export function readAllHeartbeats(paths: BusPaths): Heartbeat[] {
   }
 
   return heartbeats;
+}
+
+/**
+ * Read the fleet by DUAL ENUMERATION: the roster UNION the `state/` directory scan.
+ *
+ * Rows are keyed on the roster where one exists, so DISABLED, DEAD and NEVER-BEATEN
+ * become three renderable states instead of two collapsed into one plus a silent
+ * omission. The roster side comes from {@link listAgents}, which already merges
+ * `enabled-agents.json` with the org directory scan — reading the JSON alone would
+ * relabel a real agent missing from that file as an orphan, which is BUG-028 rebuilt
+ * one layer up.
+ *
+ * Scoped to ONE instance (`paths.ctxRoot`). `~/.cortextos/` holds several, and this
+ * says nothing about the others; callers that mean "the whole machine" must iterate.
+ *
+ * PASS `org` WHEN ITERATING INSTANCES. The roster's two halves are scoped differently —
+ * `enabled-agents.json` is per-instance, but the directory scan is global
+ * (`CTX_FRAMEWORK_ROOT`) and, unfiltered, returns EVERY org's agents. Omitting `org`
+ * during a multi-instance sweep therefore imports one instance's agents into another's
+ * report, where they appear as confident `roster-only` rows for agents that do not
+ * belong to it.
+ */
+export function readAllHeartbeatRows(paths: BusPaths, org?: string | string[]): HeartbeatRow[] {
+  const rows = new Map<string, HeartbeatRow>();
+
+  // 1. Roster axis — every agent that EXISTS, beaten or not.
+  const orgs: (string | undefined)[] =
+    org === undefined ? [undefined] : Array.isArray(org) ? org : [org];
+  for (const o of orgs) {
+    for (const a of listAgents(paths.ctxRoot, o)) {
+      if (rows.has(a.name)) continue; // first org wins; never duplicate a name
+      rows.set(a.name, {
+        agent: a.name,
+        org: a.org ?? null,
+        source: 'roster-only',
+        enabled: a.enabled,
+        heartbeat: null,
+      });
+    }
+  }
+
+  // 2. State axis — every agent that has WRITTEN one. Keyed on the DIRECTORY name;
+  //    the `agent` field inside the file is data, not identity.
+  const stateDir = join(paths.ctxRoot, 'state');
+  let dirs: string[] = [];
+  try {
+    dirs = readdirSync(stateDir, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name);
+  } catch {
+    // No state dir yet — the roster rows above still stand.
+  }
+
+  for (const dir of dirs) {
+    const hbPath = join(stateDir, dir, 'heartbeat.json');
+    if (!existsSync(hbPath)) continue; // not an agent dir at all (oauth/, usage/, …)
+
+    const existing = rows.get(dir);
+    const row: HeartbeatRow = existing
+      ? { ...existing, source: 'roster+state' }
+      : { agent: dir, org: null, source: 'state-only', enabled: null, heartbeat: null };
+
+    try {
+      const hb = JSON.parse(readFileSync(hbPath, 'utf-8')) as Heartbeat;
+      row.heartbeat = hb;
+      if (row.org === null) row.org = hb.org ?? null;
+      if (hb.agent && hb.agent !== dir) row.nameMismatch = hb.agent;
+    } catch {
+      row.unreadable = true; // reported, never silently skipped
+    }
+    rows.set(dir, row);
+  }
+
+  return [...rows.values()].sort((a, b) => a.agent.localeCompare(b.agent));
 }

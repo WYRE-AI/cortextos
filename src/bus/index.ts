@@ -4,7 +4,7 @@
 export { sendMessage, checkInbox, ackInbox } from './message.js';
 export { createTask, updateTask, completeTask, listTasks } from './task.js';
 export { logEvent } from './event.js';
-export { updateHeartbeat, readAllHeartbeats } from './heartbeat.js';
+export { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from './heartbeat.js';
 export { createApproval, updateApproval, listPendingApprovals } from './approval.js';
 export {
   selfRestart,
