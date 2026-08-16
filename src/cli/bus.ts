@@ -1,7 +1,8 @@
 import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInboxWithStatus, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
@@ -9,7 +10,7 @@ import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } f
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
-import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
+import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity, broadcastActivityViaBus } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
@@ -593,29 +594,93 @@ busCommand
 
 busCommand
   .command('read-all-heartbeats')
-  .description('Read heartbeat files for all agents in the system')
+  // Scope stated exactly: this reads ONE instance unless --all-instances is passed.
+  // The previous wording, "all agents in the system", overclaimed — `~/.cortextos/`
+  // holds several instances and this saw only the caller's.
+  .description("Fleet heartbeat report for the caller's instance (roster UNION state/ scan). Use --all-instances to sweep every instance.")
   .option('--format <fmt>', 'Output format: json or text', 'text')
-  .action((opts: { format?: string }) => {
+  .option('--all-instances', 'Sweep every instance under ~/.cortextos that has a roster')
+  .action((opts: { format?: string; allInstances?: boolean }) => {
     const env = resolveEnv();
-    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const heartbeats = readAllHeartbeats(paths);
+
+    const instances: string[] = opts.allInstances
+      ? (() => {
+          const base = join(homedir(), '.cortextos');
+          try {
+            return readdirSync(base, { withFileTypes: true })
+              .filter(d => d.isDirectory() && existsSync(join(base, d.name, 'config', 'enabled-agents.json')))
+              .map(d => d.name)
+              .sort();
+          } catch {
+            return [env.instanceId];
+          }
+        })()
+      : [env.instanceId];
+
+    // Each instance's orgs come from ITS OWN roster. Inheriting the caller's org (or
+    // passing none, which scans every org) mixes one instance's agents into another's
+    // report — they surface as "NEVER BEATEN" rows for agents that are not its at all.
+    const orgsOf = (instanceId: string): string[] | undefined => {
+      if (instanceId === env.instanceId && env.org) return [env.org];
+      try {
+        const roster = JSON.parse(readFileSync(
+          join(homedir(), '.cortextos', instanceId, 'config', 'enabled-agents.json'), 'utf-8',
+        )) as Record<string, { org?: string }>;
+        const found = [...new Set(Object.values(roster).map(e => e.org).filter(Boolean))] as string[];
+        return found.length > 0 ? found : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+
+    const report = instances.map(instanceId => ({
+      instance: instanceId,
+      rows: readAllHeartbeatRows(
+        resolvePaths(env.agentName, instanceId, env.org),
+        orgsOf(instanceId),
+      ),
+    }));
 
     if (opts.format === 'json') {
-      console.log(JSON.stringify(heartbeats, null, 2));
+      console.log(JSON.stringify(opts.allInstances ? report : report[0].rows, null, 2));
       return;
     }
 
-    if (heartbeats.length === 0) {
-      console.log('No agents found.');
-      return;
-    }
+    const STALE_MS = 2 * 60 * 60 * 1000;
+    for (const { instance, rows } of report) {
+      if (opts.allInstances) console.log(`\n=== instance: ${instance} ===`);
+      if (rows.length === 0) {
+        console.log('No agents found.');
+        continue;
+      }
 
-    for (const hb of heartbeats) {
-      const stale = new Date(hb.last_heartbeat) < new Date(Date.now() - 2 * 60 * 60 * 1000);
-      const staleFlag = stale ? ' [STALE]' : '';
-      const label = hb.display_name ? `${hb.display_name} (${hb.agent})` : hb.agent;
-      console.log(`${label} (${hb.org}) — ${hb.status}${staleFlag} — last seen ${hb.last_heartbeat}`);
-      if (hb.current_task) console.log(`  task: ${hb.current_task}`);
+      for (const row of rows) {
+        const hb = row.heartbeat;
+        const name = hb?.display_name ? `${hb.display_name} (${row.agent})` : row.agent;
+        const org = row.org ?? '?';
+
+        // The three conditions the old single-axis output could not tell apart.
+        if (row.source === 'roster-only') {
+          console.log(`${name} (${org}) — NEVER BEATEN — no heartbeat file${row.enabled === false ? ' [DISABLED]' : ''}`);
+          continue;
+        }
+        if (row.source === 'state-only') {
+          console.log(`${name} (${org}) — ORPHAN STATE DIR — heartbeat present but no roster entry; not a running agent`);
+          if (row.nameMismatch) console.log(`  ⚠ file claims agent="${row.nameMismatch}" but lives in state/${row.agent}/`);
+          continue;
+        }
+        if (row.unreadable || !hb) {
+          console.log(`${name} (${org}) — UNREADABLE heartbeat.json (this is NOT a pass)`);
+          continue;
+        }
+
+        const stale = new Date(hb.last_heartbeat) < new Date(Date.now() - STALE_MS);
+        // A disabled agent is stale BY DESIGN — never label it as though it died.
+        const flag = row.enabled === false ? ' [DISABLED]' : stale ? ' [STALE]' : '';
+        console.log(`${name} (${org}) — ${hb.status}${flag} — last seen ${hb.last_heartbeat}`);
+        if (row.nameMismatch) console.log(`  ⚠ file claims agent="${row.nameMismatch}" but lives in state/${row.agent}/`);
+        if (hb.current_task) console.log(`  task: ${hb.current_task}`);
+      }
     }
   });
 

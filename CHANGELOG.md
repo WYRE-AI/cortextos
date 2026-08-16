@@ -32,6 +32,64 @@ as a back-compat wrapper whose docblock states what it discards. A gate that
 cannot verify now holds instead of opening. Behaviour is unchanged on any
 healthy tree or inbox, and CLI stdout shapes are unchanged because agents
 parse them; the new signal rides stderr and the exit code.
+### Fixed — `read-all-heartbeats` reported two dead agents where there were none, and could not report a third condition at all
+
+`readAllHeartbeats` enumerated **subdirectories of `state/`** and consulted no
+roster of any kind, so "which agents exist" was answered by a filesystem
+artifact. Three consequences, two visible and one not:
+
+- A `state/` dir with **no roster entry** was returned as though it were an
+  agent. On the live fleet that is `state/cortextos/` — a watchdog write under
+  the wrong key, whose status text reads `[watchdog] warden alive` — plus five
+  more in the `wyre-gateway` instance.
+- A **disabled** agent was rendered identically to a dead one. `lantern` has
+  been `enabled: false` since 2026-06-10 and showed only as `[STALE]`.
+- An agent in the roster that has **never beaten** has no `state/` dir, so it
+  was **absent from the output entirely** rather than flagged — and an absence
+  reads as "no such agent", not as a gap.
+
+Two structural details underneath:
+
+- **The writer and the reader used different axes, in the same file.**
+  `BusPaths.stateDir` is the *per-agent* directory (`utils/paths.ts`);
+  `updateHeartbeat` writes through it correctly, while `readAllHeartbeats`
+  ignored it and recomputed `join(ctxRoot, 'state')`, treating every subdir as
+  an agent name.
+- **Nothing declared agent-ness** — a parseable `heartbeat.json` implied it.
+  `state/oauth/` and `state/usage/` sit on the identical axis and were excluded
+  only because they happen to lack that file.
+
+Adds `readAllHeartbeatRows(paths, org?)`, which enumerates the **roster UNION
+the `state/` scan** and tags every row with the enumeration that found it, so
+`roster+state`, `roster-only` (never beaten) and `state-only` (orphan) are three
+renderable states instead of two collapsed into one plus a silent omission. The
+roster half reuses `listAgents`, which already merges `enabled-agents.json` with
+the org directory scan — reading the JSON alone would relabel a real agent
+missing from that file as an orphan, which is BUG-028 rebuilt one layer up. A
+mismatch between a heartbeat's `agent` field and its directory name is now
+surfaced rather than displayed as a plausible agent name, and an unparseable
+file is reported instead of silently skipped.
+
+`readAllHeartbeats` is unchanged and still exported, with its narrow contract
+documented: it answers "which agents have written a heartbeat", not "which
+agents exist".
+
+The CLI renders the new states, stops labelling a disabled agent `[STALE]`, and
+gains `--all-instances`. Its description previously claimed "all agents in the
+system" while resolving a single `instanceId`; `~/.cortextos/` holds five
+instances, two with rosters, so the wording overclaimed and is now exact.
+
+Note for anyone extending the sweep: pass `org`. The roster's two halves are
+scoped differently — `enabled-agents.json` is per-instance but the directory
+scan is global (`CTX_FRAMEWORK_ROOT`), so an unscoped multi-instance sweep
+imports one instance's agents into another's report as confident "never beaten"
+rows. That regression is pinned by a test.
+
+Every fixture is **synthesised**, deliberately. The never-beaten case exists in
+neither live instance on this machine (roster-minus-state is empty in `default`
+*and* in `wyre-gateway`), so a fixture sampled from live config would have been
+green over a real bug. The suite is mutation-validated: five deliberate breaks
+of the implementation each fail it.
 
 ### Fixed — the concurrent-cron race test reported a bare count, making its own flake undiagnosable
 
