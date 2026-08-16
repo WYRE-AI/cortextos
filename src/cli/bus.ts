@@ -44,8 +44,17 @@ function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org:
   let ctx: OrgContext;
   try {
     ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
-  } catch {
-    return null; // cannot read config — allow the transition
+  } catch (err) {
+    // Allowing the transition is defensible — blocking every task in an org on
+    // one corrupt file is worse.  Doing it silently is not: require_deliverables
+    // enforcement turns OFF org-wide with no observable other than the absence
+    // of an error nobody was expecting.
+    console.warn(
+      `[bus] org context ${contextPath} is unreadable or corrupt ` +
+      `(${err instanceof Error ? err.message : String(err)}) — require_deliverables ` +
+      `enforcement is SKIPPED for this transition.`
+    );
+    return null;
   }
 
   if (!ctx.require_deliverables) return null;
@@ -57,7 +66,13 @@ function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org:
   let task: Task;
   try {
     task = JSON.parse(readFileSync(taskFile, 'utf-8'));
-  } catch {
+  } catch (err) {
+    // Same fail-open direction, same reason to be loud about it.
+    console.warn(
+      `[bus] task file ${taskFile} is unreadable or corrupt ` +
+      `(${err instanceof Error ? err.message : String(err)}) — require_deliverables ` +
+      `check SKIPPED for ${taskId}.`
+    );
     return null;
   }
 
