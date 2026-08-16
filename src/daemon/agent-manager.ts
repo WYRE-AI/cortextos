@@ -260,8 +260,18 @@ export class AgentManager {
     if (!existsSync(enabledFile)) return {};
     try {
       return JSON.parse(readFileSync(enabledFile, 'utf-8'));
-    } catch {
-      return {}; // corrupt or unreadable — fall through to default-enabled
+    } catch (err) {
+      // Fail-open direction is deliberate (default-enabled, matching
+      // discoverAndStart).  But a CORRUPT registry is not the same fact as a
+      // MISSING one: the file exists and records explicit enable/disable
+      // intent we are now discarding, so a deliberately DISABLED agent starts.
+      // Keep the direction; do not swallow the condition.
+      console.warn(
+        `[agent-manager] enabled-agents.json at ${enabledFile} is unreadable or corrupt ` +
+        `(${err instanceof Error ? err.message : String(err)}) — falling through to DEFAULT-ENABLED. ` +
+        `Any agent explicitly disabled in that file WILL START.`
+      );
+      return {};
     }
   }
 
