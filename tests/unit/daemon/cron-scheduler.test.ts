@@ -572,6 +572,69 @@ describe('CronScheduler', () => {
   });
 
   // -------------------------------------------------------------------------
+  // reload() — a PROMPT-ONLY edit must not re-phase the cron.
+  //
+  // Regression guard for the 2026-08-15 fleet incident: editing a cron's prompt
+  // via remove-then-add silently re-phased it (boss's `check-approvals` moved
+  // 18:14/20:14Z -> 19:20/21:20Z, destroying a backstop nobody knew they had).
+  // The mechanism: a re-added cron has no `last_fired_at` and a fresh
+  // `created_at`, so computeReferenceMs anchors on ~now and the phase moves.
+  //
+  // `bus update-cron --prompt` avoids this at TWO independent levels:
+  //   1. changeKeyFor() is `name|schedule` (cron-scheduler.ts:208-210), so a
+  //      prompt-only edit keeps the key and nextFireAt is preserved outright.
+  //   2. updateCron() shallow-merges (bus/crons.ts:250-267), so `last_fired_at`
+  //      survives even when the schedule DOES change.
+  // The two existing tests above cover "identical definition" and "changed
+  // schedule".  Neither covers "changed prompt, same schedule" — which is the
+  // case the incident actually turned on.
+  // -------------------------------------------------------------------------
+
+  it('update-cron holds a cron\'s phase; remove-then-add re-phases it', async () => {
+    const base    = Date.now();
+    const THREE_H = 3 * 60 * 60 * 1000;
+    const FOUR_H  = 4 * 60 * 60 * 1000;
+    const created = new Date(base - THREE_H).toISOString();
+
+    // A 4h cron created 3h ago: anchored on created_at, it is due in 1h.
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'phase', schedule: '4h', prompt: 'original', created_at: created }),
+    ]);
+    scheduler.start();
+    const before = scheduler.getNextFireTimes().find(e => e.name === 'phase')!;
+    expect(before.nextFireAt).toBe(base - THREE_H + FOUR_H);
+
+    // (a) update-cron: prompt rewritten, created_at (and any last_fired_at)
+    //     preserved by the shallow merge. Phase must NOT move.
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'phase', schedule: '4h', prompt: 'rewritten', created_at: created }),
+    ]);
+    scheduler.reload();
+    const afterUpdate = scheduler.getNextFireTimes().find(e => e.name === 'phase')!;
+    expect(afterUpdate.nextFireAt).toBe(before.nextFireAt);
+
+    // (b) remove-then-add: two reloads, because that is what the CLI actually
+    //     does — the cron disappears, then returns as a NEW definition with a
+    //     fresh created_at and no last_fired_at.
+    mockReadCrons.mockReturnValue([]);            // remove-cron
+    scheduler.reload();
+    expect(scheduler.getNextFireTimes().find(e => e.name === 'phase')).toBeUndefined();
+
+    mockReadCrons.mockReturnValue([               // add-cron
+      makeCron({ name: 'phase', schedule: '4h', prompt: 'rewritten',
+                 created_at: new Date(base).toISOString() }),
+    ]);
+    scheduler.reload();
+    const afterReadd = scheduler.getNextFireTimes().find(e => e.name === 'phase')!;
+
+    // The 2026-08-15 defect, pinned: the phase slipped by the full 3h of
+    // elapsed life. boss's check-approvals moved 18:14/20:14Z -> 19:20/21:20Z
+    // this way, destroying a backstop nobody knew they had.
+    expect(afterReadd.nextFireAt).toBe(base + FOUR_H);
+    expect(afterReadd.nextFireAt - before.nextFireAt).toBe(THREE_H);
+  });
+
+  // -------------------------------------------------------------------------
   // reload() during in-flight fire — race condition probe
   //
   // If reload() runs while a fire's onFire is awaiting, the old ScheduledCron
