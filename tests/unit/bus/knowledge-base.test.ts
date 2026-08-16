@@ -37,7 +37,7 @@ vi.mock('../../../src/utils/org.js', () => ({
   normalizeOrgName: (_root: string, org: string) => org,
 }));
 
-const { queryKnowledgeBase, ingestKnowledgeBase } = await import('../../../src/bus/knowledge-base.js');
+const { queryKnowledgeBase, ingestKnowledgeBase, deleteFromKnowledgeBase } = await import('../../../src/bus/knowledge-base.js');
 
 // Minimal BusPaths stub — knowledge-base.ts doesn't actually USE the paths
 // object at call time, just the options/env it constructs.
@@ -194,6 +194,89 @@ describe('kb warn messages — UX invariants', () => {
     const specificOrgWarns = warnLog.filter((m) => m.includes('SpecificOrg'));
     expect(specificOrgWarns.length).toBeGreaterThanOrEqual(2);
     expect(specificOrgWarns.every((m) => /run setup/i.test(m))).toBe(true);
+  });
+});
+
+describe('deleteFromKnowledgeBase — no default scope (the pawl)', () => {
+  it('THROWS when scope is omitted — must never silently pick a collection to empty', () => {
+    mockConfiguredKb();
+    // @ts-expect-error — deliberately omitting the required `scope` field to
+    // prove the runtime guard fires even if a caller's types are loose.
+    expect(() => deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, scope: undefined }))
+      .toThrow(/scope/i);
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it('THROWS on any scope value other than exactly "shared" or "private"', () => {
+    mockConfiguredKb();
+    expect(() =>
+      // @ts-expect-error — invalid scope value on purpose
+      deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, scope: 'all' }),
+    ).toThrow(/scope/i);
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it('scope=private with no agent throws (same rule ingest already enforces)', () => {
+    mockConfiguredKb();
+    expect(() =>
+      deleteFromKnowledgeBase('/some/file.md', {
+        org: 'TestOrg',
+        frameworkRoot: baseOptions.frameworkRoot,
+        instanceId: baseOptions.instanceId,
+        scope: 'private',
+      }),
+    ).toThrow(/agent/i);
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('deleteFromKnowledgeBase — happy path', () => {
+  it('missing config: warn + return cleanly, execFileSync NEVER called', () => {
+    mockMissingKbConfig();
+
+    expect(() =>
+      deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, scope: 'private' }),
+    ).not.toThrow();
+
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+    expect(warnLog.some((m) => m.includes('TestOrg') && /run setup/i.test(m))).toBe(true);
+    expect(warnLog.some((m) => m.includes('[kb]'))).toBe(true);
+  });
+
+  it('scope=private: calls mmrag delete against the agent-<agent> collection, no --force-style flag', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+
+    deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, scope: 'private' });
+
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+    const [pythonPath, argv] = execFileSyncMock.mock.calls[0] as [string, string[], object];
+    expect(String(pythonPath)).toMatch(/python/);
+    expect(argv).toEqual(['/home/test/cortextOS/knowledge-base/scripts/mmrag.py', 'delete', '/some/file.md', '--collection', 'agent-tester']);
+  });
+
+  it('scope=shared: calls mmrag delete against the shared-<org> collection', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+
+    deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, scope: 'shared' });
+
+    const [, argv] = execFileSyncMock.mock.calls[0] as [string, string[], object];
+    expect(argv).toContain('shared-TestOrg');
+    expect(argv).not.toContain('agent-tester');
+  });
+
+  it('never exposes a raw --collection passthrough: the caller cannot name an arbitrary collection', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+
+    // deleteFromKnowledgeBase's options type has no `collection` field at
+    // all — this call proves the only inputs that influence the collection
+    // are org/agent/scope, exactly mirroring ingestKnowledgeBase.
+    deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, scope: 'private', agent: 'other-agent' });
+
+    const [, argv] = execFileSyncMock.mock.calls[0] as [string, string[], object];
+    expect(argv).toContain('agent-other-agent');
   });
 });
 

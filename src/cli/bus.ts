@@ -20,7 +20,7 @@ import { createReminder, listReminders, ackReminder, pruneReminders } from '../b
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron, computeReferenceMs } from '../daemon/cron-scheduler.js';
-import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
+import { queryKnowledgeBase, ingestKnowledgeBase, deleteFromKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, setActiveAccount, writeTokenToAgents, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { mintInstallationToken, shouldRefuseInteractivePrint, redactForJson } from '../bus/github-app.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -1504,6 +1504,34 @@ busCommand
       agent: opts.agent || env.agentName,
       scope: (opts.scope as 'shared' | 'private') || 'shared',
       force: opts.force,
+      frameworkRoot: env.frameworkRoot || process.cwd(),
+      instanceId: env.instanceId,
+    });
+  });
+
+busCommand
+  .command('kb-delete')
+  .description('Delete every indexed chunk for one source file from the knowledge base (irreversible — no default scope)')
+  .argument('<path>', 'Exact source file path to delete (no wildcard, no glob)')
+  .option('--org <org>', 'Organization name')
+  .option('--agent <name>', 'Agent name (required for --scope private)')
+  .option('--scope <s>', 'Scope: shared or private — REQUIRED, no default (an irreversible command must not guess)')
+  .action((path: string, opts: { org?: string; agent?: string; scope?: string }) => {
+    const env = resolveEnv();
+    const org = opts.org || env.org;
+    if (!org) {
+      console.error('ERROR: --org or CTX_ORG required');
+      process.exit(1);
+    }
+    if (opts.scope !== 'shared' && opts.scope !== 'private') {
+      console.error('ERROR: --scope shared|private is required — kb-delete has no default scope, since a wrong guess is unrecoverable (orgs/ is gitignored, there is no history to restore from).');
+      process.exit(1);
+    }
+
+    deleteFromKnowledgeBase(path, {
+      org,
+      agent: opts.agent || env.agentName,
+      scope: opts.scope,
       frameworkRoot: env.frameworkRoot || process.cwd(),
       instanceId: env.instanceId,
     });

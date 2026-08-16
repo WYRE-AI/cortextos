@@ -333,6 +333,79 @@ export function ingestKnowledgeBase(
 }
 
 /**
+ * Delete every indexed chunk for a single source file from the knowledge
+ * base — wraps mmrag.py's `delete <path> --collection` (mmrag.py:1464),
+ * which was previously only reachable by hand-building the MMRAG_* env vars
+ * and invoking the venv python directly.
+ *
+ * Deliberately narrower than ingestKnowledgeBase in two ways, both load-
+ * bearing for safety since a ChromaDB delete has no undo and orgs/ (where
+ * every agent's files live) is gitignored — there is no git history to
+ * recover from:
+ *   - `scope` has NO DEFAULT. ingestKnowledgeBase defaults to 'shared' when
+ *     omitted; an irreversible delete must never guess which collection to
+ *     empty a source out of, so an omitted/invalid scope throws instead.
+ *   - the collection is always DERIVED from org/agent/scope, exactly like
+ *     ingest — callers cannot pass an arbitrary collection name, so this
+ *     can never be used to reach into a collection unrelated to the caller.
+ * Single path only (no paths array, no glob expansion) — this deletes by
+ * exact `source` metadata match inside mmrag.py, so anything that isn't a
+ * precise path is a footgun, not a feature.
+ */
+export function deleteFromKnowledgeBase(
+  path: string,
+  options: {
+    org: string;
+    agent?: string;
+    scope: 'shared' | 'private';
+    frameworkRoot: string;
+    instanceId: string;
+  },
+): void {
+  const { agent, scope, frameworkRoot, instanceId } = options;
+  // Normalize once (see queryKnowledgeBase for rationale).
+  const org = normalizeOrgName(frameworkRoot, options.org);
+
+  if (scope !== 'shared' && scope !== 'private') {
+    throw new Error(
+      `--scope must be exactly "shared" or "private" (got: ${JSON.stringify(scope)}) — ` +
+      'kb-delete has no default scope on purpose, since a wrong guess is unrecoverable.',
+    );
+  }
+
+  const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
+
+  if (!kbConfigured(env)) {
+    console.warn(
+      `[kb] Knowledge base not configured for org ${org}. Skipping delete — ` +
+      `run setup to enable (see HEARTBEAT.md step 10 for the config path).`,
+    );
+    return;
+  }
+
+  let collection: string;
+  if (scope === 'private') {
+    if (!agent) throw new Error('--agent or CTX_AGENT_NAME required for --scope private');
+    collection = `agent-${agent}`;
+  } else {
+    collection = `shared-${org}`;
+  }
+
+  const pythonPath = getVenvPython(frameworkRoot);
+  const mmragPath = join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
+
+  console.log(`Deleting from collection: ${collection}`);
+  console.log(`  Source: ${path}`);
+
+  execFileSync(pythonPath, [mmragPath, 'delete', path, '--collection', collection], {
+    encoding: 'utf-8',
+    timeout: 30000,
+    env,
+    stdio: 'inherit',
+  });
+}
+
+/**
  * Ensure the knowledge base directories exist for an org.
  *
  * `frameworkRoot` is required so the org name can be normalized to its
