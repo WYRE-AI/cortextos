@@ -20,7 +20,7 @@ import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { resolveAgentDir } from '../utils/agent-dir.js';
 import { stripBom } from '../utils/strip-bom.js';
-import { writeAgentPid, readAgentPid, clearAgentPid, reapOrphan, isPidAlive } from '../utils/agent-pidfile.js';
+import { readAgentPid, clearAgentPid, reapOrphan, isPidAlive } from '../utils/agent-pidfile.js';
 import { tryAcquireRestartLock, releaseRestartLock } from './restart-lock.js';
 import { RotationManager } from './rotation-manager.js';
 import { LimitScanner } from './limit-detector.js';
@@ -546,12 +546,12 @@ export class AgentManager {
     // Start agent
     await agentProcess.start();
 
-    // Persist the PTY pid so start/stop reconcile can detect divergence between
-    // this in-memory registry and the real process — including across daemon
-    // generations (a crash leaves the Map empty but the PTY may survive on disk
-    // as an orphan). Best-effort; writeAgentPid never throws.
-    const spawnedPid = agentProcess.getPid();
-    if (spawnedPid) writeAgentPid(paths.stateDir, name, spawnedPid, process.pid);
+    // The PTY pid is persisted by AgentProcess.start() itself. It used to be
+    // written here, but this is only ONE of five callers of start() — the
+    // other four are restart paths inside AgentProcess that respawn the PTY
+    // with a new pid, so the record went stale on every self-restart. Moving
+    // it to the choke point covers all five; writing it here too would just
+    // duplicate the same values.
 
     // Subtask 2.2: Auto-migrate crons from config.json → crons.json before
     // starting the scheduler, so the scheduler always has a populated crons.json

@@ -59,6 +59,31 @@ land, so it could never present as a silent loss), and the **stale-lock steal**
 path is excluded by construction (`STALE_LOCK_MS` 30s exceeds the 5s lock
 timeout, so a steal cannot occur within a single acquisition wait).
 
+### Fixed — the agent pid record went stale on every self-restart
+
+`writeAgentPid` was called by `AgentManager` immediately after
+`await agentProcess.start()`. That is only **one of five** callers of
+`AgentProcess.start()`: the other four are restart paths inside
+`AgentProcess` itself — session-refresh, image-poison recovery, rate-limit
+recovery, and generic crash recovery — each of which respawns the PTY with a
+new pid and wrote nothing.
+
+So the record was accurate exactly once, on the daemon-managed first spawn,
+and went stale the moment an agent restarted itself. The rate-limit path
+means records drifted during precisely the incidents where establishing
+liveness matters most. With no usable pid record, identifying an agent's
+process falls back to matching on `lsof` cwd, because the process cmdline
+does not contain the agent name.
+
+The write now happens inside `start()` — the one point every agent start
+passes through — and is removed from the caller. It stays best-effort and
+cannot fail a spawn.
+
+Note this was never able to kill the wrong process: `verifyOwnership`
+anchors on process start time, so a recycled pid returns `unverified` and
+`reapOrphan` refuses to signal it and logs why. The defect was a missing
+record, not an unsafe one.
+
 ### Fixed — node-pty's `spawn-helper` lost its executable bit on install, crashing every agent spawn
 
 A plain `npm install`/`npm ci` of `node-pty@1.1.0` leaves

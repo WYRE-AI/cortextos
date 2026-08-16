@@ -38,6 +38,17 @@ vi.mock('../../../src/bus/reminders.js', () => ({
   getOverdueReminders: vi.fn().mockReturnValue([]),
 }));
 
+const pidfileMocks = {
+  writeAgentPid: vi.fn(),
+};
+
+vi.mock('../../../src/utils/agent-pidfile.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../src/utils/agent-pidfile')>(
+    '../../../src/utils/agent-pidfile',
+  );
+  return { ...actual, writeAgentPid: (...args: unknown[]) => pidfileMocks.writeAgentPid(...args) };
+});
+
 vi.mock('../../../src/utils/paths.js', () => ({
   resolvePaths: vi.fn().mockReturnValue({ stateDir: '/tmp/test-ctx/state/alice' }),
 }));
@@ -870,5 +881,67 @@ describe('AgentProcess.injectMessageDetailed — RESTARTING code (bus-message si
 
     expect(result.ok).toBe(false);
     expect((result as { code: string }).code).toBe('NOT_RUNNING');
+  });
+});
+
+describe('AgentProcess — pid record written at the start() choke point', () => {
+  beforeEach(() => {
+    pidfileMocks.writeAgentPid.mockClear();
+  });
+
+  it('start() records the live PTY pid', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(pidfileMocks.writeAgentPid).toHaveBeenCalledTimes(1);
+    const [stateDir, agentName, pid, daemonPid] = pidfileMocks.writeAgentPid.mock.calls[0];
+    expect(stateDir).toBe('/tmp/test-ctx/state/alice');
+    expect(agentName).toBe('alice');
+    expect(pid).toBe(12345);          // mockPty.getPid()
+    expect(daemonPid).toBe(process.pid);
+  });
+
+  it('REGRESSION: a SELF-RESTART re-records the pid, so the record cannot go stale', async () => {
+    // The defect this fixes. writeAgentPid used to live in AgentManager, at
+    // the ONE caller that spawns an agent from outside. The four restart
+    // paths inside AgentProcess (image-poison, rate-limit, generic, and the
+    // session-refresh at :380) all call this.start() directly and wrote no
+    // pid — so after any self-restart the record still named the pid of a
+    // process that no longer exists. Notably :881 is the RATE-LIMIT restart,
+    // so records went stale during exactly the incidents where liveness
+    // matters most.
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    expect(pidfileMocks.writeAgentPid).toHaveBeenCalledTimes(1);
+    expect(pidfileMocks.writeAgentPid.mock.calls[0][2]).toBe(12345);
+
+    // Drive the real restart shape: start() early-returns while status is
+    // 'running', so a self-restart necessarily goes through a PTY exit first.
+    capturedOnExit!(1);
+    // The PTY comes back with a different pid, as a real respawn would.
+    mockPty.getPid.mockReturnValue(67890);
+    await ap.start();
+
+    const calls = pidfileMocks.writeAgentPid.mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    // Pre-fix the record would still name 12345 — a process that is gone.
+    expect(calls[calls.length - 1][2]).toBe(67890);
+    mockPty.getPid.mockReturnValue(12345);
+  });
+
+  it('a failed spawn records NO pid — an absent record beats one naming a process that never ran', async () => {
+    mockPty.spawn.mockRejectedValueOnce(new Error('boom'));
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(pidfileMocks.writeAgentPid).not.toHaveBeenCalled();
+  });
+
+  it('a pidfile write failure never breaks the spawn', async () => {
+    pidfileMocks.writeAgentPid.mockImplementationOnce(() => { throw new Error('disk full'); });
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await expect(ap.start()).resolves.toBeUndefined();
+    expect(ap.getStatus().status).toBe('running');
   });
 });
