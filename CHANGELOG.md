@@ -196,6 +196,7 @@ That is a different failure — the agent completes a turn every cycle, the
 Stop hook writes `last_idle.flag` unconditionally, and the sensor correctly
 reports it as not wedged. Tracked separately; a test pins that boundary so
 this fix is not misread as closing it.
+
 ### Fixed — the agent pid record went stale on every self-restart
 
 `writeAgentPid` was called by `AgentManager` immediately after
