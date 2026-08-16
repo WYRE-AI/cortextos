@@ -281,13 +281,38 @@ export function removeCron(agentName: string, name: string): boolean {
  * (shallow merge).  The `name` field in `patch` is ignored — the cron is
  * looked up by the `name` parameter and the stored name is never changed.
  *
+ * Rejects an empty or whitespace-only `prompt`. A cron whose prompt has been
+ * blanked still loads, still shows `enabled` in `list-crons`, and still fires
+ * on schedule — it just injects nothing. It is a no-op cron that is
+ * indistinguishable from a working one at every surface an operator checks,
+ * which is why this has to fail loudly at write time rather than be noticed
+ * later.
+ *
+ * The guard lives here, at the choke point, because there are two paths to this
+ * operation and only one of them was covered: `handleUpdateCron`
+ * (`src/daemon/ipc-server.ts`) has validated the prompt all along, while
+ * `bus update-cron` passed `--prompt ""` straight through and reported success.
+ * Same operation, two entry points, opposite behaviour. Guarding the callers
+ * individually is what produced that split, so this follows #120 — write it at
+ * the choke point, not at one caller.
+ *
+ * `cron-scheduler.ts` also calls this (for `last_fire_attempted_at` and
+ * friends) and never patches `prompt`, so it is unaffected.
+ *
  * @returns `true` if the cron was found and updated; `false` if it did not exist.
+ * @throws {Error} if `patch.prompt` is present but empty or whitespace-only.
  */
 export function updateCron(
   agentName: string,
   name: string,
   patch: Partial<CronDefinition>
 ): boolean {
+  if (patch.prompt !== undefined && !patch.prompt.trim()) {
+    throw new Error(
+      'Cron prompt must be non-empty — an empty prompt produces a cron that fires and does nothing.'
+    );
+  }
+
   return withFileLockSync(lockDirFor(agentName), () => {
     const existing = readCrons(agentName);
     const idx = existing.findIndex(c => c.name === name);
