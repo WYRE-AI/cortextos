@@ -157,6 +157,45 @@ export function mostRecentDeliveredFireMs(crons: Cronish[]): number | null {
 }
 
 /**
+ * Most-recent fire the agent has ALREADY HAD `graceMs` to answer.
+ *
+ * Why this exists rather than {@link mostRecentDeliveredFireMs}: the field is
+ * `last_fire_attempted_at` — ATTEMPTED, not consumed — so it keeps advancing
+ * whether or not the agent is alive to receive the fire. Anchoring on the
+ * newest attempt means that for any agent whose tightest cron interval is
+ * <= graceMs, `now - T` is ALWAYS within grace, so evaluateHang returns
+ * "within grace" on every poll and never reaches the beat comparison. The
+ * anchor refreshes itself faster than the grace window can expire, and the
+ * agent becomes undetectable for as long as its crons keep firing.
+ *
+ * The perverse consequence: monitoring an agent MORE closely made it LESS
+ * detectable. On 2026-08-15 the fleet's tightest-cadence agent (15m) went
+ * unflagged for 11 hours, and escaped only when a fire happened to land late.
+ *
+ * Selecting the newest fire that is already older than grace makes detection
+ * latency bounded by roughly (cron interval + graceMs) regardless of cadence,
+ * and leaves infrequent-cron agents behaving exactly as before — for a 4h
+ * cron, the newest fire is virtually always older than grace already.
+ *
+ * Returns null when no fire has ripened yet; evaluateHang treats null as
+ * fail-safe (not hung).
+ */
+export function mostRecentAnswerableFireMs(
+  crons: Cronish[],
+  now: number,
+  graceMs: number,
+): number | null {
+  let max: number | null = null;
+  for (const c of crons) {
+    const t = toMs(c.last_fire_attempted_at);
+    if (t === null) continue;
+    if (now - t <= graceMs) continue; // too fresh to have been answered yet
+    if (max === null || t > max) max = t;
+  }
+  return max;
+}
+
+/**
  * The trigger condition. HUNG iff (positive assertion on every input):
  *   1. a delivered fire T is recorded, AND
  *   2. now - T > grace N, AND

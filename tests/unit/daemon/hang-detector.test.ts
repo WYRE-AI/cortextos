@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateHang, evaluateBootstrapHang, mostRecentDeliveredFireMs, hasBeatSinceRestart } from '../../../src/daemon/hang-detector.js';
+import { evaluateHang, evaluateBootstrapHang, mostRecentDeliveredFireMs, mostRecentAnswerableFireMs, hasBeatSinceRestart } from '../../../src/daemon/hang-detector.js';
 
 const MIN = 60_000;
 const GRACE = 15 * MIN;
@@ -282,5 +282,96 @@ describe('hang-detector — hasBeatSinceRestart (restart-loop-counter reset sign
   it('FALSE: all three beats predate the restart', () => {
     const R = NOW - 20 * MIN;
     expect(hasBeatSinceRestart(R, R - 5 * MIN, R - 3 * MIN, R - MIN)).toBe(false);
+  });
+});
+
+describe('hang-detector — a frequent cron must not blind the sensor (self-refreshing anchor)', () => {
+  const CRON_INTERVAL = 15 * MIN; // maintainer's trigger-scan — the tightest in the fleet
+
+  /**
+   * Fires ATTEMPTED every CRON_INTERVAL since `onset`, up to `now`.
+   *
+   * This is the whole defect in one helper: last_fire_attempted_at records the
+   * ATTEMPT, so it keeps advancing whether or not the agent is alive to consume
+   * it. A wedged agent's newest fire is therefore always fresh.
+   */
+  const firesSince = (onset: number, now: number) => {
+    const out: Array<{ last_fire_attempted_at: string }> = [];
+    for (let t = onset; t <= now; t += CRON_INTERVAL) out.push({ last_fire_attempted_at: iso(t) });
+    return out;
+  };
+
+  // Deliberately NOT asserted as "never flags". That shape passes on the broken
+  // code and fails on a correct fix, so it would lock the defect in. Bounded
+  // detection latency from onset is the property that actually matters.
+  const BOUND = CRON_INTERVAL + GRACE + 1 * MIN; // one interval to advance past onset, one grace to ripen
+
+  it('REGRESSION: a wedged agent on a 15m cron IS flagged within a bounded time of onset', () => {
+    const onset = NOW - BOUND;
+    const crons = firesSince(onset, NOW);
+    const S = onset; // last real beat: the moment it wedged
+
+    const T = mostRecentAnswerableFireMs(crons, NOW, GRACE);
+    expect(T).not.toBeNull();
+    const r = evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: T, lastSessionHeartbeat: S });
+    expect(r.hung).toBe(true);
+  });
+
+  it('the OLD anchor cannot flag it at any elapsed time — the defect, pinned', () => {
+    // Same wedged agent, 11 hours in — the real 2026-08-15 duration.
+    const onset = NOW - 11 * 60 * MIN;
+    const crons = firesSince(onset, NOW);
+    const S = onset;
+
+    const stale = mostRecentDeliveredFireMs(crons)!; // newest ATTEMPT — always fresh
+    expect(NOW - stale).toBeLessThanOrEqual(GRACE);  // hence permanently "within grace"
+    expect(evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: stale, lastSessionHeartbeat: S }).hung).toBe(false);
+
+    // The corrected anchor flags the same agent from the same inputs.
+    const fixed = mostRecentAnswerableFireMs(crons, NOW, GRACE);
+    expect(evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: fixed, lastSessionHeartbeat: S }).hung).toBe(true);
+  });
+
+  it('CONTROL: a HEALTHY agent on the same 15m cron is not flagged', () => {
+    const onset = NOW - 11 * 60 * MIN;
+    const crons = firesSince(onset, NOW);
+    const S = NOW - 2 * MIN; // beating normally
+
+    const T = mostRecentAnswerableFireMs(crons, NOW, GRACE);
+    expect(evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: T, lastSessionHeartbeat: S }).hung).toBe(false);
+  });
+
+  it('CONTROL: an infrequent (4h) cron behaves exactly as before — no fleet-wide change', () => {
+    const T4 = NOW - 20 * MIN; // a 4h cron that fired 20min ago
+    const crons = [{ last_fire_attempted_at: iso(T4) }];
+    expect(mostRecentAnswerableFireMs(crons, NOW, GRACE)).toBe(T4);
+    expect(mostRecentDeliveredFireMs(crons)).toBe(T4); // identical to the old anchor
+  });
+
+  it('no fire is old enough yet — returns null, and null is fail-safe', () => {
+    const crons = [{ last_fire_attempted_at: iso(NOW - 3 * MIN) }];
+    expect(mostRecentAnswerableFireMs(crons, NOW, GRACE)).toBeNull();
+    expect(evaluateHang({
+      now: NOW, graceMs: GRACE,
+      deliveredFireAt: mostRecentAnswerableFireMs(crons, NOW, GRACE),
+      lastSessionHeartbeat: NOW - 60 * MIN,
+    }).hung).toBe(false);
+  });
+
+  it('a fresh activity flag still suppresses the verdict — maxBeat is UNCHANGED here', () => {
+    // Documents the boundary of this fix, so nobody reads it as closing the
+    // 2026-08-15 credit-exhaustion outage. There the agent completed a turn
+    // every cycle, the Stop hook wrote last_idle.flag unconditionally, and S
+    // stayed fresh. A corrected anchor reaches the S >= T comparison and still
+    // returns healthy — correctly, because that agent was NOT wedged.
+    const onset = NOW - 11 * 60 * MIN;
+    const crons = firesSince(onset, NOW);
+    const T = mostRecentAnswerableFireMs(crons, NOW, GRACE);
+    const r = evaluateHang({
+      now: NOW, graceMs: GRACE, deliveredFireAt: T,
+      lastSessionHeartbeat: onset,   // 11h stale
+      lastIdleFlagAt: NOW - 1 * MIN, // but turns ARE completing
+    });
+    expect(r.hung).toBe(false);
   });
 });
