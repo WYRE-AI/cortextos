@@ -135,9 +135,21 @@ export function initWatcher(): FSWatcher {
 
   const watcher = createWatcher();
 
-  if (process.env.NODE_ENV !== 'production') {
-    globalForWatcher.__cortextos_watcher = watcher;
-  }
+  // Store the singleton UNCONDITIONALLY, production included.
+  //
+  // This was previously guarded by `NODE_ENV !== 'production'`, copying the
+  // hot-reload pattern used for the emitter above. That guard is correct for
+  // module-level state (the emitter is a module const, so production retains it
+  // anyway) but WRONG here: the watcher is function-local, so with nothing
+  // storing it the early-return guard never fired, every call built a new
+  // watcher and ran another full sync, and no reference outlived the request.
+  //
+  // initWatcher's only caller was the SSE route, so in production the dashboard
+  // ingested ONLY while a browser held an open SSE connection — it was not a
+  // monitoring system, it was a live view that recorded only while watched.
+  // Measured: the DB sat frozen for 37 hours while the process was online,
+  // serving, and green.
+  globalForWatcher.__cortextos_watcher = watcher;
 
   return watcher;
 }
