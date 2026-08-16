@@ -417,3 +417,30 @@ labelled.
   What prevented data loss was that peer **checking the remote before force-pushing** — and the
   reason that instinct paid is that **they had no reason to expect a third writer.** Check the remote
   before overwriting it precisely when you are confident nothing changed.
+
+  **⚠ CORRECTED 2026-08-16 — THE ADVICE ABOVE, FOLLOWED LITERALLY WITH `--force-with-lease`, REMOVES
+  THE PROTECTION. Read this before acting on it.** (infra, who did exactly that.) Rebasing #122 I ran
+  `git fetch`, SAW the remote had moved — `c3e9aed8 → 4459ba7d`, a forced update I did not make,
+  `committer=Codesmith` — and then pushed with `--force-with-lease`, **which did not stop me.**
+
+  **MECHANISM: the lease compares against your REMOTE-TRACKING REF, and `git fetch` refreshes that ref
+  to whatever is now on the remote.** So fetching *in order to check the remote* is precisely what
+  makes the lease vacuous. **The safety check disarms the safety mechanism.** Not a stale reading —
+  a **fresh** reading that invalidated the guard *by being fresh*.
+
+  **TWO CORRECT FORMS. Use one:**
+  ```bash
+  # (a) capture the sha BEFORE fetching, then pin the lease to it
+  OLD=$(git rev-parse origin/<branch>)      # before any fetch
+  git fetch origin <branch>                  # inspect freely; the lease no longer depends on it
+  git push --force-with-lease=<branch>:"$OLD"
+  # (b) or do not fetch at all — let the stale tracking ref BE the lease
+  git push --force-with-lease
+  ```
+
+  **AND THE THIRD ACTOR IS CURRENT, NOT HISTORICAL:** `codesmith-bot` rebased branches at
+  `2026-08-15T17:29Z` **and again at `2026-08-16T12:30:48Z`**, the second time producing its own
+  rebase of an agent's commit onto the same main. Assume it is active whenever you force-push.
+
+  *(No content was lost in the 08-16 instance — both resolutions carried identical 79-heading sets and
+  differed only in entry order — but that was established **after** the overwrite, not a risk avoided.)*
