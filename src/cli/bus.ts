@@ -6,7 +6,7 @@ import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -294,8 +294,14 @@ busCommand
   .action((id: string) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const open = checkTaskDependencies(paths, id);
+    const { open, unresolved } = checkTaskDependenciesWithStatus(paths, id);
     if (open.length === 0) {
+      if (unresolved) {
+        // Do not print "ready to work" off a scan that never completed.
+        console.log(`${id}: dependency state UNKNOWN — a task directory could not be read, so this is NOT an all-clear`);
+        process.exitCode = 1;
+        return;
+      }
       console.log(`${id}: no open dependencies — ready to work`);
       return;
     }

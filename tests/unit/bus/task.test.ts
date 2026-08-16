@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, checkTaskDependenciesWithStatus, compactTasks, listTasks, findTaskFile, findTaskFileWithStatus, archiveTasks } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -933,5 +933,89 @@ describe('findTaskFile — tier-3 unique-prefix resolution', () => {
     expect(findTaskFile(paths, 'task_1700000000003')).toContain(
       'task_1700000000003_33333333.json',
     );
+  });
+});
+
+describe('lookup completion status — "nothing there" vs "I did not look"', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-task-status-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'paul'),
+      inflight: join(testDir, 'inflight', 'paul'),
+      processed: join(testDir, 'processed', 'paul'),
+      logDir: join(testDir, 'logs', 'paul'),
+      stateDir: join(testDir, 'state', 'paul'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+    mkdirSync(paths.taskDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  // Make readdirSync(orgsRoot) throw ENOTDIR deterministically. Preferred over
+  // chmod 000, which a root-owned CI container silently ignores — the scan would
+  // then succeed and the test would pass while proving nothing.
+  const breakOrgsTree = (): void => {
+    writeFileSync(join(testDir, 'orgs'), 'not a directory');
+  };
+
+  const ABSENT = 'task_9999999999999_000';
+
+  it('CONTROL: a readable tree with no match reports a COMPLETED lookup', () => {
+    const r = findTaskFileWithStatus(paths, ABSENT);
+    expect(r.path).toBeNull();
+    expect(r.unreadable).toBe(false); // genuine absence — callers may trust it
+  });
+
+  it('an unreadable orgs tree reports the lookup did NOT complete', () => {
+    breakOrgsTree();
+    const r = findTaskFileWithStatus(paths, ABSENT);
+    expect(r.path).toBeNull();
+    expect(r.unreadable).toBe(true); // `path: null` here is NOT evidence of absence
+  });
+
+  it('THE COLLAPSE: both cases are byte-identical through the legacy wrapper', () => {
+    const genuine = findTaskFile(paths, ABSENT);
+    breakOrgsTree();
+    const unreadable = findTaskFile(paths, ABSENT);
+    // Documents exactly what the WithStatus split exists to recover. The wrapper
+    // is intentionally lossy (mirrors readCrons); callers that care must migrate.
+    expect(genuine).toBeNull();
+    expect(unreadable).toBeNull();
+  });
+
+  it('a findable task still resolves, and reports a completed lookup', () => {
+    const id = createTask(paths, 'alice', 'acme', 'Findable');
+    const r = findTaskFileWithStatus(paths, id);
+    expect(r.path).not.toBeNull();
+    expect(r.unreadable).toBe(false);
+  });
+
+  it('CONTROL: no blockers on a readable tree is a TRUSTWORTHY all-clear', () => {
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    const blocked = createTask(paths, 'alice', 'acme', 'Blocked', { blockedBy: [blocker] });
+    completeTask(paths, blocker, 'done');
+    const r = checkTaskDependenciesWithStatus(paths, blocked);
+    expect(r.open).toEqual([]);
+    expect(r.unresolved).toBe(false);
+  });
+
+  it('REGRESSION: an unreadable tree must NOT produce a clean bill of health', () => {
+    // The dangerous path. Both consumers read `open.length === 0` as an
+    // affirmative all-clear: the CLI prints "ready to work", and the drift
+    // scanner emits a `resolved_dependency` finding asserting the blockers
+    // "are all completed" — a claim built from blocked_by WITHOUT reading them.
+    breakOrgsTree();
+    const r = checkTaskDependenciesWithStatus(paths, ABSENT);
+    expect(r.unresolved).toBe(true);
   });
 });

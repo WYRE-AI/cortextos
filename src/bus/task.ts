@@ -158,34 +158,97 @@ function detectCycleOrThrow(
 }
 
 /**
+ * Result of {@link findTaskFileWithStatus}.
+ *
+ * `unreadable` separates two cases that a bare `path: null` merges:
+ *
+ *   - `unreadable: false` — every candidate directory was scanned and the task
+ *     is genuinely not on disk. Callers may treat this as real absence.
+ *
+ *   - `unreadable: true` — a directory that EXISTS could not be read, so the
+ *     scan aborted early. The task may well be present. `path: null` here is
+ *     the absence of a lookup, not the absence of a task.
+ *
+ * NEVER read `path === null` alone as "no such task" — see {@link findTaskFile}.
+ */
+export interface TaskFileLookup {
+  path: string | null;
+  unreadable: boolean;
+}
+
+/**
+ * Result of {@link checkTaskDependenciesWithStatus}.
+ *
+ * `unresolved: true` means the dependency picture is INCOMPLETE — the task or
+ * one of its blockers could not be read. An empty `open` is then meaningless
+ * and must never be rendered as "ready to work".
+ */
+export interface TaskDependencyCheck {
+  open: Array<{ id: string; status: TaskStatus | 'missing' }>;
+  unresolved: boolean;
+}
+
+/**
  * Resolve blockers for `taskId`: returns the list of tasks in its
- * `blocked_by` that are NOT yet completed. Empty list = good to go.
+ * `blocked_by` that are NOT yet completed, plus whether the picture is
+ * complete. `open: []` AND `unresolved: false` = good to go.
  * A missing peer is reported as `{ id, status: 'missing' }` so callers
  * can distinguish "dependency cleared" from "dependency references a
  * task that no longer exists".
+ *
+ * The `unresolved` flag exists because an empty `open` list is consumed as an
+ * affirmative all-clear in both call sites — the CLI prints "ready to work",
+ * and the drift scanner emits a `resolved_dependency` finding whose detail
+ * asserts the blockers "are all completed". That sentence is built from
+ * `blocked_by` alone, so on an unreadable tree it states as fact something no
+ * code ever read. A gate that cannot verify must hold, not open.
+ */
+export function checkTaskDependenciesWithStatus(
+  paths: BusPaths,
+  taskId: string,
+): TaskDependencyCheck {
+  const lookup = findTaskFileWithStatus(paths, taskId);
+  if (!lookup.path) return { open: [], unresolved: lookup.unreadable };
+  const filePath = lookup.path;
+  let task: Task;
+  try { task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task; }
+  catch { return { open: [], unresolved: true }; } // found it, could not parse it
+  const deps = task.blocked_by ?? [];
+  const open: Array<{ id: string; status: TaskStatus | 'missing' }> = [];
+  let unresolved = false;
+  for (const depId of deps) {
+    const depLookup = findTaskFileWithStatus(paths, depId);
+    if (!depLookup.path) {
+      // A dep we could not LOOK UP is not a dep we know is gone. Both land in
+      // `open` so the gate stays shut either way, but only the first is a fact.
+      if (depLookup.unreadable) unresolved = true;
+      open.push({ id: depId, status: 'missing' });
+      continue;
+    }
+    try {
+      const dep = JSON.parse(readFileSync(depLookup.path, 'utf-8')) as Task;
+      if (dep.status !== 'completed') open.push({ id: depId, status: dep.status });
+    } catch {
+      unresolved = true;
+      open.push({ id: depId, status: 'missing' });
+    }
+  }
+  return { open, unresolved };
+}
+
+/**
+ * Back-compat wrapper over {@link checkTaskDependenciesWithStatus}.
+ *
+ * @returns only the open-blocker list, DISCARDING whether that list is
+ *          trustworthy. An empty array means "no open blockers" OR "could not
+ *          tell". Use {@link checkTaskDependenciesWithStatus} anywhere the
+ *          result gates an action or is shown to a human.
  */
 export function checkTaskDependencies(
   paths: BusPaths,
   taskId: string,
 ): Array<{ id: string; status: TaskStatus | 'missing' }> {
-  const filePath = findTaskFile(paths, taskId);
-  if (!filePath) return [];
-  let task: Task;
-  try { task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task; }
-  catch { return []; }
-  const deps = task.blocked_by ?? [];
-  const open: Array<{ id: string; status: TaskStatus | 'missing' }> = [];
-  for (const depId of deps) {
-    const depPath = findTaskFile(paths, depId);
-    if (!depPath) { open.push({ id: depId, status: 'missing' }); continue; }
-    try {
-      const dep = JSON.parse(readFileSync(depPath, 'utf-8')) as Task;
-      if (dep.status !== 'completed') open.push({ id: depId, status: dep.status });
-    } catch {
-      open.push({ id: depId, status: 'missing' });
-    }
-  }
-  return open;
+  return checkTaskDependenciesWithStatus(paths, taskId).open;
 }
 
 /**
@@ -220,13 +283,13 @@ export function checkTaskDependencies(
  * that needs cross-org task lookup (e.g. a hypothetical `get-task` command,
  * task-graph visualization, or cross-org list-tasks flag).
  */
-export function findTaskFile(paths: BusPaths, taskId: string): string | null {
+export function findTaskFileWithStatus(paths: BusPaths, taskId: string): TaskFileLookup {
   // Reject path-traversal task ids before they reach any join() below. This is
   // the chokepoint for updateTask/claimTask/completeTask/checkTaskDependencies.
   validateTaskId(taskId);
   // Fast path: same-org lookup.
   const sameOrg = join(paths.taskDir, `${taskId}.json`);
-  if (existsSync(sameOrg)) return sameOrg;
+  if (existsSync(sameOrg)) return { path: sameOrg, unreadable: false };
 
   // Fallback: cross-org scan.
   const orgsRoot = join(paths.ctxRoot, 'orgs');
@@ -242,6 +305,8 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
   } catch {
     // orgs/ missing or unreadable — the prefix scan still covers the
     // caller's own taskDir (which is not guaranteed to live under orgs/).
+    // It re-derives `unreadable` from its own sweep, so the flag reflects
+    // whether ANY dir was left unscanned rather than just this one throw.
     return findTaskFileByPrefix(paths, taskId, orgsRoot);
   }
 
@@ -254,7 +319,21 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
       `Review task ID generation if this recurs.`,
     );
   }
-  return matches[0].path;
+  return { path: matches[0].path, unreadable: false };
+}
+
+/**
+ * Back-compat wrapper over {@link findTaskFileWithStatus}, kept because most
+ * callers genuinely do not care why the lookup came back empty.
+ *
+ * @returns the task file path, or `null` for BOTH "no such task" and "the scan
+ *          could not be completed". That collapse is the entire reason
+ *          {@link findTaskFileWithStatus} exists — use it wherever a `null` is
+ *          about to be reported to a human, written into a finding, or treated
+ *          as an affirmative all-clear.
+ */
+export function findTaskFile(paths: BusPaths, taskId: string): string | null {
+  return findTaskFileWithStatus(paths, taskId).path;
 }
 
 /**
@@ -266,12 +345,16 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
  * prefix throws NAMING every candidate (so the operator can see what to
  * disambiguate to) rather than silently picking one; no match falls
  * through to the caller's existing not-found error.
+ *
+ * Returns a {@link TaskFileLookup} rather than a bare `string | null` so the
+ * "scan aborted" path stays distinguishable from "scan completed, found
+ * nothing" — see {@link findTaskFileWithStatus}.
  */
 function findTaskFileByPrefix(
   paths: BusPaths,
   taskIdPrefix: string,
   orgsRoot: string,
-): string | null {
+): TaskFileLookup {
   const prefixMatches: Array<{ path: string; id: string; org: string }> = [];
   const scanDir = (tasksDir: string, org: string): void => {
     if (!existsSync(tasksDir)) return;
@@ -299,9 +382,12 @@ function findTaskFileByPrefix(
       }
     }
   } catch {
-    return null; // orgs/ or a tasks dir unreadable
+    // A tasks dir EXISTS but could not be read (EACCES/EIO/ENOTDIR). Absence is
+    // already handled by the existsSync guards above and never lands here, so
+    // this is unambiguously "the scan aborted", not "there was nothing to find".
+    return { path: null, unreadable: true };
   }
-  if (prefixMatches.length === 1) return prefixMatches[0].path;
+  if (prefixMatches.length === 1) return { path: prefixMatches[0].path, unreadable: false };
   if (prefixMatches.length > 1) {
     const candidates = prefixMatches.map((m) => `${m.id} (org: ${m.org})`).join(', ');
     throw new Error(
@@ -309,7 +395,7 @@ function findTaskFileByPrefix(
       `${candidates}. Use the full task id.`,
     );
   }
-  return null;
+  return { path: null, unreadable: false }; // scan completed, genuinely no match
 }
 
 /**
