@@ -7,7 +7,7 @@ import type { BusPaths, TaskStatus } from '../types/index.js';
 import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
 import { resolvePaths } from '../utils/paths.js';
 import { sendMessage } from './message.js';
-import { listTasks, checkTaskDependencies } from './task.js';
+import { listTasks, checkTaskDependenciesWithStatus } from './task.js';
 
 // --- Types ---
 
@@ -501,8 +501,10 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
 
     for (const task of blocked) {
       if ((task.blocked_by?.length ?? 0) > 0) {
-        const openDeps = checkTaskDependencies(paths, task.id);
-        if (openDeps.length === 0) {
+        const { open: openDeps, unresolved } = checkTaskDependenciesWithStatus(paths, task.id);
+        // An incomplete scan cannot support "blocked_by are all completed" —
+        // that detail string names the deps as a fact. Skip rather than assert.
+        if (openDeps.length === 0 && !unresolved) {
           entries.push({
             task_id: task.id,
             org,

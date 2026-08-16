@@ -3,10 +3,10 @@ import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
-import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
+import { sendMessage, checkInboxWithStatus, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -163,8 +163,15 @@ busCommand
   .action(() => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const messages = checkInbox(paths);
+    const { messages, skipped } = checkInboxWithStatus(paths);
+    // stdout shape is unchanged on purpose — agents and scripts parse this
+    // array. The "we never looked" signal rides stderr + exit code so an
+    // empty result can no longer be mistaken for a verified-empty inbox.
     console.log(JSON.stringify(messages));
+    if (skipped) {
+      console.error('[bus] check-inbox: could not acquire the inbox lock — the inbox was NOT read. The empty result above is not evidence the inbox is empty (stale .lock.d?).');
+      process.exitCode = 1;
+    }
   });
 
 busCommand
@@ -309,8 +316,14 @@ busCommand
   .action((id: string) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const open = checkTaskDependencies(paths, id);
+    const { open, unresolved } = checkTaskDependenciesWithStatus(paths, id);
     if (open.length === 0) {
+      if (unresolved) {
+        // Do not print "ready to work" off a scan that never completed.
+        console.log(`${id}: dependency state UNKNOWN — a task directory could not be read, so this is NOT an all-clear`);
+        process.exitCode = 1;
+        return;
+      }
       console.log(`${id}: no open dependencies — ready to work`);
       return;
     }
