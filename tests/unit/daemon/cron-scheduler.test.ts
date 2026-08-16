@@ -577,8 +577,6 @@ describe('CronScheduler', () => {
   // Regression guard for the 2026-08-15 fleet incident: editing a cron's prompt
   // via remove-then-add silently re-phased it (boss's `check-approvals` moved
   // 18:14/20:14Z -> 19:20/21:20Z, destroying a backstop nobody knew they had).
-  // The mechanism: a re-added cron has no `last_fired_at` and a fresh
-  // `created_at`, so computeReferenceMs anchors on ~now and the phase moves.
   //
   // `bus update-cron --prompt` avoids this at TWO independent levels:
   //   1. changeKeyFor() is `name|schedule` (cron-scheduler.ts:208-210), so a
@@ -588,9 +586,17 @@ describe('CronScheduler', () => {
   // The two existing tests above cover "identical definition" and "changed
   // schedule".  Neither covers "changed prompt, same schedule" — which is the
   // case the incident actually turned on.
+  //
+  // Part (b) is a SCHEDULER-LEVEL statement about a definition that carries no
+  // fire history at all: with nothing to anchor on, created_at is the anchor,
+  // and that is unchanged (10e3011f). It is no longer a statement about what
+  // the CLI does — this file mocks src/bus/crons.js wholesale, so it cannot see
+  // that removeCron now leaves the fire behind as a cron-state.json tombstone.
+  // A real remove-then-add therefore keeps its phase; that is pinned end-to-end
+  // against the unmocked path in tests/unit/bus/cron-phase-across-remove-add.
   // -------------------------------------------------------------------------
 
-  it('update-cron holds a cron\'s phase; remove-then-add re-phases it', async () => {
+  it('update-cron holds a cron\'s phase; a definition with no fire history anchors on created_at', async () => {
     const base    = Date.now();
     const THREE_H = 3 * 60 * 60 * 1000;
     const FOUR_H  = 4 * 60 * 60 * 1000;
@@ -613,9 +619,9 @@ describe('CronScheduler', () => {
     const afterUpdate = scheduler.getNextFireTimes().find(e => e.name === 'phase')!;
     expect(afterUpdate.nextFireAt).toBe(before.nextFireAt);
 
-    // (b) remove-then-add: two reloads, because that is what the CLI actually
-    //     does — the cron disappears, then returns as a NEW definition with a
-    //     fresh created_at and no last_fired_at.
+    // (b) the cron disappears, then returns as a NEW definition with a fresh
+    //     created_at and no fire history of any kind. Two reloads, because that
+    //     is the shape the scheduler sees across a remove and a re-add.
     mockReadCrons.mockReturnValue([]);            // remove-cron
     scheduler.reload();
     expect(scheduler.getNextFireTimes().find(e => e.name === 'phase')).toBeUndefined();
@@ -627,9 +633,10 @@ describe('CronScheduler', () => {
     scheduler.reload();
     const afterReadd = scheduler.getNextFireTimes().find(e => e.name === 'phase')!;
 
-    // The 2026-08-15 defect, pinned: the phase slipped by the full 3h of
-    // elapsed life. boss's check-approvals moved 18:14/20:14Z -> 19:20/21:20Z
-    // this way, destroying a backstop nobody knew they had.
+    // With no fire on record the anchor is created_at, so the phase slips by
+    // the full 3h of elapsed life. This is the shape the 2026-08-15 defect took
+    // (boss's check-approvals moved 18:14/20:14Z -> 19:20/21:20Z); the fix is
+    // to stop producing this input, not to re-anchor a cron that never fired.
     expect(afterReadd.nextFireAt).toBe(base + FOUR_H);
     expect(afterReadd.nextFireAt - before.nextFireAt).toBe(THREE_H);
   });
