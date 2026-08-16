@@ -33,6 +33,32 @@ cannot verify now holds instead of opening. Behaviour is unchanged on any
 healthy tree or inbox, and CLI stdout shapes are unchanged because agents
 parse them; the new signal rides stderr and the exit code.
 
+### Fixed — the concurrent-cron race test reported a bare count, making its own flake undiagnosable
+
+`concurrent-cron-mutations.test.ts` fails intermittently — observed once in
+eight full-suite runs, and never once in 1120 standalone invocations
+(including under concurrent full-suite load). On failure it printed only how
+many updates were lost, which is not enough to tell apart two defects whose
+causes point in opposite directions:
+
+- every child exited 0 and an update still vanished — mutual exclusion broke
+- a child exited non-zero — lock timeout, or a spawn failure under load
+
+It also `await`ed `Promise.all` directly, so a non-zero exit rejected with the
+**first** failure and discarded the other seven children's outcomes.
+
+Each child's exit code and stderr are now captured rather than thrown, the
+on-disk cron state is dumped at the moment of failure, and the two shapes are
+asserted separately so they can never be collapsed into one number again.
+Both diagnostic paths are mutation-verified.
+
+This does not fix the race. Two candidate causes were ruled out while
+investigating: a lock **timeout** is excluded by experiment (a held lock makes
+`bus update-cron` exit 1 with a distinctive error and the update does not
+land, so it could never present as a silent loss), and the **stale-lock steal**
+path is excluded by construction (`STALE_LOCK_MS` 30s exceeds the 5s lock
+timeout, so a steal cannot occur within a single acquisition wait).
+
 ### Fixed — node-pty's `spawn-helper` lost its executable bit on install, crashing every agent spawn
 
 A plain `npm install`/`npm ci` of `node-pty@1.1.0` leaves
