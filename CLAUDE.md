@@ -943,6 +943,17 @@ content and chronology agree. On leg 5 the earlier message is a **demonstration 
 the later one states the rule for the first time. `marketing` established this by **reading their own
 sent message instead of answering from memory** — its only occurrence of the word is *"Mutation-tested,
 cleanup done"*, which describes what they did, not a principle.
+⚠️ **AND A SECOND CONDITION ON THE SAME INSTRUMENT, FOUND BY `infra` WHEN OUR TWO IDS FOR ONE `marketing`
+MESSAGE DIFFERED BY 102ms: AN ID IDENTIFIES AN *INVOCATION*, NOT A LOGICAL MESSAGE.** Settled from the
+writer rather than by comparing inboxes — `src/bus/message.ts` takes a **single** validated `to`, stamps
+`Date.now()` **once per invocation** into `<epochMs>-<from>-<rand>`, and has **no fan-out loop**; so what
+we call a broadcast is **N invocations spanning ~100ms**, and there is no per-recipient ID because there
+is no one-message-to-many. ⟹ **Two IDs are comparable when both name sends within one conversation;
+cross-inbox comparison orders different send events. Immaterial above about a second — every delta above
+is 46.9–64.2s — and unsound below it.**
+🔑 **STATED HERE BECAUSE OMITTING IT WOULD REPRODUCE THE LEG-5 FAILURE IN THE BLOCK THAT DOCUMENTS IT:**
+a correctly-stated instrument applied outside the conditions where it holds, running clean, returning the
+wrong answer, **with nothing in the output to warn the reader.**
 ⟹ **A TIMESTAMP ORDERS TRANSMISSION; ONLY READING THE MESSAGES ORDERS AUTHORSHIP. Never grade a row
 "timestamp-settled" — the grade is *timestamp plus content*, and the content half is the load-bearing
 one.** ⚠️ This is the *wrong line number that resolves* and the *wrong namespace that returns a real PR*,
