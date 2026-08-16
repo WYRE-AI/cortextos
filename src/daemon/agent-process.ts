@@ -10,6 +10,7 @@ import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
+import { writeAgentPid } from '../utils/agent-pidfile.js';
 import { resolvePaths } from '../utils/paths.js';
 import { tryAcquireRestartLock, releaseRestartLock, isRestartInFlight } from './restart-lock.js';
 
@@ -221,6 +222,32 @@ export class AgentProcess {
       this.status = 'running';
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
+
+      // Record the live PTY pid HERE, at the one point every agent start
+      // passes through — not at the caller. AgentManager used to do it, but it
+      // is only one of five callers of start(): the other four are restart
+      // paths inside this class (session-refresh, image-poison, rate-limit,
+      // generic crash recovery), which respawn the PTY with a NEW pid and
+      // wrote nothing. So the record was correct exactly once, on the
+      // daemon-managed first spawn, and went stale on every self-restart —
+      // including the rate-limit restart, i.e. precisely during the incidents
+      // where establishing liveness matters most.
+      //
+      // Best-effort by design: a pidfile is an optimization for reconcile and
+      // must never be able to fail a spawn.
+      try {
+        const spawnedPid = this.pty.getPid();
+        if (spawnedPid) {
+          writeAgentPid(
+            join(this.env.ctxRoot, 'state', this.name),
+            this.name,
+            spawnedPid,
+            process.pid,
+          );
+        }
+      } catch (err) {
+        this.log(`pidfile write failed (non-fatal): ${err}`);
+      }
 
       // Issue #392: codex-app-server does not reliably execute the inline
       // "Send a Telegram message saying you are back online" instruction the
