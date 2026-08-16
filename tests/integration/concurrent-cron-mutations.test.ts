@@ -91,12 +91,42 @@ function seedCrons(agent: string, count: number): string[] {
   return names;
 }
 
-async function runUpdate(agent: string, name: string, newPrompt: string): Promise<void> {
-  await execFileAsync(
-    process.execPath,
-    [DIST_CLI, 'bus', 'update-cron', agent, name, '--prompt', newPrompt],
-    { env: { ...process.env, CTX_ROOT: tmpRoot } },
-  );
+interface ChildResult {
+  name: string;
+  ok: boolean;
+  code: number | null;
+  stderr: string;
+}
+
+/**
+ * Runs one update-cron child and CAPTURES its outcome instead of throwing.
+ *
+ * The reason this does not just `await` and let a rejection surface: on a
+ * non-zero exit `Promise.all` rejects with the FIRST failure and discards the
+ * other seven children's fates, so the run reports one error and loses the
+ * picture. Worse, a lost update with all children exiting 0 is a completely
+ * different defect from a child that died — and the bare count the assertion
+ * used to print cannot tell them apart.
+ *
+ * Failures are still failures: the assertion below checks both.
+ */
+async function runUpdate(agent: string, name: string, newPrompt: string): Promise<ChildResult> {
+  try {
+    await execFileAsync(
+      process.execPath,
+      [DIST_CLI, 'bus', 'update-cron', agent, name, '--prompt', newPrompt],
+      { env: { ...process.env, CTX_ROOT: tmpRoot } },
+    );
+    return { name, ok: true, code: 0, stderr: '' };
+  } catch (err) {
+    const e = err as { code?: number; stderr?: string; message?: string };
+    return {
+      name,
+      ok: false,
+      code: e.code ?? null,
+      stderr: (e.stderr ?? e.message ?? '').slice(0, 400),
+    };
+  }
 }
 
 describe.skipIf(!existsSync(DIST_CLI))('Iter 12 audit: concurrent bus update-cron lost-update race', () => {
@@ -107,6 +137,8 @@ describe.skipIf(!existsSync(DIST_CLI))('Iter 12 audit: concurrent bus update-cro
     const N = 8;
     const ITERATIONS = 5;
     const lostUpdatesPerIteration: number[] = [];
+    const forensics: string[] = [];
+    let childFailures = 0;
 
     for (let iter = 0; iter < ITERATIONS; iter++) {
       const names = seedCrons(agent, N);
@@ -114,26 +146,55 @@ describe.skipIf(!existsSync(DIST_CLI))('Iter 12 audit: concurrent bus update-cro
       // Launch N parallel CLI invocations updating N distinct crons.
       // Each writes a unique prompt so we can detect lost updates.
       const newPromptFor = (name: string) => `updated-iter${iter}-${name}`;
-      await Promise.all(names.map(n => runUpdate(agent, n, newPromptFor(n))));
+      const results = await Promise.all(names.map(n => runUpdate(agent, n, newPromptFor(n))));
 
       // Verify all N mutations survived.
       const onDisk = readCronsFromDisk(agent);
-      let lost = 0;
+      const lostNames: string[] = [];
       for (const name of names) {
         const cron = onDisk.find(c => c.name === name);
         if (!cron || cron.prompt !== newPromptFor(name)) {
-          lost++;
+          lostNames.push(name);
         }
       }
-      lostUpdatesPerIteration.push(lost);
+      lostUpdatesPerIteration.push(lostNames.length);
+
+      const failed = results.filter(r => !r.ok);
+      childFailures += failed.length;
+
+      // Capture the full picture at the moment of failure. This test is a
+      // low-rate flake (observed ~1 in 8 full-suite runs, never once in 1120
+      // standalone invocations), so a failure that leaves only a count forces
+      // a fresh investigation every time instead of yielding a diagnosis.
+      // The two shapes point at completely different defects:
+      //   children all exited 0 + an update vanished => mutual exclusion broke
+      //   a child exited non-zero                    => lock timeout / spawn
+      if (lostNames.length > 0 || failed.length > 0) {
+        forensics.push(
+          `iter ${iter}: lost=[${lostNames.join(', ') || 'none'}] ` +
+          `childFailures=${failed.length}` +
+          (failed.length
+            ? ` -> ${failed.map(f => `${f.name} exit=${f.code} stderr=${JSON.stringify(f.stderr)}`).join(' | ')}`
+            : ' (ALL CHILDREN EXITED 0 — a write was overwritten while the lock was held)') +
+          `\n  on-disk: ${JSON.stringify(onDisk.map(c => `${c.name}=${c.prompt}`))}` +
+          `\n  crons present: ${onDisk.length} of ${N}`,
+        );
+      }
     }
 
     const totalLost = lostUpdatesPerIteration.reduce((a, b) => a + b, 0);
-    // Diagnostic for debugging:
-    if (totalLost > 0) {
+    if (forensics.length > 0) {
       // eslint-disable-next-line no-console
-      console.warn(`[iter12 audit] lost updates per iteration: ${lostUpdatesPerIteration.join(', ')} (total ${totalLost} of ${N * ITERATIONS})`);
+      console.warn(
+        `[iter12 audit] lost per iteration: ${lostUpdatesPerIteration.join(', ')} ` +
+        `(total ${totalLost} of ${N * ITERATIONS}), child failures: ${childFailures}\n` +
+        forensics.join('\n'),
+      );
     }
-    expect(totalLost, 'concurrent bus update-cron must not lose any updates').toBe(0);
+    // Assert both: a child that died and an update that vanished are different
+    // defects, and collapsing them into one number is what made this flake
+    // undiagnosable in the first place.
+    expect(childFailures, `update-cron child process(es) failed:\n${forensics.join('\n')}`).toBe(0);
+    expect(totalLost, `concurrent bus update-cron must not lose any updates:\n${forensics.join('\n')}`).toBe(0);
   }, 60_000);
 });
