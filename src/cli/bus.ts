@@ -2509,7 +2509,16 @@ busCommand
       try { patch.timezone = validateTimezone(opts.timezone); } catch (err) { console.error(String(err)); process.exit(1); }
     }
 
-    const ok = updateCronDef(agent, name, patch);
+    let ok: boolean;
+    try {
+      ok = updateCronDef(agent, name, patch);
+    } catch (err) {
+      // updateCron rejects an empty prompt. Report it the way every other
+      // validation failure in this command reports — one line, exit 1 — rather
+      // than an unhandled stack trace.
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
     if (!ok) {
       console.error(`Error: cron '${name}' not found for agent '${agent}'.`);
       process.exit(1);

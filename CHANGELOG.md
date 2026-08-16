@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### Fixed — `bus update-cron --prompt ""` wiped the prompt and reported success
+
+The CLI passed `--prompt` straight through whenever it was defined, and an empty
+string is defined:
+
+```ts
+if (opts.prompt !== undefined) {
+  patch.prompt = opts.prompt;   // "" lands here
+}
+```
+
+The cron that results is the bad kind of broken. It still loads, still reports
+`enabled` in `list-crons`, still shows its schedule, and still fires on time —
+it just injects nothing. There is no error, no warning, and no surface an
+operator would check that looks any different from a working cron. It was hit
+for real on 2026-08-16, on `guardrail-expiry-check`, and recovered only because
+`crons.json.bak` happened to still hold the previous prompt.
+
+**The validation already existed and was on the wrong side of a two-path API.**
+`handleUpdateCron` (`src/daemon/ipc-server.ts`) has rejected an empty prompt all
+along — *"Prompt must be non-empty."* The same operation reached through the CLI
+did not. Two entry points, one guarded, and the unguarded one silently
+succeeded.
+
+So the guard moves to the choke point rather than being copied into the second
+caller — the same call made in #120 (write the agent pid at the `start()` choke
+point, not at one caller). `updateCron` (`src/bus/crons.ts`) now throws on an
+empty or whitespace-only `prompt`, which covers the CLI, the IPC path, and any
+future third caller. `cron-scheduler.ts` also calls `updateCron` — for
+`last_fire_attempted_at` and similar — and never patches `prompt`, so it is
+unaffected. `bus update-cron` catches the throw and reports it the way its other
+validation failures already do: one line, exit 1, no stack trace.
+
+Covered by `tests/unit/bus/update-cron-empty-prompt.test.ts`, verified to fail
+**4 of 7** against the unfixed code. The three that pass either way are the
+positive controls — a non-empty prompt still writes, a patch omitting `prompt`
+still writes, and a missing cron still returns `false` — and they are what prove
+the guard did not simply break `updateCron`. The load-bearing assertion is not
+that it throws but that **the stored prompt is still on disk afterwards**; a test
+asserting only the throw would pass against an implementation that threw after
+writing.
+
 ### Fixed — the dashboard watcher handed globs to a chokidar that has no globs
 
 `getWatchPaths` (`dashboard/src/lib/watcher.ts`) built patterns —
