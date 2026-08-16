@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### Fixed — a task lookup and an inbox check both reported "nothing there" when they meant "I did not look"
+
+`findTaskFile` returned `null` both when it had scanned every candidate
+directory and found no such task, and when a directory existed but could not
+be read so the scan aborted. `checkInbox` returned `[]` both when the inbox
+was read and empty, and when the lock could not be acquired so it was never
+opened. In each case the caller cannot tell a fact from a failure.
+
+The damage is not in the "not found" error strings — those at least stop
+loudly. It is where an empty result is consumed as an affirmative all-clear:
+
+- The drift scanner emitted a `resolved_dependency` finding reading
+  `blocked_by [...] are all completed, but task is still status=blocked`.
+  That sentence is assembled from `blocked_by` alone, so on an unreadable
+  tree it asserts as fact something no code ever read — and recommends
+  clearing a safety gate on that basis.
+- `bus task-deps` printed `no open dependencies — ready to work`.
+- `bus check-inbox` printed `[]`, which is how an agent concludes "inbox
+  empty, nothing owed to anyone" and records it as session state. The skip
+  warning is rate-limited to once per inbox per minute, so under a 1s poll
+  59 of every 60 skipped polls are silent in both channels.
+
+Adds `findTaskFileWithStatus` → `{ path, unreadable }`,
+`checkTaskDependenciesWithStatus` → `{ open, unresolved }`, and
+`checkInboxWithStatus` → `{ messages, skipped }`, following the existing
+`readCronsWithStatus`/`readCrons` precedent — each original function is kept
+as a back-compat wrapper whose docblock states what it discards. A gate that
+cannot verify now holds instead of opening. Behaviour is unchanged on any
+healthy tree or inbox, and CLI stdout shapes are unchanged because agents
+parse them; the new signal rides stderr and the exit code.
+
 ### Fixed — node-pty's `spawn-helper` lost its executable bit on install, crashing every agent spawn
 
 A plain `npm install`/`npm ci` of `node-pty@1.1.0` leaves
