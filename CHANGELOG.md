@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### Fixed — editing a cron's prompt silently re-phased it
+
+`computeReferenceMs` (`src/daemon/cron-scheduler.ts`) took `Math.max` over
+`created_at` **and** every fire record, so a freshly-stamped `created_at`
+always won. Its own docblock four lines above already stated the correct
+rule — *"created_at anchors a cron that has NEVER fired"* — which the code
+did not implement.
+
+That combination is only reachable through a prompt edit, and a prompt edit
+always reaches it. `add-cron` refuses to overwrite an existing name, so the
+only way to change a prompt is remove-then-add; `handleAddCron`
+(`src/daemon/ipc-server.ts:419`) stamps a fresh `created_at` on every add;
+and `removeCron` (`src/bus/crons.ts:228`) deletes only the `crons.json`
+entry, leaving `cron-state.json`'s `last_fire` — the real phase anchor —
+intact but outvoted.
+
+An interval cron's phase is invisible state that carries real meaning:
+staggering paired observers, avoiding a stampede, covering a specific
+window. Nothing announced the change — the listing still showed the same
+schedule, the same enabled flag and the same count. Two measured incidents
+on 2026-08-15: `check-approvals` moved 18:14/20:14Z → 19:20/21:20Z, losing
+coverage of a window it had been covering and forcing a one-shot backstop;
+a sweep cron moved 18:11Z → 18:13Z unnoticed.
+
+`created_at` is now a **fallback**, not a candidate: it anchors a cron with
+no fire history, and is otherwise excluded so a real fire record wins. The
+never-fired anchoring behaviour from `10e3011f` is unchanged, and the only
+behavioural difference is the case where `created_at` is newer than every
+fire record — which is exactly the defect.
+
+Two notes for anyone reading the original bug report, both wrong there:
+the proposed fix "preserve `created_at` on re-add" is **not implementable**
+(`removeCron` deletes the entry, so nothing survives to inherit from), and
+`bus update-cron` is **not** a fix anyone shipped for this — it landed in
+`dad07797`, the original external-crons feature, and was available the
+whole time. It remains the right way to edit a prompt.
+
 ### Fixed — a task lookup and an inbox check both reported "nothing there" when they meant "I did not look"
 
 `findTaskFile` returned `null` both when it had scanned every candidate

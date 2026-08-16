@@ -32,7 +32,7 @@ vi.mock('../../../src/bus/crons.js', () => ({
 // Imports AFTER mock setup
 // ---------------------------------------------------------------------------
 
-import { CronScheduler, nextFireFromCron } from '../../../src/daemon/cron-scheduler';
+import { CronScheduler, nextFireFromCron, computeReferenceMs } from '../../../src/daemon/cron-scheduler';
 import type { CronDefinition } from '../../../src/types/index';
 
 // ---------------------------------------------------------------------------
@@ -1057,3 +1057,91 @@ describe('CronScheduler', () => {
     expect(names).not.toContain('c'); // disabled, not scheduled
   });
 });
+
+// ---------------------------------------------------------------------------
+// computeReferenceMs — phase anchoring
+//
+// created_at is a FALLBACK for a never-fired cron, never a candidate competing
+// with real fire records. Editing a cron's prompt is remove-then-add (add-cron
+// refuses to overwrite an existing name), handleAddCron stamps a fresh
+// created_at on every add, and removeCron leaves cron-state.json's last_fire
+// intact — so treating created_at as a candidate meant a prompt edit silently
+// re-phased the cron. Real incidents 2026-08-15: boss's check-approvals moved
+// 18:14/20:14Z -> 19:20/21:20Z, losing coverage of a window it had been
+// covering; infra's sweep moved 18:11Z -> 18:13Z unnoticed.
+//
+// Every assertion below is a hardcoded literal so it can witness the behaviour
+// rather than inherit it.
+// ---------------------------------------------------------------------------
+
+describe('computeReferenceMs — phase anchoring', () => {
+  const NOW = Date.parse('2026-08-15T18:00:00.000Z');
+  const ms = (iso: string) => Date.parse(iso);
+
+  it('falls back to now when nothing at all is known', () => {
+    expect(computeReferenceMs({}, NOW)).toBe(NOW);
+  });
+
+  it('anchors a NEVER-FIRED cron on created_at, not now (preserves 10e3011f)', () => {
+    expect(
+      computeReferenceMs({ createdAt: '2026-08-15T12:00:00.000Z' }, NOW),
+    ).toBe(ms('2026-08-15T12:00:00.000Z'));
+  });
+
+  it('ignores an unparseable created_at and falls back to now', () => {
+    expect(computeReferenceMs({ createdAt: 'not-a-date' }, NOW)).toBe(NOW);
+  });
+
+  it('takes the NEWEST fire record when several are present', () => {
+    expect(
+      computeReferenceMs(
+        {
+          createdAt: '2026-08-01T00:00:00.000Z',
+          lastFiredAt: '2026-08-15T16:00:00.000Z',
+          lastFireAttemptedAt: '2026-08-15T17:00:00.000Z',
+          stateFire: '2026-08-15T16:30:00.000Z',
+        },
+        NOW,
+      ),
+    ).toBe(ms('2026-08-15T17:00:00.000Z'));
+  });
+
+  // THE REGRESSION TEST. Under the old unconditional-max implementation this
+  // returned the fresh created_at (18:00) and the cron re-phased off the edit.
+  it('a FRESH created_at from a remove-then-add does NOT beat an existing fire record', () => {
+    expect(
+      computeReferenceMs(
+        {
+          createdAt: '2026-08-15T18:00:00.000Z', // stamped by handleAddCron during the edit
+          stateFire: '2026-08-15T16:14:00.000Z', // survives removeCron in cron-state.json
+        },
+        NOW,
+      ),
+    ).toBe(ms('2026-08-15T16:14:00.000Z'));
+  });
+
+  it('the re-phasing incident does not reproduce: a 2h cron keeps its :14 phase across a prompt edit', () => {
+    // boss's check-approvals: fired 16:14Z, prompt edited at 17:20Z (fresh
+    // created_at), schedule '2h'. The next fire must stay on :14.
+    const reference = computeReferenceMs(
+      { createdAt: '2026-08-15T17:20:00.000Z', stateFire: '2026-08-15T16:14:00.000Z' },
+      ms('2026-08-15T17:20:00.000Z'),
+    );
+    const next = computeNextFireAtFromInterval(reference, 2 * 60 * 60 * 1000);
+    expect(new Date(next).toISOString()).toBe('2026-08-15T18:14:00.000Z');
+  });
+
+  it('created_at still anchors when the ONLY other input is unparseable', () => {
+    expect(
+      computeReferenceMs(
+        { createdAt: '2026-08-15T12:00:00.000Z', stateFire: 'garbage' },
+        NOW,
+      ),
+    ).toBe(ms('2026-08-15T12:00:00.000Z'));
+  });
+});
+
+/** Local mirror of the interval branch of computeNextFireAt, kept literal. */
+function computeNextFireAtFromInterval(referenceMs: number, durationMs: number): number {
+  return referenceMs + durationMs;
+}
