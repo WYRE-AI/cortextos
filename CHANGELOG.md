@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+### Fixed — the dashboard watcher handed globs to a chokidar that has no globs
+
+`getWatchPaths` (`dashboard/src/lib/watcher.ts`) built patterns —
+`.../analytics/events/**/*.jsonl` and four more — and passed them to
+`chokidar.watch`. Chokidar removed glob support in v4; the dashboard is on
+5.0.0. It took each pattern as a **literal path**, matched nothing, raised
+no error, reached `ready`, and then sat there watching zero entries and
+emitting zero `add`/`change` events, permanently.
+
+Nothing about it looked broken. The startup line read
+`[watcher] Watching 8 patterns` — a count of the argument we passed in, not
+of what chokidar resolved. Eight patterns in, zero entries watched, and the
+log confidently reported the eight. A one-time full sync then backfilled the
+database, so the dashboard presented as live while frozen at the moment of
+that sync: worse than visibly stale, because the timestamp looked current.
+
+An earlier check ruled this out by testing the patterns against a glob
+matcher, which matches them happily. That answers "is this a correct glob?"
+(yes) rather than "does chokidar 5 expand globs?" (no).
+
+Measured with the installed chokidar 5.0.0 on an identical synthesised tree:
+
+| arm | `getWatched()` entries | events on append |
+|---|---|---|
+| glob pattern | 0 | 0 |
+| literal directory | 3 | 1 |
+
+Three changes:
+
+1. **`getWatchRoots` returns literal directories** — `tasks`, `approvals`,
+   `analytics/events` per org, plus flat `state` and `inbox`.
+2. **Watching the directory means seeing everything under it**, so an
+   `ignored` predicate prunes the heavy trees (`claude-config` alone is
+   22372 of the 22765 entries under `state/`) and `isRelevant` keeps the
+   handler to the files `syncFile` can actually act on.
+3. **The health signal now counts what chokidar resolved, not what we asked
+   for.** On `ready` it reports the watched-entry count and logs an error
+   when that count is zero; a watch root that does not exist is reported by
+   path. Both conditions were previously silent, and the silence is what
+   made this a 37-hour outage rather than a startup failure.
+
+Covered by `watcher-ingests-real-events.test.ts`, which drives the real
+chokidar against a real temp tree — verified to fail 4/4 on the old code
+(`expected [] to include …`) and pass 4/4 on the new. A mocked-chokidar test
+cannot catch this class: it asserts that `watch()` was called with some
+argument, and the argument was the defect.
+
 ### Fixed — editing a cron's prompt silently re-phased it
 
 `computeReferenceMs` (`src/daemon/cron-scheduler.ts`) took `Math.max` over
