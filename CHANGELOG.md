@@ -26,11 +26,25 @@ on 2026-08-15: `check-approvals` moved 18:14/20:14Z → 19:20/21:20Z, losing
 coverage of a window it had been covering and forcing a one-shot backstop;
 a sweep cron moved 18:11Z → 18:13Z unnoticed.
 
-`created_at` is now a **fallback**, not a candidate: it anchors a cron with
-no fire history, and is otherwise excluded so a real fire record wins. The
-never-fired anchoring behaviour from `10e3011f` is unchanged, and the only
-behavioural difference is the case where `created_at` is newer than every
-fire record — which is exactly the defect.
+Two halves, and the first is the load-bearing one:
+
+1. **`removeCron` now leaves a tombstone.** Before deleting the entry it
+   persists the cron's last fire to `state/<agent>/cron-state.json` — a file
+   that lives outside `crons.json`, that the scheduler already reads and
+   threads through as `stateFire`, and that is written here through its
+   existing writer so the record shape stays identical to the one
+   `bus update-cron-fire` produces. Best-effort: a cron must still be
+   removable if the tombstone cannot be written.
+2. **`created_at` is now a fallback, not a candidate** in
+   `computeReferenceMs`, so the surviving fire record actually wins over the
+   fresh stamp. Never-fired anchoring (`10e3011f`) is unchanged; the only
+   behavioural difference is `created_at` newer than every fire record.
+
+Known and accepted edge: a name deleted permanently and recreated much later
+inherits the old anchor, so an interval cron computes a next-fire in the past
+and takes **one** catch-up fire before re-phasing to now. Bounded and
+self-correcting, and it cannot arise for cron expressions, whose phase is
+pinned to the wall clock.
 
 Two notes for anyone reading the original bug report, both wrong there:
 the proposed fix "preserve `created_at` on re-add" is **not implementable**
