@@ -142,6 +142,9 @@ describe('Task Management', () => {
       const log = readTaskAudit(paths, taskId);
       const reassignEntry = log[log.length - 1];
       expect(reassignEntry.note).toContain('assignee: boss -> dev');
+      // The actor is 'paul' (the caller); 'boss' is merely the PRE-mutation
+      // assignee. Attributing the entry to 'boss' names the wrong agent.
+      expect(reassignEntry.agent).not.toBe('boss');
     });
 
     it('changes priority without a status argument', () => {
