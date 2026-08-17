@@ -332,6 +332,71 @@ export function ingestKnowledgeBase(
   console.log(`\nIngest complete → collection: ${collection}`);
 }
 
+export interface KBDeleteResult {
+  collection: string;
+  sourcePath: string;
+  deletedCount: number;
+  output: string;
+}
+
+/**
+ * Delete all chunks for one source file from a knowledge base collection.
+ *
+ * Matching is EXACT-EQUALITY against the chunk's stored `source` metadata
+ * (itself always `str(file_path.resolve())` at ingest time, in mmrag.py) —
+ * not fuzzy, not a prefix match. This is precise by construction (it cannot
+ * touch an unrelated source), but also unforgiving: pass `sourcePath` as the
+ * exact string read back from the collection's own metadata (e.g. via
+ * `mmrag.py list`), never a hand-typed or reconstructed path — a path that
+ * differs by even a prefix (relative vs absolute, a symlinked vs real
+ * directory component) silently matches zero chunks and exits 0,
+ * indistinguishable from "already clean."
+ */
+export function deleteFromKnowledgeBase(
+  sourcePath: string,
+  options: {
+    org: string;
+    agent?: string;
+    scope?: 'shared' | 'private';
+    frameworkRoot: string;
+    instanceId: string;
+  },
+): KBDeleteResult {
+  const { agent, scope = 'shared', frameworkRoot, instanceId } = options;
+  const org = normalizeOrgName(frameworkRoot, options.org);
+
+  const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
+
+  if (!kbConfigured(env)) {
+    throw new Error(`[kb] Knowledge base not configured for org ${org} — nothing to delete.`);
+  }
+
+  const pythonPath = getVenvPython(frameworkRoot);
+  const mmragPath = join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
+
+  let collection: string;
+  if (scope === 'private') {
+    if (!agent) throw new Error('--agent or CTX_AGENT_NAME required for --scope private');
+    collection = `agent-${agent}`;
+  } else {
+    collection = `shared-${org}`;
+  }
+
+  const output = execFileSync(pythonPath, [mmragPath, 'delete', sourcePath, '--collection', collection], {
+    encoding: 'utf-8',
+    timeout: 30000,
+    env,
+  });
+
+  // mmrag.py prints either "Deleted N chunk(s) from '<col>' for: <path>" or
+  // "No documents found for: <path>" — parse the count from the former so
+  // callers can assert on it programmatically rather than re-parsing text.
+  const match = output.match(/^Deleted (\d+) chunk/);
+  const deletedCount = match ? parseInt(match[1], 10) : 0;
+
+  return { collection, sourcePath, deletedCount, output };
+}
+
 /**
  * Ensure the knowledge base directories exist for an org.
  *

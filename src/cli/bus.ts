@@ -20,7 +20,7 @@ import { createReminder, listReminders, ackReminder, pruneReminders } from '../b
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron, computeReferenceMs } from '../daemon/cron-scheduler.js';
-import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
+import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs, deleteFromKnowledgeBase } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, setActiveAccount, writeTokenToAgents, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { mintInstallationToken, shouldRefuseInteractivePrint, redactForJson } from '../bus/github-app.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -1507,6 +1507,39 @@ busCommand
       frameworkRoot: env.frameworkRoot || process.cwd(),
       instanceId: env.instanceId,
     });
+  });
+
+busCommand
+  .command('kb-delete')
+  .description('Delete all chunks for one source file from a knowledge base collection (exact-match on the stored source path — read it from `kb-list`/collection metadata first, never hand-type it)')
+  .argument('<sourcePath>', 'Exact source path as recorded in the collection metadata (verbatim, not reconstructed)')
+  .option('--org <org>', 'Organization name')
+  .option('--agent <name>', 'Agent name (for private scope)')
+  .option('--scope <s>', 'Scope: shared or private', 'shared')
+  .action((sourcePath: string, opts: { org?: string; agent?: string; scope?: string }) => {
+    const env = resolveEnv();
+    const org = opts.org || env.org;
+    if (!org) {
+      console.error('ERROR: --org or CTX_ORG required');
+      process.exit(1);
+    }
+
+    try {
+      const result = deleteFromKnowledgeBase(sourcePath, {
+        org,
+        agent: opts.agent || env.agentName,
+        scope: (opts.scope as 'shared' | 'private') || 'shared',
+        frameworkRoot: env.frameworkRoot || process.cwd(),
+        instanceId: env.instanceId,
+      });
+      console.log(result.output.trim());
+      if (result.deletedCount === 0) {
+        console.log('WARNING: 0 chunks deleted. Exact-match on `source` metadata — if you expected a hit, verify the path was read from the collection itself (e.g. via mmrag.py list), not reconstructed.');
+      }
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
   });
 
 busCommand
