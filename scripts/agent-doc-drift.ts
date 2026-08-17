@@ -55,7 +55,8 @@
  * Usage:
  *   npx tsx scripts/agent-doc-drift.ts --agent scribe --org wyre
  *   npx tsx scripts/agent-doc-drift.ts --agent scribe --org wyre --json
- *   npx tsx scripts/agent-doc-drift.ts --all --org wyre   # every agent in the org
+ *   npx tsx scripts/agent-doc-drift.ts --all --org wyre   # every agent in one org
+ *   npx tsx scripts/agent-doc-drift.ts --all              # every agent in every org under orgs/*
  *
  * This is a read-only report. It never modifies any file. Fixing a
  * reported drift is a human/agent decision per line, made deliberately —
@@ -180,21 +181,51 @@ function findUnexaminedEntries(templateDir: string, categories: FileCategory[]):
 interface EqualityDiff {
   onlyInTemplate: string[];
   onlyInDeployed: string[];
+  // Same multiset (same lines, same counts) but not the same sequence —
+  // e.g. a section moved. Distinct from onlyInTemplate/onlyInDeployed,
+  // which are both empty when this is true.
+  reordered: boolean;
 }
 
 function nonBlankLines(text: string): string[] {
   return text.split('\n').filter((l) => l.trim().length > 0);
 }
 
+// infra found (2026-08-15) that Set-membership filtering is both
+// order-blind and duplicate-blind: template=[alpha,bravo,charlie],
+// deployed=[charlie,bravo,alpha,alpha] reported clean, because Set.has()
+// only asks "does this line exist anywhere," never "how many times" or
+// "in what order." A duplicated section is the signature artifact of a
+// botched bulk write — exactly the case this tool exists to catch — so a
+// clean report here was actively misleading. Fixed with a line MULTISET
+// (frequency count): a line appearing more/fewer times on one side than
+// the other now surfaces as an extra/missing occurrence, not just an
+// extra/missing distinct value. Pure reordering (same multiset, same
+// lines, different sequence) is reported separately via `reordered`
+// rather than folded into the line lists, since positional diffing would
+// otherwise flood the report with noise for a single moved line.
+function lineCounts(lines: string[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const line of lines) counts.set(line, (counts.get(line) ?? 0) + 1);
+  return counts;
+}
+
 function equalityDiff(templateText: string, deployedText: string): EqualityDiff {
   const t = nonBlankLines(templateText);
   const d = nonBlankLines(deployedText);
-  const tSet = new Set(t);
-  const dSet = new Set(d);
-  return {
-    onlyInTemplate: t.filter((l) => !dSet.has(l)),
-    onlyInDeployed: d.filter((l) => !tSet.has(l)),
-  };
+  const tCounts = lineCounts(t);
+  const dCounts = lineCounts(d);
+  const onlyInTemplate: string[] = [];
+  const onlyInDeployed: string[] = [];
+  for (const key of new Set([...tCounts.keys(), ...dCounts.keys()])) {
+    const tc = tCounts.get(key) ?? 0;
+    const dc = dCounts.get(key) ?? 0;
+    for (let i = 0; i < tc - dc; i++) onlyInTemplate.push(key);
+    for (let i = 0; i < dc - tc; i++) onlyInDeployed.push(key);
+  }
+  const sameMultiset = onlyInTemplate.length === 0 && onlyInDeployed.length === 0;
+  const reordered = sameMultiset && t.join('\n') !== d.join('\n');
+  return { onlyInTemplate, onlyInDeployed, reordered };
 }
 
 function propertyDiff(templateText: string, deployedText: string): string[] {
@@ -253,7 +284,7 @@ function runForAgent(frameworkRoot: string, org: string, agent: string): AgentRe
 
     if (cat.kind === 'equality') {
       const diff = equalityDiff(templateText, deployedText);
-      const isClean = diff.onlyInTemplate.length === 0 && diff.onlyInDeployed.length === 0;
+      const isClean = diff.onlyInTemplate.length === 0 && diff.onlyInDeployed.length === 0 && !diff.reordered;
       results.push({
         file: cat.file,
         kind: cat.kind,
@@ -293,9 +324,9 @@ function printReport(report: AgentReport): void {
       'additions (those are expected and healthy, and this tool does not flag them). A high PROPERTY drift count is a real gap, not noise.',
   );
   console.log(
-    'CAVEAT (both equality and property checks): comparison is by LINE-SET MEMBERSHIP, not position or count — a clean result does NOT rule out ' +
-      'reordered or duplicated content. A "clean" EQUALITY file could still have a section repeated or moved and this run would not see it ' +
-      '(a duplicated section is the signature artifact of a botched bulk write — do not treat a clean report here as proof a bulk edit landed correctly).',
+    'CAVEAT (PROPERTY checks only): comparison is by line-set MEMBERSHIP, not count or position — a clean PROPERTY result does not rule out a ' +
+      'template line appearing duplicated in the deployed file. EQUALITY checks use a line MULTISET (duplicates flagged) plus a separate reordered ' +
+      'flag (same lines/counts, different sequence), so a clean EQUALITY result does rule out both reordering and duplication.',
   );
   if (report.unexamined.length > 0) {
     console.log(
@@ -327,14 +358,17 @@ function printReport(report: AgentReport): void {
     if (r.kind === 'equality') {
       const d = r.detail as EqualityDiff;
       if (d.onlyInTemplate.length > 0) {
-        console.log(`      only in template (${d.onlyInTemplate.length} line(s), deployed may be behind):`);
+        console.log(`      only in template (${d.onlyInTemplate.length} line(s), deployed may be behind — a count above 1 for the same line means a missing DUPLICATE, not just a missing line):`);
         for (const line of d.onlyInTemplate.slice(0, 5)) console.log(`        - ${line.slice(0, 140)}`);
         if (d.onlyInTemplate.length > 5) console.log(`        ... and ${d.onlyInTemplate.length - 5} more`);
       }
       if (d.onlyInDeployed.length > 0) {
-        console.log(`      only in deployed (${d.onlyInDeployed.length} line(s), deployed may be ahead, or a legitimate local edit):`);
+        console.log(`      only in deployed (${d.onlyInDeployed.length} line(s), deployed may be ahead, a legitimate local edit, or an UNINTENDED DUPLICATE — check which):`);
         for (const line of d.onlyInDeployed.slice(0, 5)) console.log(`        - ${line.slice(0, 140)}`);
         if (d.onlyInDeployed.length > 5) console.log(`        ... and ${d.onlyInDeployed.length - 5} more`);
+      }
+      if (d.reordered) {
+        console.log('      REORDERED: same lines, same counts, different sequence (e.g. a section moved) — not shown line-by-line, verify manually.');
       }
     } else if (r.kind === 'property') {
       const missing = r.detail as string[];
@@ -368,6 +402,21 @@ function listAgentsInOrg(frameworkRoot: string, org: string): string[] {
     .map((d) => d.name);
 }
 
+// infra found (2026-08-15) that --org was mandatory and --all only ever
+// meant "every agent in the one org named" — orgs/wyre-gateway/ (5 more
+// agents, all same-named as wyre agents, so a 15-row wyre-only report
+// reads as complete beside it) sat entirely unexamined by every --all
+// run, and nothing in the output said so. Same shape as the
+// findUnexaminedEntries fix above, one directory up: a partial
+// population must never be able to look like the whole one.
+function listOrgs(frameworkRoot: string): string[] {
+  const orgsDir = join(frameworkRoot, 'orgs');
+  if (!existsSync(orgsDir)) return [];
+  return readdirSync(orgsDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name);
+}
+
 function main(): void {
   const args = process.argv.slice(2);
   const orgIdx = args.indexOf('--org');
@@ -379,47 +428,83 @@ function main(): void {
   const rootIdx = args.indexOf('--root');
   const rootOverride = rootIdx >= 0 ? args[rootIdx + 1] : undefined;
 
-  if (!org || (!agent && !all)) {
+  // --org is now optional, but ONLY alongside --all (every org under
+  // orgs/*). --agent still requires --org — a bare agent name is
+  // ambiguous across orgs (this fleet's agent names collide across
+  // wyre/wyre-gateway on purpose, which is exactly what made the old gap
+  // invisible).
+  if (!all && !org) {
     console.error('Usage: npx tsx scripts/agent-doc-drift.ts --agent <name> --org <org> [--json] [--root <path>]');
     console.error('   or: npx tsx scripts/agent-doc-drift.ts --all --org <org> [--json] [--root <path>]');
+    console.error('   or: npx tsx scripts/agent-doc-drift.ts --all [--json] [--root <path>]   # every org under orgs/*');
+    process.exit(1);
+  }
+  if (!all && !agent) {
+    console.error('Usage: npx tsx scripts/agent-doc-drift.ts --agent <name> --org <org> [--json] [--root <path>]');
+    process.exit(1);
+  }
+  if (agent && !org) {
+    console.error('--agent requires --org — a bare agent name is ambiguous across orgs.');
     process.exit(1);
   }
 
   const frameworkRoot = findFrameworkRoot(rootOverride);
+  const orgsToRun = org ? [org] : listOrgs(frameworkRoot);
 
-  // Fail CLOSED, explicitly, before doing any per-file work. orgs/ is
-  // gitignored — a fresh `git worktree` checkout (or a CI runner without
-  // the real tree mounted) does not have it, and the naive failure mode
-  // for that is a CLEAN, EMPTY result: every file check reports "missing
-  // in deployed," which a hasty reader can misread as "nothing to see
-  // here" rather than "this tool couldn't see the tree it needed to
-  // check." Refuse outright instead, with an error that names the exact
-  // thing that's missing, rather than let the absence look like a report.
-  const agentsBaseDir = join(frameworkRoot, 'orgs', org, 'agents');
-  if (!existsSync(agentsBaseDir)) {
-    console.error(`REFUSING TO RUN: orgs/${org}/agents/ does not exist under ${frameworkRoot}.`);
-    console.error('orgs/ is gitignored — a fresh `git worktree` checkout will never have it.');
+  if (orgsToRun.length === 0) {
+    console.error(`REFUSING TO RUN: no orgs found under ${join(frameworkRoot, 'orgs')}/ (missing or empty — orgs/ is gitignored, absent in a fresh worktree).`);
     console.error('Point --root at a checkout with the real orgs/ tree (normally the primary framework checkout).');
     process.exit(1);
   }
 
-  const agents = all ? listAgentsInOrg(frameworkRoot, org) : [agent as string];
+  const population: Array<{ org: string; agents: string[] }> = [];
+  const reports: AgentReport[] = [];
 
-  if (agents.length === 0) {
-    console.error(`No agents found under orgs/${org}/agents/`);
-    process.exit(1);
+  for (const o of orgsToRun) {
+    // Fail CLOSED, explicitly, before doing any per-file work. orgs/ is
+    // gitignored — a fresh `git worktree` checkout (or a CI runner without
+    // the real tree mounted) does not have it, and the naive failure mode
+    // for that is a CLEAN, EMPTY result: every file check reports "missing
+    // in deployed," which a hasty reader can misread as "nothing to see
+    // here" rather than "this tool couldn't see the tree it needed to
+    // check." Refuse outright instead, with an error that names the exact
+    // thing that's missing, rather than let the absence look like a report.
+    const agentsBaseDir = join(frameworkRoot, 'orgs', o, 'agents');
+    if (!existsSync(agentsBaseDir)) {
+      console.error(`REFUSING TO RUN: orgs/${o}/agents/ does not exist under ${frameworkRoot}.`);
+      console.error('orgs/ is gitignored — a fresh `git worktree` checkout will never have it.');
+      console.error('Point --root at a checkout with the real orgs/ tree (normally the primary framework checkout).');
+      process.exit(1);
+    }
+
+    const agentsInOrg = all ? listAgentsInOrg(frameworkRoot, o) : [agent as string];
+
+    if (agentsInOrg.length === 0) {
+      console.error(`No agents found under orgs/${o}/agents/`);
+      process.exit(1);
+    }
+
+    if (!all && !existsSync(join(agentsBaseDir, agent as string))) {
+      console.error(`REFUSING TO RUN: orgs/${o}/agents/${agent}/ does not exist.`);
+      process.exit(1);
+    }
+
+    population.push({ org: o, agents: agentsInOrg });
+    for (const a of agentsInOrg) reports.push(runForAgent(frameworkRoot, o, a));
   }
 
-  if (!all && !existsSync(join(agentsBaseDir, agent as string))) {
-    console.error(`REFUSING TO RUN: orgs/${org}/agents/${agent}/ does not exist.`);
-    process.exit(1);
-  }
-
-  const reports = agents.map((a) => runForAgent(frameworkRoot, org, a));
-
+  // Print the examined population EVERY run, clean or not — the exact
+  // discipline this tool already applies to its own file categories
+  // (Population examined / UNEXAMINED above), now applied to org scope
+  // too: a missing org must show up as absent, never as silently unasked.
   if (asJson) {
-    console.log(JSON.stringify(reports, null, 2));
+    console.log(JSON.stringify({ orgsExamined: population, reports }, null, 2));
   } else {
+    const populationSummary = population
+      .map((p) => `${p.org} (${p.agents.length} agent${p.agents.length === 1 ? '' : 's'})`)
+      .join(', ');
+    console.log(`\nOrgs examined this run: ${populationSummary}`);
+    if (!org) console.log('(no --org given — enumerated every org under orgs/*; pass --org to scope to one)');
     for (const r of reports) printReport(r);
   }
 }
