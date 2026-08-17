@@ -686,8 +686,88 @@ export function completeTask(
 }
 
 /**
+ * Reconstruct Task-shaped summaries from `compactTasks`'s `archive-YYYY-MM.jsonl`
+ * files in `taskDir`. Each JSONL line only carries {id, title, org, assigned_to,
+ * completed_at, archived_at, result} — compaction deletes the full task JSON
+ * (see {@link compactTasks}), so this is a lookup surface, not a full replay.
+ *
+ * Fields the archive line doesn't carry get a fixed, documented default rather
+ * than an inferred guess: `status: 'completed'` is exact (compaction only ever
+ * archives completed tasks, so this is not a default in the guessing sense);
+ * `priority`/`description`/`project`/`type`/`created_by`/`due_date`/`kpi_key`
+ * are genuinely unknown and get the same neutral defaults `createTask` itself
+ * uses, so a caller filtering on them gets a stable, documented answer instead
+ * of an undefined one. `archived: true` marks every reconstructed entry so a
+ * caller (or the CLI renderer) can tell it apart from a live task on sight.
+ *
+ * Corrupt lines and unreadable/absent archive files are skipped silently —
+ * same failure posture as the active-task read loop below, and consistent
+ * with `readTaskAudit`'s corrupt-line handling.
+ */
+function readCompactedTasks(taskDir: string): Task[] {
+  let files: string[];
+  try {
+    files = readdirSync(taskDir).filter(
+      f => f.startsWith('archive-') && f.endsWith('.jsonl'),
+    );
+  } catch {
+    return [];
+  }
+
+  const tasks: Task[] = [];
+  for (const file of files) {
+    let content: string;
+    try {
+      content = readFileSync(join(taskDir, file), 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const entry = JSON.parse(trimmed) as {
+          id: string; title: string; org: string; assigned_to: string;
+          completed_at: string; archived_at: string; result?: string;
+        };
+        tasks.push({
+          id: entry.id,
+          title: entry.title,
+          description: '',
+          type: 'agent',
+          needs_approval: false,
+          status: 'completed',
+          assigned_to: entry.assigned_to,
+          created_by: entry.assigned_to,
+          org: entry.org,
+          priority: 'normal',
+          project: '',
+          kpi_key: null,
+          created_at: entry.completed_at,
+          updated_at: entry.archived_at,
+          completed_at: entry.completed_at,
+          due_date: null,
+          archived: true,
+          ...(entry.result ? { result: entry.result } : {}),
+        });
+      } catch {
+        // Skip corrupt lines — matches readTaskAudit's posture.
+      }
+    }
+  }
+  return tasks;
+}
+
+/**
  * List tasks with optional filters.
  * Matches bash list-tasks.sh behavior.
+ *
+ * `includeArchived` additionally surfaces compacted tasks reconstructed via
+ * {@link readCompactedTasks} — see that function for exactly which fields are
+ * exact vs. defaulted. Without the flag, a task `compactTasks` has processed
+ * is invisible here by construction (its JSON no longer exists), the gap this
+ * flag exists to close: a retired task must stay matchable by the same key a
+ * caller would use to look it up, or a recurrence reads as a first occurrence.
  */
 export function listTasks(
   paths: BusPaths,
@@ -696,6 +776,7 @@ export function listTasks(
     status?: TaskStatus;
     priority?: Priority;
     respectDeps?: boolean;
+    includeArchived?: boolean;
   },
 ): Task[] {
   const { taskDir } = paths;
@@ -723,6 +804,15 @@ export function listTasks(
       tasks.push(task);
     } catch {
       // Skip corrupt files
+    }
+  }
+
+  if (filters?.includeArchived) {
+    for (const task of readCompactedTasks(taskDir)) {
+      if (filters?.agent && task.assigned_to !== filters.agent) continue;
+      if (filters?.status && task.status !== filters.status) continue;
+      if (filters?.priority && task.priority !== filters.priority) continue;
+      tasks.push(task);
     }
   }
 

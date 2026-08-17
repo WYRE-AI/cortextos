@@ -209,6 +209,91 @@ describe('Task Management', () => {
       const pending = listTasks(paths, { status: 'pending' });
       expect(pending.length).toBe(1);
     });
+
+    // task_1786931062956_88555785: compact-tasks moves completed tasks into
+    // archive-YYYY-MM.jsonl and DELETES the active JSON, but listTasks only
+    // ever scanned task_*.json — so an archived task was retained on disk and
+    // permanently unmatchable by the same detector that filed it, and a
+    // re-filed duplicate would read as a first occurrence rather than a
+    // recurrence. --include-archived closes that gap.
+    //
+    // Fixture is SYNTHESIZED here, not sampled from live state: this box has
+    // zero real archive-*.jsonl files today (compact-tasks has never run in
+    // this instance), so a fixture drawn from live state would contain
+    // exactly the case this test needs to exercise and could not fail —
+    // the same fixture-sampled-from-live-config trap that produced a false
+    // positive on its first production fire elsewhere in the fleet.
+    describe('--include-archived (compact-tasks archive lookup)', () => {
+      it('archived task is found ONLY with the flag, never without it — both directions, with a positive control', () => {
+        const archivedId = createTask(paths, 'paul', 'acme', 'Old shipped work', { assignee: 'paul' });
+        completeTask(paths, archivedId, 'shipped');
+        // Backdate past compactTasks' cutoff so it's actually eligible.
+        const oldTs = new Date(Date.now() - 60 * 86400_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+        const p = join(paths.taskDir, `${archivedId}.json`);
+        const t = JSON.parse(readFileSync(p, 'utf-8'));
+        t.completed_at = oldTs;
+        writeFileSync(p, JSON.stringify(t));
+
+        // Positive control: a second task that stays ACTIVE (never compacted).
+        // If this ever disappeared from either query, the probe itself would
+        // be broken, not the archive lookup — same shape as tonight's
+        // fleet-wide "a wrapper zero is not evidence without a control" rule.
+        const liveId = createTask(paths, 'paul', 'acme', 'Still active work', { assignee: 'paul' });
+
+        const compactReport = compactTasks(paths, { olderThanDays: 30 });
+        expect(compactReport.archived.map(a => a.id)).toEqual([archivedId]);
+        expect(existsSync(join(paths.taskDir, `${archivedId}.json`))).toBe(false);
+
+        // Direction 1: WITHOUT the flag, the archived task must be absent —
+        // and the live one (positive control) must still be present, so an
+        // empty archived-task check can't be confused with a broken query.
+        const withoutFlag = listTasks(paths, { agent: 'paul' });
+        expect(withoutFlag.map(t => t.id)).toContain(liveId);
+        expect(withoutFlag.map(t => t.id)).not.toContain(archivedId);
+
+        // Direction 2: WITH the flag, the archived task is found by the same
+        // key (id) the detector uses, AND the live task is still there too —
+        // proving the flag adds coverage rather than silently replacing it.
+        const withFlag = listTasks(paths, { agent: 'paul', includeArchived: true });
+        expect(withFlag.map(t => t.id)).toContain(liveId);
+        expect(withFlag.map(t => t.id)).toContain(archivedId);
+
+        const found = withFlag.find(t => t.id === archivedId)!;
+        expect(found.title).toBe('Old shipped work');
+        expect(found.status).toBe('completed');
+        expect(found.archived).toBe(true);
+        expect(found.result).toBe('shipped');
+      });
+
+      it('negative control: --include-archived on a tree with zero archive files returns the same set as without it', () => {
+        // Guards against the flag silently no-op'ing in the common case
+        // (no archives yet) being mistaken for "the flag works" — this run
+        // has no compaction at all, so both queries must agree exactly.
+        createTask(paths, 'paul', 'acme', 'Ordinary task');
+        const without = listTasks(paths, { agent: 'paul' });
+        const withFlag = listTasks(paths, { agent: 'paul', includeArchived: true });
+        expect(withFlag.map(t => t.id).sort()).toEqual(without.map(t => t.id).sort());
+      });
+
+      it('--status completed --include-archived surfaces both a live-completed and an archived task', () => {
+        const liveCompletedId = createTask(paths, 'paul', 'acme', 'Live completed, not old enough');
+        completeTask(paths, liveCompletedId, 'done recently');
+
+        const archivedId = createTask(paths, 'paul', 'acme', 'Archived completed');
+        completeTask(paths, archivedId, 'done long ago');
+        const oldTs = new Date(Date.now() - 60 * 86400_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+        const p = join(paths.taskDir, `${archivedId}.json`);
+        const t = JSON.parse(readFileSync(p, 'utf-8'));
+        t.completed_at = oldTs;
+        writeFileSync(p, JSON.stringify(t));
+        compactTasks(paths, { olderThanDays: 30 });
+
+        const result = listTasks(paths, { status: 'completed', includeArchived: true });
+        const ids = result.map(t => t.id);
+        expect(ids).toContain(liveCompletedId);
+        expect(ids).toContain(archivedId);
+      });
+    });
   });
 });
 
