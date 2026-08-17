@@ -70,15 +70,57 @@ function expandField(field: string, min: number, max: number): number[] {
 }
 
 /**
+ * Default timezone for a cron expression with no explicit `timezone` field.
+ * UTC, not the daemon process's ambient/local timezone — see the bug this
+ * fixes: with no TZ env override, Node's Date getters fall back to the OS
+ * timezone (America/New_York on the fleet host), silently evaluating every
+ * cron-expr field 4-5h (DST-dependent) off from its stated UTC time.
+ */
+const DEFAULT_CRON_TIMEZONE = 'UTC';
+
+const WEEKDAY_ABBR_TO_NUM: Record<string, number> = {
+  Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+};
+
+/**
+ * Extract cron-relevant calendar fields (minute/hour/day/month/weekday) for
+ * `ms` in whatever timezone `formatter` was constructed with. Timezone-aware
+ * via Intl.DateTimeFormat (DST-native — a "America/New_York" formatter
+ * correctly reflects EST vs EDT per-date, not a fixed offset), independent
+ * of the process's ambient TZ env.
+ */
+function fieldsFromFormatter(
+  formatter: Intl.DateTimeFormat,
+  ms: number,
+): { minute: number; hour: number; day: number; month: number; weekday: number } {
+  const parts = formatter.formatToParts(new Date(ms));
+  const map: Record<string, string> = {};
+  for (const p of parts) map[p.type] = p.value;
+  return {
+    minute: parseInt(map.minute, 10),
+    hour: parseInt(map.hour, 10),
+    day: parseInt(map.day, 10),
+    month: parseInt(map.month, 10),
+    weekday: WEEKDAY_ABBR_TO_NUM[map.weekday],
+  };
+}
+
+/**
  * Compute the next fire timestamp (ms since epoch) for a 5-field cron
  * expression, starting from `fromMs` (exclusive — the next fire must be
  * strictly after fromMs, rounded forward to the next whole minute).
  *
- * @param expr   - 5-field cron expression ("min hour dom month dow").
- * @param fromMs - Starting epoch time in milliseconds.
- * @returns      Epoch ms of the next matching minute, or NaN if unparseable.
+ * @param expr     - 5-field cron expression ("min hour dom month dow").
+ * @param fromMs   - Starting epoch time in milliseconds.
+ * @param timezone - IANA timezone the expression's fields are evaluated in
+ *                   (e.g. "America/New_York"). Defaults to "UTC" — a cron
+ *                   with no explicit timezone fires at its literal stated
+ *                   UTC time, never at the ambient/local time of whatever
+ *                   process happens to be running the daemon.
+ * @returns        Epoch ms of the next matching minute, or NaN if
+ *                 unparseable (including an invalid IANA timezone string).
  */
-export function nextFireFromCron(expr: string, fromMs: number): number {
+export function nextFireFromCron(expr: string, fromMs: number, timezone: string = DEFAULT_CRON_TIMEZONE): number {
   const parts = expr.trim().split(/\s+/);
   if (parts.length !== 5) return NaN;
 
@@ -95,6 +137,34 @@ export function nextFireFromCron(expr: string, fromMs: number): number {
     return NaN;
   }
 
+  // Feasibility pre-check: a dom+month combination that exists in NO month
+  // (e.g. "0 0 31 2 *" — Feb 31) passes per-field expansion but can never
+  // match, so the scan below would walk all MAX_MINUTES candidates — 527K
+  // formatToParts calls, ~1.2s measured — just to return NaN. Reject it in
+  // O(fields) instead. Feb counts as 29 deliberately: "29 2" is feasible
+  // (leap years), and whether the NEXT Feb 29 falls inside the 1-year scan
+  // window is the scan's question, not this check's.
+  const MAX_DOM_BY_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (!months.some((mo) => doms.some((d) => d <= MAX_DOM_BY_MONTH[mo - 1]))) {
+    return NaN;
+  }
+
+  // Build the Intl formatter once (throws RangeError on an invalid IANA
+  // timezone string — caught here so an invalid cron.timezone in crons.json
+  // fails safe as NaN rather than crashing the daemon's scheduler tick).
+  let formatter: Intl.DateTimeFormat;
+  try {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit',
+      hourCycle: 'h23',
+      weekday: 'short',
+    });
+  } catch {
+    return NaN;
+  }
+
   // Start from the next whole minute after fromMs
   const startMs = Math.floor(fromMs / 60_000) * 60_000 + 60_000;
 
@@ -103,12 +173,7 @@ export function nextFireFromCron(expr: string, fromMs: number): number {
   let candidate = startMs;
 
   for (let i = 0; i < MAX_MINUTES; i++) {
-    const d = new Date(candidate);
-    const m  = d.getMinutes();
-    const h  = d.getHours();
-    const dy = d.getDate();
-    const mo = d.getMonth() + 1; // 1-12
-    const dw = d.getDay();       // 0-6
+    const { minute: m, hour: h, day: dy, month: mo, weekday: dw } = fieldsFromFormatter(formatter, candidate);
 
     if (
       months.includes(mo) &&
@@ -145,6 +210,66 @@ function changeKeyFor(c: CronDefinition): string {
 }
 
 /**
+ * Inputs to computeReferenceMs — plain values, not a CronDefinition, so
+ * every caller (live scheduler, CLI, dashboard) supplies its own already-
+ * available fields without this module reaching into their I/O.
+ */
+export interface NextFireReferenceInputs {
+  createdAt?: string;
+  lastFiredAt?: string;
+  lastFireAttemptedAt?: string;
+  /** cron-state.json's last_fire for this cron, if the caller has read it. */
+  stateFire?: string;
+}
+
+/**
+ * Shared candidate-max reference-time computation — the single source of
+ * truth for "what time should a cron's next-fire be computed FROM," used
+ * identically by the live scheduler (loadCrons, below), the CLI's
+ * list-crons display, and the dashboard's list-all-crons API. Previously
+ * each of the three reimplemented this independently and only the
+ * scheduler's copy included created_at, so a never-fired cron displayed a
+ * misleading recomputed-every-query "now+interval" in the CLI/dashboard
+ * even after 10e3011f fixed the scheduler's own actual firing behavior —
+ * DRY violation, not three independent bugs (task_1785589264937).
+ *
+ * created_at anchors a cron that has NEVER fired on when it was created,
+ * rather than "now" — without it, a never-fired cron's computed next-fire
+ * silently resets forward every time this is called (every restart for the
+ * scheduler, every query for the CLI/dashboard), which can make an interval
+ * close to (or longer than) how often this gets recomputed structurally
+ * never actually arrive.
+ *
+ * created_at is therefore a FALLBACK, not a candidate: once any fire is on
+ * record that fire is the authoritative phase anchor and created_at must not
+ * compete with it in the max. Editing a cron's prompt is remove-then-add
+ * (add-cron refuses to overwrite an existing name), handleAddCron stamps a
+ * fresh created_at on every add, and removeCron leaves cron-state.json's
+ * last_fire intact — so including created_at unconditionally meant a prompt
+ * edit presented a brand-new timestamp that won the max and silently
+ * re-phased the cron. An interval cron's phase is invisible state that
+ * carries real meaning (staggering paired observers, stampede avoidance,
+ * covering a window), and nothing in the CLI output announced the change:
+ * the listing still read the same schedule, enabled, and count.
+ */
+export function computeReferenceMs(inputs: NextFireReferenceInputs, now: number): number {
+  const toMs = (iso: string | undefined): number | undefined => {
+    if (!iso) return undefined;
+    const ms = new Date(iso).getTime();
+    return isNaN(ms) ? undefined : ms;
+  };
+
+  const fires = [inputs.lastFiredAt, inputs.lastFireAttemptedAt, inputs.stateFire]
+    .map(toMs)
+    .filter((ms): ms is number => ms !== undefined);
+
+  if (fires.length > 0) return Math.max(...fires);
+
+  const created = toMs(inputs.createdAt);
+  return created !== undefined ? created : now;
+}
+
+/**
  * Compute the next fire time for a cron definition.
  *
  * For interval shorthands ("6h", "30m") we count forward from the
@@ -153,13 +278,15 @@ function changeKeyFor(c: CronDefinition): string {
  * @param cron        - The cron definition.
  * @param referenceMs - Epoch ms to count forward from (usually now or lastFiredAt).
  */
-function computeNextFireAt(cron: CronDefinition, referenceMs: number): number {
+export function computeNextFireAt(cron: CronDefinition, referenceMs: number): number {
   const durationMs = parseDurationMs(cron.schedule);
   if (!isNaN(durationMs)) {
     return referenceMs + durationMs;
   }
-  // Try as a cron expression
-  const next = nextFireFromCron(cron.schedule, referenceMs);
+  // Try as a cron expression, in the cron's declared timezone (default UTC —
+  // see nextFireFromCron's docblock for why this must not be the process's
+  // ambient/local timezone).
+  const next = nextFireFromCron(cron.schedule, referenceMs, cron.timezone ?? DEFAULT_CRON_TIMEZONE);
   return next;
 }
 
@@ -383,18 +510,15 @@ export class CronScheduler {
         continue;
       }
 
-      // New or modified cron — compute fresh nextFireAt.
-      // Base: take the most recent of crons.json.last_fired_at,
-      // crons.json.last_fire_attempted_at (set pre-onFire to detect crash
-      // mid-fire — iter 11), and cron-state.json.last_fire (either may be
-      // more current depending on which write path recorded the fire).
-      // Fall back to now.
-      const stateFire = stateLastFireByName.get(def.name);
-      const candidates: number[] = [];
-      if (def.last_fired_at) candidates.push(new Date(def.last_fired_at).getTime());
-      if (def.last_fire_attempted_at) candidates.push(new Date(def.last_fire_attempted_at).getTime());
-      if (stateFire) candidates.push(new Date(stateFire).getTime());
-      const referenceMs = candidates.length > 0 ? Math.max(...candidates) : now;
+      // New or modified cron — compute fresh nextFireAt via the shared
+      // candidate-max reference computation (computeReferenceMs, above) —
+      // see its docblock for why created_at must anchor a never-fired cron.
+      const referenceMs = computeReferenceMs({
+        createdAt: def.created_at,
+        lastFiredAt: def.last_fired_at,
+        lastFireAttemptedAt: def.last_fire_attempted_at,
+        stateFire: stateLastFireByName.get(def.name),
+      }, now);
 
       let nextFireAt = computeNextFireAt(def, referenceMs);
 

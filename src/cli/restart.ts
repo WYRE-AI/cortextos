@@ -34,6 +34,20 @@ export const restartCommand = new Command('restart')
     // PTY respawn semantics match exactly.
     const startResponse = await ipc.send({ type: 'start-agent', agent, source: 'cortextos restart' });
     if (!startResponse.success) {
+      // DEDUPED is not a failure. stop-agent returns as soon as the stop is
+      // dispatched, but the agent only leaves the registry once its PTY has
+      // actually exited — so a start issued immediately after can land while
+      // the entry is still present and be deduped. The dedupe message itself
+      // says "in-flight start or already running", so the agent is coming up
+      // (or never went down), and the old "Agent is now stopped. Recover
+      // with: cortextos start <agent>" was both wrong and actively misleading
+      // during an incident: the follow-up `start` then errors as deduped too,
+      // reading as a second failure against a perfectly healthy agent.
+      if (startResponse.code === 'DEDUPED') {
+        console.log(`  ${startResponse.error}`);
+        console.log(`  Agent is starting or already running — verify with: cortextos status`);
+        return;
+      }
       console.error(`  Start failed: ${startResponse.error}`);
       console.error(`  Agent is now stopped. Recover with: cortextos start ${agent}`);
       process.exit(1);

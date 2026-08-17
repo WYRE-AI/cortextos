@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFi
 import { join, sep } from 'path';
 import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
-import { AgentPTY } from '../pty/agent-pty.js';
+import { AgentPTY, isBinaryAvailable } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { OpencodePTY, opencodeSessionExists } from '../pty/opencode-pty.js';
@@ -11,14 +11,22 @@ import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
+import { writeAgentPid } from '../utils/agent-pidfile.js';
 import { resolvePaths } from '../utils/paths.js';
-import { tryAcquireRestartLock, releaseRestartLock } from './restart-lock.js';
+import { tryAcquireRestartLock, releaseRestartLock, isRestartInFlight } from './restart-lock.js';
 
 type LogFn = (msg: string) => void;
 
 // See the organic rate-limit exit block in handleExit() for why this is
 // deliberately narrower than the 16KB image-poison capture it slices from.
 const RATE_LIMIT_EXIT_TAIL_BYTES = 4096;
+
+// Binary-unavailable retry tiers. See binaryUnavailableRetryDelayMs().
+// Fast tier covers an in-flight install (the 2026-08-04 outage was ~12min);
+// the slow tier is for a runtime that is broken rather than mid-update.
+const BINARY_UNAVAILABLE_FAST_MS = 30_000;
+const BINARY_UNAVAILABLE_FAST_WINDOW_MS = 15 * 60_000;
+const BINARY_UNAVAILABLE_SLOW_MS = 5 * 60_000;
 
 /**
  * Manages a single agent's lifecycle.
@@ -38,6 +46,11 @@ export class AgentProcess {
   private crashTimestamps: number[] = [];
   private crashWindowMs: number = 0;
   private crashWindowMax: number = 0;
+  // Binary-unavailable outage tracking (see binaryUnavailableRetryDelayMs).
+  // Timestamps, not an attempt counter, so no reset has to stay in sync with
+  // start() — a long enough gap is itself the signal that the outage ended.
+  private binaryUnavailableSince: number = 0;
+  private lastBinaryUnavailableAt: number = 0;
   private sessionStart: Date | null = null;
   private status: AgentStatus['status'] = 'stopped';
   private stopping: boolean = false;
@@ -70,6 +83,10 @@ export class AgentProcess {
   // (each start() recreates the PTY, but the Telegram handle persists).
   private telegramApi: TelegramAPI | null = null;
   private telegramChatId: string | null = null;
+  // Limit-rotation wiring: secondary raw-output consumer re-applied on every
+  // AgentPTY (re)spawn (session refresh recreates the PTY, like the Telegram
+  // handle above).
+  private outputChunkHandler: ((data: string) => void) | null = null;
   // Issue #392: tracks whether the most recently built startup prompt consumed
   // a handoff doc marker. start() reads this after spawn to decide whether the
   // daemon should fire runtime-owned lifecycle Telegram directly.
@@ -165,6 +182,14 @@ export class AgentProcess {
           ? new CodexAppServerPTY(this.env, this.config, logPath)
           : new AgentPTY(this.env, this.config, logPath);
 
+    // Limit-rotation: re-apply the output-chunk handler on every PTY creation
+    // (this ternary is the SINGLE creation site — sessionRefresh delegates to
+    // stop()+start()). Guarded: CodexAppServerPTY has no onOutputChunk;
+    // HermesPTY inherits it from AgentPTY.
+    if (this.pty instanceof AgentPTY && this.outputChunkHandler) {
+      this.pty.onOutputChunk = this.outputChunkHandler;
+    }
+
     // Issue #330: re-wire the Telegram handle on every start() (session refresh
     // creates a fresh CodexAppServerPTY). Only CodexAppServerPTY uses this — Claude / Hermes
     // typing indicators flow through fast-checker.
@@ -211,6 +236,32 @@ export class AgentProcess {
       this.status = 'running';
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
+
+      // Record the live PTY pid HERE, at the one point every agent start
+      // passes through — not at the caller. AgentManager used to do it, but it
+      // is only one of five callers of start(): the other four are restart
+      // paths inside this class (session-refresh, image-poison, rate-limit,
+      // generic crash recovery), which respawn the PTY with a NEW pid and
+      // wrote nothing. So the record was correct exactly once, on the
+      // daemon-managed first spawn, and went stale on every self-restart —
+      // including the rate-limit restart, i.e. precisely during the incidents
+      // where establishing liveness matters most.
+      //
+      // Best-effort by design: a pidfile is an optimization for reconcile and
+      // must never be able to fail a spawn.
+      try {
+        const spawnedPid = this.pty.getPid();
+        if (spawnedPid) {
+          writeAgentPid(
+            join(this.env.ctxRoot, 'state', this.name),
+            this.name,
+            spawnedPid,
+            process.pid,
+          );
+        }
+      } catch (err) {
+        this.log(`pidfile write failed (non-fatal): ${err}`);
+      }
 
       // Issue #392 / opencode parity — per-runtime msg1/msg2 rules live on
       // maybeSendRuntimeLifecycleNotification's doc block.
@@ -385,13 +436,36 @@ export class AgentProcess {
    * Inject a message into the agent's PTY — structured outcome.
    *
    * Distinguishes NOT_RUNNING (agent registered but no live PTY) from
-   * DEDUPED (content collapsed against the in-process MessageDedup window).
-   * See issue #346 — both used to surface as a bare `false` and got mistaken
-   * for "agent not found" by operators investigating restart/cron failures.
+   * DEDUPED (content collapsed against the in-process MessageDedup window)
+   * from RESTARTING (a restart is in flight — see below).
+   * See issue #346 — the first two used to surface as a bare `false` and
+   * got mistaken for "agent not found" by operators investigating
+   * restart/cron failures.
+   *
+   * RESTARTING check (silent-message-drop fix): `this.status === 'running'`
+   * is true for the entire window between a restart being DECIDED
+   * (sessionRefresh acquiring the restart-in-flight lock) and the PTY
+   * actually tearing down inside stop() — status only flips off 'running'
+   * partway through that teardown. A caller (fast-checker.ts's pollCycle)
+   * that sees `ok: true` here ACKs the message as delivered — moving it
+   * inbox -> inflight -> processed permanently — even though the bytes
+   * just written may land in a PTY that's about to die with nothing left
+   * to ever read them. That's genuine silent loss, not just a delay: the
+   * message never stays in inflight/ long enough for the 5-minute
+   * stale-inflight sweep to notice and redeliver it. Checking
+   * isRestartInFlight() here closes that window: fast-checker sees a
+   * failed injection (this new RESTARTING code, not NOT_RUNNING) and does
+   * NOT ack, so the message stays safely in inflight/ and gets swept back
+   * to the new session once the restart completes.
    */
-  injectMessageDetailed(content: string): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+  injectMessageDetailed(content: string): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED' | 'RESTARTING'; message: string } {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
+    }
+
+    const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
+    if (isRestartInFlight(paths.stateDir)) {
+      return { ok: false, code: 'RESTARTING', message: `agent "${this.name}" has a restart in flight — injection deferred to avoid a silent drop` };
     }
 
     if (this.dedup.isDuplicate(content)) {
@@ -488,6 +562,12 @@ export class AgentProcess {
     if (this.config.runtime === 'codex-app-server' && this.pty) {
       (this.pty as CodexAppServerPTY).setTelegramHandle(api, chatId);
     }
+  }
+
+  /** Secondary PTY output consumer (survives session refresh re-spawns). */
+  setOutputChunkHandler(cb: (data: string) => void): void {
+    this.outputChunkHandler = cb;
+    if (this.pty instanceof AgentPTY) this.pty.onOutputChunk = cb;
   }
 
   /**
@@ -693,6 +773,59 @@ export class AgentProcess {
     }
   }
 
+  /**
+   * The binary this agent's PTY execs, mirroring the runtime switch in start().
+   * Kept in sync with that ternary — the two are the only places runtime maps
+   * to a concrete executable.
+   */
+  private agentBinaryName(): string {
+    if (this.config.runtime === 'hermes') return 'hermes';
+    if (this.config.runtime === 'codex-app-server') return 'codex';
+    return 'claude';
+  }
+
+  /**
+   * How long to wait before re-spawning an agent whose binary is missing.
+   *
+   * Called only from handleExit()'s binary-unavailable branch. The retry does
+   * NOT count against max_crashes_per_day, so this loop is the agent's only
+   * route back to life — the delay is an availability trade-off, not a tuning
+   * constant. Too short and the daemon spins against a torn-down install; too
+   * long and the fleet stays dark after the installer already finished,
+   * missing cron fires and inbox messages the whole time.
+   *
+   * Two tiers, keyed on how long the binary has been gone:
+   *
+   *   - First BINARY_UNAVAILABLE_FAST_WINDOW_MS of an outage: poll every 30s.
+   *     A real install window is minutes (the 2026-08-04 outage was ~12), so
+   *     this is the case that actually happens, and 30s keeps the agent's
+   *     downtime within a minute of the binary reappearing. A failed exec
+   *     costs ~1ms, so the polling itself is free.
+   *   - After that: back off to 5min. An outage this long is no longer an
+   *     in-flight install — it's a broken or removed runtime needing a human.
+   *     Slowing down bounds restarts.log growth (30s forever would append
+   *     ~2,880 lines/agent/day) without ever giving up, since nothing else
+   *     would bring the agent back if we did.
+   *
+   * Outage age is derived from timestamps rather than an attempt counter so
+   * there is no reset to keep in sync with start(): a gap longer than the slow
+   * tier means the previous outage ended and recovery already happened, so the
+   * next failure starts a fresh outage at the fast tier.
+   */
+  private binaryUnavailableRetryDelayMs(): number {
+    const now = Date.now();
+    const gapSinceLast = now - this.lastBinaryUnavailableAt;
+    if (gapSinceLast > BINARY_UNAVAILABLE_SLOW_MS * 2) {
+      this.binaryUnavailableSince = now;
+    }
+    this.lastBinaryUnavailableAt = now;
+
+    const outageAge = now - this.binaryUnavailableSince;
+    return outageAge < BINARY_UNAVAILABLE_FAST_WINDOW_MS
+      ? BINARY_UNAVAILABLE_FAST_MS
+      : BINARY_UNAVAILABLE_SLOW_MS;
+  }
+
   private handleExit(exitCode: number): void {
     // Capture last 16KB of the agent's stdout BEFORE nulling pty.
     // Used by the image-poison auto-recovery check below — reads the log
@@ -854,6 +987,49 @@ export class AgentProcess {
       return;
     }
 
+    // Binary-unavailable exemption (2026-08-04 fleet incident). Third member
+    // of the "upstream condition, not agent malfunction" family, alongside the
+    // image-poison and rate-limit blocks above.
+    //
+    // Every agent runs its own Claude Code auto-updater (private
+    // CLAUDE_CONFIG_DIR) against ONE shared binary. When two updaters raced,
+    // the install was left torn down — ~/.local/bin/claude dangling at a
+    // deleted version for ~12 minutes. node-pty happily returns a pid for a
+    // dangling symlink, then the child exits 1 having written nothing at all.
+    // Indistinguishable from a crash at the daemon's altitude, so the daemon
+    // charged the daily budget with exponential backoff and halted agents at
+    // the cap. AgentPTY's DISABLE_AUTOUPDATER pin is the prevention half; this
+    // is the resilience half, and it stands on its own for any other cause of
+    // a vanished runtime (botched upgrade, unmounted volume, bad PATH).
+    //
+    // Deliberately narrow — three independent conditions must all hold, so a
+    // genuine crash that merely coincides with an update window still counts:
+    //   1. exitCode === 1        — exec failure, not a clean exit
+    //   2. zero bytes written    — a real agent crash emits SOMETHING first.
+    //                              Bounded at stdoutLogSizeAtStart because
+    //                              stdout.log is append-only across restarts.
+    //   3. binary missing NOW    — the decisive check; without it (1)+(2) would
+    //                              exempt any fast silent failure.
+    const wroteNothingThisLifecycle =
+      this.tailStdoutLog(1, this.stdoutLogSizeAtStart).length === 0;
+    if (exitCode === 1 && wroteNothingThisLifecycle && !isBinaryAvailable(this.agentBinaryName())) {
+      const retryMs = this.binaryUnavailableRetryDelayMs();
+      this.log(
+        `Agent binary "${this.agentBinaryName()}" is not executable on PATH — runtime is missing or ` +
+        `mid-install, not an agent fault. Retrying in ${retryMs / 1000}s without counting against ` +
+        `max_crashes_per_day.`,
+      );
+      this.appendCrashToRestartsLog(exitCode, retryMs, 'BINARY_UNAVAILABLE_RECOVERY');
+      this.status = 'crashed';
+      this.notifyStatusChange();
+      setTimeout(() => {
+        if (this.status === 'crashed') {
+          this.start().catch(err => this.log(`Binary-unavailable restart failed: ${err}`));
+        }
+      }, retryMs);
+      return;
+    }
+
     // CrashLoopPauser (instar-inspired): if a sliding window is configured,
     // check whether the agent is crash-looping before falling through to
     // the legacy daily counter. The window is a more precise signal than
@@ -988,16 +1164,33 @@ export class AgentProcess {
     const handoffBlock = this.consumeHandoffBlock();
     const isHandoffRestart = handoffBlock.length > 0;
     this.lastSpawnWasHandoff = isHandoffRestart;
+    const telegram = this.canSendTelegram();
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
     // before cron restoration, before heartbeat, before anything else. Placing this instruction
     // immediately after the handoffBlock in the prompt ensures it is not buried.
     const shouldPromptTelegram = this.shouldPromptTelegramOnlineMessage();
-    const handoffUxOverride = isHandoffRestart && shouldPromptTelegram
-      ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
+    const handoffUxOverride = isHandoffRestart
+      ? (telegram
+        // Telegram-capable: upstream's telegram_polling gate still applies.
+        ? (shouldPromptTelegram
+          ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
+          : '')
+        // Bus-only (#107): ordering send-telegram here exits 1. update-heartbeat is
+        // the only channel these agents have, and it is what the dashboard shows.
+        : ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. You have NO Telegram bot configured, so do NOT attempt send-telegram; it will fail. Instead, after reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus update-heartbeat \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. That string is what the dashboard shows a human, so write it as a sentence, not a status code. Do this BEFORE any other tool call. No cron IDs, no cold-boot phrasing.')
       : '';
-    const onlineMessage = isHandoffRestart || !shouldPromptTelegram
+    // Gate ONLY the Telegram instruction on telegram_polling (upstream). The bus-only
+    // branch must NOT sit behind that predicate: shouldPromptTelegram is false for every
+    // bus-only agent by construction (telegramApi is only wired when BOT_TOKEN is set), so
+    // gating it there silently deletes #107's instruction for exactly the five agents it
+    // was written for, while leaving the string in the file for a grep to find.
+    const onlineMessage = isHandoffRestart
       ? ''
-      : ' Send a Telegram message to the user saying you are back online.';
+      : (telegram
+        ? (shouldPromptTelegram
+          ? ' Send a Telegram message to the user saying you are back online.'
+          : '')
+        : ' You have NO Telegram bot configured — do NOT attempt send-telegram. Report you are back online with: cortextos bus update-heartbeat \'<one-sentence status>\'.');
     return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
   }
 
@@ -1007,14 +1200,65 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    const onlineMessage = this.shouldPromptTelegramOnlineMessage()
-      ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
-      : '';
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineMessage}`;
+    const backOnline = this.canSendTelegram()
+      ? (this.shouldPromptTelegramOnlineMessage()
+        ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
+        : '')
+      : ' You have NO Telegram bot configured — do NOT attempt send-telegram. After checking inbox, report you are back online with: cortextos bus update-heartbeat \'<one-sentence status>\'.';
+    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${backOnline}`;
+  }
+
+  /**
+   * Whether a back-online / handoff instruction can actually be honoured, by
+   * EITHER delivery path. Both exist and neither alone is sufficient:
+   *
+   *  - the AGENT self-sends via `cortextos bus send-telegram`, which reads
+   *    BOT_TOKEN from the agent .env / process env (see hasTelegram) — this is
+   *    the claude-code shape, where the daemon never wires a handle at all;
+   *  - the DAEMON sends via a handle wired by setTelegramHandle() — the codex /
+   *    opencode shape, where the agent .env may carry no token.
+   *
+   * Keying on only the handle silences a token-holding claude agent; keying on
+   * only BOT_TOKEN silences a handle-wired opencode agent. Both regressions are
+   * covered by tests (agent-process-telegram-capability, agent-process-opencode),
+   * which is how the union was established rather than assumed.
+   */
+  private canSendTelegram(): boolean {
+    return this.hasTelegram() || (!!this.telegramApi && !!this.telegramChatId);
   }
 
   private shouldPromptTelegramOnlineMessage(): boolean {
-    return this.config.telegram_polling !== false && !!this.telegramApi && !!this.telegramChatId;
+    return this.config.telegram_polling !== false && this.canSendTelegram();
+  }
+
+  /**
+   * Whether this agent can actually send Telegram.
+   *
+   * Keys on BOT_TOKEN having a VALUE, not on the `BUS_ONLY` marker. BUS_ONLY is a
+   * classification that currently happens to select the right five agents; BOT_TOKEN
+   * is the property that actually determines whether `send-telegram` succeeds. They
+   * diverge on any newly-created agent: `add-agent` writes a literal `BOT_TOKEN=`
+   * (empty) with no BUS_ONLY field, so a BUS_ONLY check would tell every fresh agent
+   * to send Telegram it cannot send — the same defect, on a population that did not
+   * exist when the marker was introduced.
+   *
+   * Note CHAT_ID is deliberately NOT a tell: it is set (to the same value) on all
+   * five bus-only agents while BOT_TOKEN is empty, so its presence is a false
+   * positive for Telegram capability.
+   *
+   * Precedence matches `cortextos bus send-telegram` itself (src/cli/bus.ts): agent
+   * `.env` first, then the process environment. If the two ever disagree, this and
+   * the command it advertises must agree, or the prompt resumes lying.
+   */
+  private hasTelegram(): boolean {
+    try {
+      const envPath = join(this.env.agentDir, '.env');
+      if (existsSync(envPath)) {
+        const match = readFileSync(envPath, 'utf-8').match(/^BOT_TOKEN=(.+)$/m);
+        if (match && match[1].trim()) return true;
+      }
+    } catch { /* fall through to process env */ }
+    return Boolean(process.env.BOT_TOKEN && process.env.BOT_TOKEN.trim());
   }
 
   /**
@@ -1238,13 +1482,15 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'RATE_LIMIT_RECOVERY',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'RATE_LIMIT_RECOVERY'
+      | 'BINARY_UNAVAILABLE_RECOVERY',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
       ensureDir(logDir);
       const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-      const notCountedTowardMaxCrashes = kind === 'IMAGE_POISON_RECOVERY' || kind === 'RATE_LIMIT_RECOVERY';
+      const notCountedTowardMaxCrashes = kind === 'IMAGE_POISON_RECOVERY' || kind === 'RATE_LIMIT_RECOVERY'
+        || kind === 'BINARY_UNAVAILABLE_RECOVERY';
       const details =
         kind === 'HALTED'
           ? `exit_code=${exitCode} crash_count=${this.crashCount} max_crashes=${this.maxCrashesPerDay}`

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, checkTaskDependenciesWithStatus, compactTasks, listTasks, findTaskFile, findTaskFileWithStatus, archiveTasks } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -99,6 +99,49 @@ describe('Task Management', () => {
 
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
       expect(content.status).toBe('in_progress');
+    });
+
+    it('reassigns without a status argument, leaving status untouched', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task', { assignee: 'boss' });
+      updateTask(paths, taskId, undefined, { assignee: 'dev' });
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.assigned_to).toBe('dev');
+      expect(content.status).toBe('pending'); // untouched
+    });
+
+    it('changes project without a status argument', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      updateTask(paths, taskId, undefined, { project: 'conduit' });
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.project).toBe('conduit');
+    });
+
+    it('bumps updated_at on a reassign-only call', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task', { assignee: 'boss' });
+      const before = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8')).updated_at;
+
+      updateTask(paths, taskId, undefined, { assignee: 'dev' });
+
+      const after = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8')).updated_at;
+      expect(after >= before).toBe(true);
+    });
+
+    it('throws when neither status, assignee, nor project is given', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      expect(() => updateTask(paths, taskId)).toThrow(
+        'updateTask requires at least one of: status, assignee, project',
+      );
+    });
+
+    it('records the reassign in the task audit log', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task', { assignee: 'boss' });
+      updateTask(paths, taskId, undefined, { assignee: 'dev' });
+
+      const log = readTaskAudit(paths, taskId);
+      const reassignEntry = log[log.length - 1];
+      expect(reassignEntry.note).toContain('assignee: boss -> dev');
     });
   });
 
@@ -821,5 +864,158 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     expect(report.archived.map(a => a.id)).toEqual([id]);
     // Active JSON still present
     expect(existsSync(join(paths.taskDir, `${id}.json`))).toBe(true);
+  });
+});
+
+describe('findTaskFile — tier-3 unique-prefix resolution', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-task-prefix-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'paul'),
+      inflight: join(testDir, 'inflight', 'paul'),
+      processed: join(testDir, 'processed', 'paul'),
+      logDir: join(testDir, 'logs', 'paul'),
+      stateDir: join(testDir, 'state', 'paul'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    } as BusPaths;
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  const mk = (id: string, dir?: string) => {
+    const d = dir ?? paths.taskDir;
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, `${id}.json`), JSON.stringify({ id, status: 'pending', title: 'T' }));
+  };
+
+  it('a unique prefix resolves to the full task — updateTask works with a truncated id', () => {
+    mk('task_1700000000001_11111111');
+    mk('task_1700000000002_22222222');
+    updateTask(paths, 'task_1700000000001', 'in_progress');
+    const saved = JSON.parse(
+      readFileSync(join(paths.taskDir, 'task_1700000000001_11111111.json'), 'utf-8'),
+    );
+    expect(saved.status).toBe('in_progress');
+  });
+
+  it('an ambiguous prefix throws naming every candidate', () => {
+    mk('task_1700000000001_11111111');
+    mk('task_1700000000001_22222222');
+    expect(() => findTaskFile(paths, 'task_1700000000001')).toThrow(/Ambiguous task id prefix/);
+    expect(() => findTaskFile(paths, 'task_1700000000001')).toThrow(/task_1700000000001_11111111/);
+    expect(() => findTaskFile(paths, 'task_1700000000001')).toThrow(/task_1700000000001_22222222/);
+  });
+
+  it('no prefix match preserves the caller not-found error', () => {
+    mk('task_1700000000001_11111111');
+    expect(findTaskFile(paths, 'task_9999')).toBeNull();
+    expect(() => updateTask(paths, 'task_9999', 'completed')).toThrow(/not found in any org/);
+  });
+
+  it('an exact id wins at tier 1 and never enters prefix logic', () => {
+    mk('task_1700000000001_11111111');
+    expect(findTaskFile(paths, 'task_1700000000001_11111111')).toContain(
+      'task_1700000000001_11111111.json',
+    );
+  });
+
+  it('a prefix resolves across sibling orgs too', () => {
+    mk('task_1700000000003_33333333', join(testDir, 'orgs', 'beta', 'tasks'));
+    expect(findTaskFile(paths, 'task_1700000000003')).toContain(
+      'task_1700000000003_33333333.json',
+    );
+  });
+});
+
+describe('lookup completion status — "nothing there" vs "I did not look"', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-task-status-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'paul'),
+      inflight: join(testDir, 'inflight', 'paul'),
+      processed: join(testDir, 'processed', 'paul'),
+      logDir: join(testDir, 'logs', 'paul'),
+      stateDir: join(testDir, 'state', 'paul'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+    mkdirSync(paths.taskDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  // Make readdirSync(orgsRoot) throw ENOTDIR deterministically. Preferred over
+  // chmod 000, which a root-owned CI container silently ignores — the scan would
+  // then succeed and the test would pass while proving nothing.
+  const breakOrgsTree = (): void => {
+    writeFileSync(join(testDir, 'orgs'), 'not a directory');
+  };
+
+  const ABSENT = 'task_9999999999999_000';
+
+  it('CONTROL: a readable tree with no match reports a COMPLETED lookup', () => {
+    const r = findTaskFileWithStatus(paths, ABSENT);
+    expect(r.path).toBeNull();
+    expect(r.unreadable).toBe(false); // genuine absence — callers may trust it
+  });
+
+  it('an unreadable orgs tree reports the lookup did NOT complete', () => {
+    breakOrgsTree();
+    const r = findTaskFileWithStatus(paths, ABSENT);
+    expect(r.path).toBeNull();
+    expect(r.unreadable).toBe(true); // `path: null` here is NOT evidence of absence
+  });
+
+  it('THE COLLAPSE: both cases are byte-identical through the legacy wrapper', () => {
+    const genuine = findTaskFile(paths, ABSENT);
+    breakOrgsTree();
+    const unreadable = findTaskFile(paths, ABSENT);
+    // Documents exactly what the WithStatus split exists to recover. The wrapper
+    // is intentionally lossy (mirrors readCrons); callers that care must migrate.
+    expect(genuine).toBeNull();
+    expect(unreadable).toBeNull();
+  });
+
+  it('a findable task still resolves, and reports a completed lookup', () => {
+    const id = createTask(paths, 'alice', 'acme', 'Findable');
+    const r = findTaskFileWithStatus(paths, id);
+    expect(r.path).not.toBeNull();
+    expect(r.unreadable).toBe(false);
+  });
+
+  it('CONTROL: no blockers on a readable tree is a TRUSTWORTHY all-clear', () => {
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    const blocked = createTask(paths, 'alice', 'acme', 'Blocked', { blockedBy: [blocker] });
+    completeTask(paths, blocker, 'done');
+    const r = checkTaskDependenciesWithStatus(paths, blocked);
+    expect(r.open).toEqual([]);
+    expect(r.unresolved).toBe(false);
+  });
+
+  it('REGRESSION: an unreadable tree must NOT produce a clean bill of health', () => {
+    // The dangerous path. Both consumers read `open.length === 0` as an
+    // affirmative all-clear: the CLI prints "ready to work", and the drift
+    // scanner emits a `resolved_dependency` finding asserting the blockers
+    // "are all completed" — a claim built from blocked_by WITHOUT reading them.
+    breakOrgsTree();
+    const r = checkTaskDependenciesWithStatus(paths, ABSENT);
+    expect(r.unresolved).toBe(true);
   });
 });

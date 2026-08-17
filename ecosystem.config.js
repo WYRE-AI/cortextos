@@ -16,6 +16,8 @@ const CTX_ORG = process.env.CTX_ORG || '';
 // second instance start never renames/restarts the running default fleet.
 const DAEMON_PM2_NAME =
   INSTANCE_ID === 'default' ? 'cortextos-daemon' : `cortextos-daemon-${INSTANCE_ID}`;
+const DASHBOARD_PM2_NAME =
+  INSTANCE_ID === 'default' ? 'cortextos-dashboard' : `cortextos-dashboard-${INSTANCE_ID}`;
 
 module.exports = {
   apps: [
@@ -52,6 +54,34 @@ module.exports = {
       // fleet-wide outage.
       max_restarts: 10,
       restart_delay: 5000,
+      autorestart: true,
+    },
+    {
+      // The dashboard was previously started ad-hoc (`pm2 start npm -- run start`
+      // from dashboard/) and was NOT in this file, so it only ever had CTX_ROOT if
+      // the starting shell happened to export it. On 2026-08-14 a pm2 resurrect
+      // brought it back from the saved dump — which carries no CTX vars — and it
+      // ran for 37 hours online, serving, and ingesting nothing.
+      //
+      // CTX_ROOT IS LOAD-BEARING HERE, and the failure is silent because two
+      // modules disagree about what "unset" means:
+      //   dashboard/src/lib/config.ts  DEFAULTS  to ~/.cortextos/<instance>
+      //   dashboard/src/lib/db.ts      FALLS BACK to <cwd>/.data/
+      // With CTX_ROOT unset the dashboard therefore reads the RIGHT files and
+      // writes them to the WRONG database — a fresh empty one under dashboard/.data/
+      // — while the real DB sits orphaned and frozen. Nothing errors, pm2 stays
+      // green, and the UI just shows nothing.
+      name: DASHBOARD_PM2_NAME,
+      script: 'npm',
+      args: 'run start',
+      cwd: path.join(FRAMEWORK_ROOT, 'dashboard'),
+      env: {
+        CTX_INSTANCE_ID: INSTANCE_ID,
+        CTX_ROOT: CTX_ROOT,
+        CTX_FRAMEWORK_ROOT: FRAMEWORK_ROOT,
+        CTX_PROJECT_ROOT: PROJECT_ROOT,
+        CTX_ORG: CTX_ORG,
+      },
       autorestart: true,
     },
   ],

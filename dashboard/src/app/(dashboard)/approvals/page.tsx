@@ -11,6 +11,8 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { PriorityBadge, TimeAgo } from '@/components/shared';
 import type { Approval, Task } from '@/lib/types';
+import { usePagination } from '@/hooks/use-pagination';
+import { PaginationControls } from '@/components/ui/pagination-controls';
 
 export default function ApprovalsPage() {
   const { currentOrg } = useOrg();
@@ -97,6 +99,10 @@ export default function ApprovalsPage() {
   }
 
   // Derive unique values for history filter dropdowns
+  // Tall action cards: a smaller page than the compact message/event rows.
+  const taskPage = usePagination(humanTasks, 10);
+  const pendingPage = usePagination(pending, 10);
+
   const historyAgents = [...new Set(resolved.map((a) => a.agent))];
   const historyCategories = [...new Set(resolved.map((a) => a.category))];
 
@@ -150,7 +156,7 @@ export default function ApprovalsPage() {
             </p>
           ) : (
             <div className="grid gap-2 max-w-2xl">
-              {humanTasks.map((task) => (
+              {taskPage.pageItems.map((task) => (
                 <Card key={task.id} className="hover:bg-muted/20 transition-colors">
                   <CardContent className="flex items-start justify-between py-3">
                     <div className="min-w-0 flex-1 space-y-1">
@@ -184,6 +190,18 @@ export default function ApprovalsPage() {
                   </CardContent>
                 </Card>
               ))}
+              <PaginationControls
+                page={taskPage.page}
+                pageCount={taskPage.pageCount}
+                rangeStart={taskPage.rangeStart}
+                rangeEnd={taskPage.rangeEnd}
+                total={taskPage.total}
+                canPrev={taskPage.canPrev}
+                canNext={taskPage.canNext}
+                onPrev={taskPage.prev}
+                onNext={taskPage.next}
+                label="tasks"
+              />
             </div>
           )}
         </TabsContent>
@@ -196,13 +214,25 @@ export default function ApprovalsPage() {
             </p>
           ) : (
             <div className="grid gap-2 max-w-2xl">
-              {pending.map((approval) => (
+              {pendingPage.pageItems.map((approval) => (
                 <ApprovalCard
                   key={approval.id}
                   approval={approval}
                   onClick={handleApprovalClick}
                 />
               ))}
+              <PaginationControls
+                page={pendingPage.page}
+                pageCount={pendingPage.pageCount}
+                rangeStart={pendingPage.rangeStart}
+                rangeEnd={pendingPage.rangeEnd}
+                total={pendingPage.total}
+                canPrev={pendingPage.canPrev}
+                canNext={pendingPage.canNext}
+                onPrev={pendingPage.prev}
+                onNext={pendingPage.next}
+                label="approvals"
+              />
             </div>
           )}
         </TabsContent>

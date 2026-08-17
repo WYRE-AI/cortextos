@@ -174,5 +174,48 @@ describe.skipIf(!existsSync(DIST_CLI))(
       expect(code).toBe(0);
       expect(stdout).toContain("Updated task_real_002 -> in_progress");
     });
+
+    it("update-task --assignee reroutes a task without a status argument", async () => {
+      writeTask("task_real_003", { assigned_to: "boss" });
+      const { stdout, code } = await runCli([
+        "bus",
+        "update-task",
+        "task_real_003",
+        "--assignee",
+        "dev",
+      ]);
+
+      expect(code).toBe(0);
+      expect(stdout).toContain("assignee -> dev");
+    });
+
+    it("update-task --project changes the project without a status argument", async () => {
+      writeTask("task_real_004");
+      const { stdout, code } = await runCli([
+        "bus",
+        "update-task",
+        "task_real_004",
+        "--project",
+        "conduit",
+      ]);
+
+      expect(code).toBe(0);
+      expect(stdout).toContain("project -> conduit");
+    });
+
+    it("update-task with neither status nor --assignee/--project exits 1 with a clean message", async () => {
+      writeTask("task_real_005");
+      const { stdout, stderr, code } = await runCli([
+        "bus",
+        "update-task",
+        "task_real_005",
+      ]);
+
+      expect(code).toBe(1);
+      expect(stderr.trim()).toBe(
+        "Nothing to update — pass a status, --assignee, and/or --project",
+      );
+      expect(stdout).toBe("");
+    });
   },
 );

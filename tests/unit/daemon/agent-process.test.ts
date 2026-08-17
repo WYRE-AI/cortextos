@@ -14,9 +14,18 @@ const mockPty = {
   }),
 };
 
+// Getter defers the lookup until call time, so the hoisted vi.mock factory can
+// reference ptyMocks (declared below) — same idiom as the fs mock further down.
 vi.mock('../../../src/pty/agent-pty.js', () => ({
   AgentPTY: function AgentPTY() { return mockPty; },
+  get isBinaryAvailable() { return ptyMocks.isBinaryAvailable; },
 }));
+
+const ptyMocks = {
+  // Default true: the runtime is present, so every pre-existing test keeps
+  // taking the ordinary crash path.
+  isBinaryAvailable: vi.fn().mockReturnValue(true),
+};
 
 const mockInjectMessage = vi.fn();
 vi.mock('../../../src/pty/inject.js', () => ({
@@ -37,6 +46,17 @@ vi.mock('../../../src/utils/env.js', () => ({
 vi.mock('../../../src/bus/reminders.js', () => ({
   getOverdueReminders: vi.fn().mockReturnValue([]),
 }));
+
+const pidfileMocks = {
+  writeAgentPid: vi.fn(),
+};
+
+vi.mock('../../../src/utils/agent-pidfile.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../src/utils/agent-pidfile')>(
+    '../../../src/utils/agent-pidfile',
+  );
+  return { ...actual, writeAgentPid: (...args: unknown[]) => pidfileMocks.writeAgentPid(...args) };
+});
 
 vi.mock('../../../src/utils/paths.js', () => ({
   resolvePaths: vi.fn().mockReturnValue({ stateDir: '/tmp/test-ctx/state/alice' }),
@@ -108,6 +128,92 @@ beforeEach(() => {
   fsMocks.appendFileSync.mockReset();
   fsMocks.statSync.mockReset();
   fsMocks.unlinkSync.mockReset();
+  ptyMocks.isBinaryAvailable.mockReset().mockReturnValue(true);
+});
+
+describe('AgentProcess — binary-unavailable exemption (2026-08-04 shared-binary incident)', () => {
+  // Nine agents, nine private auto-updaters, ONE shared binary. Two updaters
+  // raced and left ~/.local/bin/claude dangling at a deleted version for
+  // ~12 minutes. node-pty returns a pid for a dangling symlink, then the child
+  // exits 1 having written nothing — verified against the real thing:
+  //   pid assigned: 69035 / exitCode: 1 signal: 0 / output bytes: 0
+  // The daemon read that as an agent crash: boss burned 8 of its 10-crash
+  // budget, analyst hit the cap and HALTED. A missing runtime is an
+  // environmental condition and must never charge the agent's budget.
+
+  it('does NOT count a crash when the binary is missing from PATH', async () => {
+    ptyMocks.isBinaryAvailable.mockReturnValue(false);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    // exit 1 with zero bytes written — the dangling-symlink signature.
+    capturedOnExit!(1, 0);
+
+    const [logPath, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logPath)).toContain('/logs/alice/restarts.log');
+    expect(String(logLine)).toContain('BINARY_UNAVAILABLE_RECOVERY');
+    expect(String(logLine)).toContain('(not counted toward max_crashes)');
+    // The decisive assertion: .crash_count_today must be untouched. Writing it
+    // is what marched boss to 8 and analyst into a HALT.
+    const crashCountWrites = fsMocks.writeFileSync.mock.calls
+      .filter(c => String(c[0]).endsWith('.crash_count_today'));
+    expect(crashCountWrites).toHaveLength(0);
+  });
+
+  it('still counts an ordinary crash when the binary IS present (regression guard)', async () => {
+    ptyMocks.isBinaryAvailable.mockReturnValue(true);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    capturedOnExit!(1, 0);
+
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).toMatch(/\] CRASH: exit_code=1 crash_count=1/);
+    expect(String(logLine)).not.toContain('BINARY_UNAVAILABLE_RECOVERY');
+  });
+
+  it('polls fast during a fresh outage, then backs off once it is clearly not an install', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    const delayFor = () =>
+      (ap as unknown as { binaryUnavailableRetryDelayMs(): number }).binaryUnavailableRetryDelayMs();
+    const nowSpy = vi.spyOn(Date, 'now');
+
+    // t=0 — outage begins. Fast tier: a real install window is minutes, and
+    // 30s keeps downtime within a minute of the binary reappearing.
+    nowSpy.mockReturnValue(1_000_000);
+    expect(delayFor()).toBe(30_000);
+
+    // t=+10min — still inside the fast window (the real outage was ~12min).
+    nowSpy.mockReturnValue(1_000_000 + 10 * 60_000);
+    expect(delayFor()).toBe(30_000);
+
+    // t=+20min — past the fast window. No longer an in-flight install, so
+    // slow down to bound restarts.log growth without ever giving up.
+    nowSpy.mockReturnValue(1_000_000 + 20 * 60_000);
+    expect(delayFor()).toBe(5 * 60_000);
+
+    // A gap longer than the slow tier means the previous outage ended and the
+    // agent recovered — a later failure is a NEW outage and starts fast again,
+    // rather than inheriting the old one's backoff.
+    nowSpy.mockReturnValue(1_000_000 + 20 * 60_000 + 60 * 60_000);
+    expect(delayFor()).toBe(30_000);
+
+    nowSpy.mockRestore();
+  });
+
+  it('does not exempt a clean exit(0) even while the binary is missing (narrowness guard)', async () => {
+    // A missing binary explains exit 1 (exec failure), not a graceful exit 0.
+    // Without the exit-code condition this branch would swallow unrelated
+    // failures that merely coincide with an install window.
+    ptyMocks.isBinaryAvailable.mockReturnValue(false);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    capturedOnExit!(0, 0);
+
+    const [, logLine] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(logLine)).not.toContain('BINARY_UNAVAILABLE_RECOVERY');
+  });
 });
 
 describe('AgentProcess — #19b restart-time marker (bootstrap-hang expected-beat anchor)', () => {
@@ -869,5 +975,118 @@ describe('AgentProcess - onboarding marker (do not auto-write .onboarded on hear
     const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
     expect(prompt).not.toContain('FIRST BOOT');
     expect(prompt).not.toContain('complete the onboarding protocol');
+  });
+});
+
+describe('AgentProcess.injectMessageDetailed — RESTARTING code (bus-message silent-drop race fix)', () => {
+  it('returns RESTARTING (not NOT_RUNNING, and does not write to the PTY) when a restart lock is held for this agent, even though status is still "running"', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    expect(ap.getStatus().status).toBe('running');
+
+    // Simulate the exact race this fix closes: sessionRefresh() has acquired the
+    // restart-in-flight lock but stop()'s PTY teardown hasn't run yet — status is
+    // still 'running' and this.pty is still set, so the pre-existing NOT_RUNNING
+    // check alone would not catch this window.
+    fsMocks.readFileSync.mockImplementation((path: unknown) => {
+      if (String(path).endsWith('.restart-in-flight')) {
+        return JSON.stringify({ source: 'hang-detector', at: Date.now() - 5_000 }); // fresh
+      }
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    const result = ap.injectMessageDetailed('hello');
+
+    expect(result).toEqual({
+      ok: false,
+      code: 'RESTARTING',
+      message: expect.stringContaining('restart in flight'),
+    });
+    expect(mockPty.write).not.toHaveBeenCalled();
+  });
+
+  it('returns ok:true and writes to the PTY when no restart lock is held', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    fsMocks.readFileSync.mockImplementation(() => {
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); // no lock file
+    });
+
+    const result = ap.injectMessageDetailed('hello');
+
+    expect(result).toEqual({ ok: true });
+  });
+
+  it('still returns NOT_RUNNING when the agent is not running, regardless of lock state', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    // Never started — this.pty is unset, this.status is not 'running'.
+
+    const result = ap.injectMessageDetailed('hello');
+
+    expect(result.ok).toBe(false);
+    expect((result as { code: string }).code).toBe('NOT_RUNNING');
+  });
+});
+
+describe('AgentProcess — pid record written at the start() choke point', () => {
+  beforeEach(() => {
+    pidfileMocks.writeAgentPid.mockClear();
+  });
+
+  it('start() records the live PTY pid', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(pidfileMocks.writeAgentPid).toHaveBeenCalledTimes(1);
+    const [stateDir, agentName, pid, daemonPid] = pidfileMocks.writeAgentPid.mock.calls[0];
+    expect(stateDir).toBe('/tmp/test-ctx/state/alice');
+    expect(agentName).toBe('alice');
+    expect(pid).toBe(12345);          // mockPty.getPid()
+    expect(daemonPid).toBe(process.pid);
+  });
+
+  it('REGRESSION: a SELF-RESTART re-records the pid, so the record cannot go stale', async () => {
+    // The defect this fixes. writeAgentPid used to live in AgentManager, at
+    // the ONE caller that spawns an agent from outside. The four restart
+    // paths inside AgentProcess (image-poison, rate-limit, generic, and the
+    // session-refresh at :380) all call this.start() directly and wrote no
+    // pid — so after any self-restart the record still named the pid of a
+    // process that no longer exists. Notably :881 is the RATE-LIMIT restart,
+    // so records went stale during exactly the incidents where liveness
+    // matters most.
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    expect(pidfileMocks.writeAgentPid).toHaveBeenCalledTimes(1);
+    expect(pidfileMocks.writeAgentPid.mock.calls[0][2]).toBe(12345);
+
+    // Drive the real restart shape: start() early-returns while status is
+    // 'running', so a self-restart necessarily goes through a PTY exit first.
+    capturedOnExit!(1);
+    // The PTY comes back with a different pid, as a real respawn would.
+    mockPty.getPid.mockReturnValue(67890);
+    await ap.start();
+
+    const calls = pidfileMocks.writeAgentPid.mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    // Pre-fix the record would still name 12345 — a process that is gone.
+    expect(calls[calls.length - 1][2]).toBe(67890);
+    mockPty.getPid.mockReturnValue(12345);
+  });
+
+  it('a failed spawn records NO pid — an absent record beats one naming a process that never ran', async () => {
+    mockPty.spawn.mockRejectedValueOnce(new Error('boom'));
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(ap.getStatus().status).toBe('crashed');
+    expect(pidfileMocks.writeAgentPid).not.toHaveBeenCalled();
+  });
+
+  it('a pidfile write failure never breaks the spawn', async () => {
+    pidfileMocks.writeAgentPid.mockImplementationOnce(() => { throw new Error('disk full'); });
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await expect(ap.start()).resolves.toBeUndefined();
+    expect(ap.getStatus().status).toBe('running');
   });
 });

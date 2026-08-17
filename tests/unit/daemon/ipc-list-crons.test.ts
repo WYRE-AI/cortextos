@@ -103,7 +103,7 @@ describe('computeNextFire', () => {
 
     const lastFiredAt = '2026-04-28T12:00:00.000Z';
     const now = new Date('2026-04-28T12:00:00.000Z').getTime();
-    const result = computeNextFire('6h', lastFiredAt, now);
+    const result = computeNextFire('6h', undefined, lastFiredAt, undefined, undefined, now);
 
     // 6h after lastFiredAt = 18:00 on same day
     expect(result).toBe('2026-04-28T18:00:00.000Z');
@@ -113,7 +113,7 @@ describe('computeNextFire', () => {
     const { computeNextFire } = await import('../../../src/daemon/ipc-server.js');
 
     const now = new Date('2026-04-28T12:00:00.000Z').getTime();
-    const result = computeNextFire('1h', undefined, now);
+    const result = computeNextFire('1h', undefined, undefined, undefined, undefined, now);
 
     expect(result).toBe('2026-04-28T13:00:00.000Z');
   });
@@ -124,7 +124,7 @@ describe('computeNextFire', () => {
     // last fired 10h ago, interval is 6h → next is 4h ago → should advance to now+6h
     const lastFiredAt = '2026-04-28T00:00:00.000Z'; // 10h before now
     const now = new Date('2026-04-28T10:00:00.000Z').getTime();
-    const result = computeNextFire('6h', lastFiredAt, now);
+    const result = computeNextFire('6h', undefined, lastFiredAt, undefined, undefined, now);
 
     // referenceMs=00:00, next=06:00, but 06:00 < now=10:00, so returns now+6h=16:00
     expect(result).toBe('2026-04-28T16:00:00.000Z');
@@ -134,7 +134,7 @@ describe('computeNextFire', () => {
     const { computeNextFire } = await import('../../../src/daemon/ipc-server.js');
 
     const now = new Date('2026-04-28T10:00:00.000Z').getTime();
-    const result = computeNextFire('30m', undefined, now);
+    const result = computeNextFire('30m', undefined, undefined, undefined, undefined, now);
 
     expect(result).toBe('2026-04-28T10:30:00.000Z');
   });
@@ -144,7 +144,7 @@ describe('computeNextFire', () => {
 
     const lastFiredAt = '2026-04-28T09:00:00.000Z';
     const now = new Date('2026-04-28T10:00:00.000Z').getTime();
-    const result = computeNextFire('1d', lastFiredAt, now);
+    const result = computeNextFire('1d', undefined, lastFiredAt, undefined, undefined, now);
 
     expect(result).toBe('2026-04-29T09:00:00.000Z');
   });
@@ -154,7 +154,7 @@ describe('computeNextFire', () => {
 
     const now = Date.now();
     // "*/15 * * * *" = every 15 minutes — fires within the next 15 minutes
-    const result = computeNextFire('*/15 * * * *', undefined, now);
+    const result = computeNextFire('*/15 * * * *', undefined, undefined, undefined, undefined, now);
 
     expect(result).not.toBe('unknown');
     // Must parse as a valid date
@@ -170,7 +170,7 @@ describe('computeNextFire', () => {
   it('returns "unknown" for unparseable schedule', async () => {
     const { computeNextFire } = await import('../../../src/daemon/ipc-server.js');
 
-    const result = computeNextFire('not-a-schedule', undefined, Date.now());
+    const result = computeNextFire('not-a-schedule', undefined, undefined, undefined, undefined, Date.now());
     expect(result).toBe('unknown');
   });
 });

@@ -20,8 +20,11 @@ import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { resolveAgentDir } from '../utils/agent-dir.js';
 import { stripBom } from '../utils/strip-bom.js';
-import { writeAgentPid, readAgentPid, clearAgentPid, reapOrphan, isPidAlive } from '../utils/agent-pidfile.js';
+import { readAgentPid, clearAgentPid, reapOrphan, isPidAlive } from '../utils/agent-pidfile.js';
 import { tryAcquireRestartLock, releaseRestartLock } from './restart-lock.js';
+import { RotationManager } from './rotation-manager.js';
+import { LimitScanner } from './limit-detector.js';
+import { preflightAccount } from './account-preflight.js';
 
 type LogFn = (msg: string) => void;
 
@@ -62,6 +65,12 @@ export class AgentManager {
   // the orchestrator (e.g. a restart) while this daemon process is alive.
   private slackSocketStarted = false;
   private slackSocketClient: SlackSocketModeClient | null = null;
+
+  // Limit-rotation: one fleet-level RotationManager, lazily created at first
+  // agent registration; one LimitScanner per agent feeds it (see startAgent).
+  private rotationManager: RotationManager | null = null;
+  /** First registered agent's Telegram handle — fleet-level rotation alerts. */
+  private alertHandle: { api: TelegramAPI; chatId: string } | null = null;
 
   constructor(instanceId: string, ctxRoot: string, frameworkRoot: string, org: string) {
     this.instanceId = instanceId;
@@ -125,6 +134,32 @@ export class AgentManager {
     // restart, manual restartAgent) get the real BUG-011 alarm, not the
     // quieted post-crash variant.
     this.daemonJustCrashed = false;
+  }
+
+  /**
+   * Lazily create (and start) the fleet-level RotationManager. One instance
+   * serves every agent: concurrent limit events fold into a single rotation.
+   * ctxRoot/org come from the first registered agent's env (all agents in an
+   * instance share the same ctxRoot; org matches the daemon's startup org for
+   * the accounts.json-owning default instance).
+   */
+  private ensureRotationManager(env: CtxEnv): RotationManager {
+    if (!this.rotationManager) {
+      this.rotationManager = new RotationManager({
+        ctxRoot: env.ctxRoot,
+        frameworkRoot: this.frameworkRoot,
+        org: env.org,
+        preflight: preflightAccount,
+        restartAgent: (name) => this.restartAgent(name),
+        sendAlert: (text) => {
+          const handle = this.alertHandle;
+          if (handle) handle.api.sendMessage(handle.chatId, text).catch(() => {});
+        },
+        log: (msg) => console.log(`[agent-manager] ${msg}`),
+      });
+      this.rotationManager.start();
+    }
+    return this.rotationManager;
   }
 
   /**
@@ -225,8 +260,18 @@ export class AgentManager {
     if (!existsSync(enabledFile)) return {};
     try {
       return JSON.parse(readFileSync(enabledFile, 'utf-8'));
-    } catch {
-      return {}; // corrupt or unreadable — fall through to default-enabled
+    } catch (err) {
+      // Fail-open direction is deliberate (default-enabled, matching
+      // discoverAndStart).  But a CORRUPT registry is not the same fact as a
+      // MISSING one: the file exists and records explicit enable/disable
+      // intent we are now discarding, so a deliberately DISABLED agent starts.
+      // Keep the direction; do not swallow the condition.
+      console.warn(
+        `[agent-manager] enabled-agents.json at ${enabledFile} is unreadable or corrupt ` +
+        `(${err instanceof Error ? err.message : String(err)}) — falling through to DEFAULT-ENABLED. ` +
+        `Any agent explicitly disabled in that file WILL START.`
+      );
+      return {};
     }
   }
 
@@ -458,6 +503,17 @@ export class AgentManager {
     if (telegramApi && chatId) {
       agentProcess.setTelegramHandle(telegramApi, chatId);
     }
+
+    // Limit-rotation wiring: feed this agent's raw PTY output through a
+    // per-agent LimitScanner; a detected rate-limit banner hands recovery to
+    // the fleet-level RotationManager (which restarts only blocked agents).
+    if (telegramApi && chatId && !this.alertHandle) this.alertHandle = { api: telegramApi, chatId };
+    const rotation = this.ensureRotationManager(env);
+    const scanner = new LimitScanner();
+    agentProcess.setOutputChunkHandler((data) => {
+      const ev = scanner.push(data);
+      if (ev) void rotation.onLimitEvent(name, ev);
+    });
     const checker = new FastChecker(agentProcess, paths, this.frameworkRoot, {
       log,
       telegramApi,
@@ -490,12 +546,12 @@ export class AgentManager {
     // Start agent
     await agentProcess.start();
 
-    // Persist the PTY pid so start/stop reconcile can detect divergence between
-    // this in-memory registry and the real process — including across daemon
-    // generations (a crash leaves the Map empty but the PTY may survive on disk
-    // as an orphan). Best-effort; writeAgentPid never throws.
-    const spawnedPid = agentProcess.getPid();
-    if (spawnedPid) writeAgentPid(paths.stateDir, name, spawnedPid, process.pid);
+    // The PTY pid is persisted by AgentProcess.start() itself. It used to be
+    // written here, but this is only ONE of five callers of start() — the
+    // other four are restart paths inside AgentProcess that respawn the PTY
+    // with a new pid, so the record went stale on every self-restart. Moving
+    // it to the choke point covers all five; writing it here too would just
+    // duplicate the same values.
 
     // Subtask 2.2: Auto-migrate crons from config.json → crons.json before
     // starting the scheduler, so the scheduler always has a populated crons.json
@@ -1119,6 +1175,19 @@ export class AgentManager {
     try {
       console.log(`[agent-manager] Restarting ${name}`);
       await this.stopAgent(name);
+      // Reset context_status.json so the fresh FastChecker this creates (startAgent
+      // below) doesn't read the dying session's last-written, possibly still-high
+      // percentage and immediately re-fire a Tier-2 context handoff in a session that
+      // hasn't used any context yet. forceContextRestart (fast-checker.ts) already does
+      // this for its own Tier-3 path; this path — the cooperative `hard-restart` an
+      // agent calls itself after a handoff — had no equivalent, so a fresh FastChecker's
+      // class-default ctxHandoffFiredAt=0 would pass Tier-2's guard against stale data.
+      try {
+        writeFileSync(
+          join(stateDir, 'context_status.json'),
+          JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }),
+        );
+      } catch { /* non-fatal */ }
       await this.startAgent(name, '');
       console.log(`[agent-manager] Restart complete for ${name}`);
     } finally {
@@ -1149,6 +1218,9 @@ export class AgentManager {
     this.slackSocketClient?.stop();
     this.slackSocketClient = null;
     this.slackSocketStarted = false;
+    // Stop the rotation tick first — a rotation-triggered restartAgent()
+    // firing mid-shutdown would resurrect an agent straight into process.exit().
+    this.rotationManager?.stop();
     const names = [...this.agents.keys()];
 
     for (const name of names) {
@@ -1301,11 +1373,13 @@ export class AgentManager {
    * Inject text into an agent's PTY with structured outcome — issue #346.
    *
    * Returns NOT_FOUND if the agent isn't in the registry, NOT_RUNNING if
-   * registered but the PTY is gone, DEDUPED on a MessageDedup hash hit. The
+   * registered but the PTY is gone, DEDUPED on a MessageDedup hash hit,
+   * RESTARTING if a restart is in flight (silent-drop fix — see
+   * injectMessageDetailed's docblock in agent-process.ts). The
    * boolean-returning `injectAgent()` is preserved for callers (cron
    * scheduler, fast-checker, fire-cron) that only need pass/fail.
    */
-  injectAgentDetailed(agentName: string, text: string): { ok: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+  injectAgentDetailed(agentName: string, text: string): { ok: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING' | 'DEDUPED' | 'RESTARTING'; message: string } {
     const entry = this.agents.get(agentName);
     if (!entry) {
       return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };

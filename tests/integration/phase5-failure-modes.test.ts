@@ -126,13 +126,22 @@ function makeCronDef(
   schedule: string,
   overrides: Partial<CronDefinition> = {},
 ): CronDefinition {
+  // A real cron's created_at is always <= its last_fired_at. If a caller
+  // backdates last_fired_at without also overriding created_at, default
+  // created_at to just before that fire rather than "now" — otherwise
+  // referenceMs's created_at candidate (task_1785291274197_50357066) would
+  // outrank the intentionally-backdated last_fired_at and mask catch-up.
+  const createdAt = overrides.created_at
+    ?? (overrides.last_fired_at
+      ? new Date(new Date(overrides.last_fired_at).getTime() - 60_000).toISOString()
+      : new Date().toISOString());
   return {
     name,
     prompt: `Prompt for ${name}.`,
     schedule,
     enabled: true,
-    created_at: new Date().toISOString(),
     ...overrides,
+    created_at: createdAt,
   };
 }
 

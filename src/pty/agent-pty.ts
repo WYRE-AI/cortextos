@@ -1,9 +1,40 @@
 import { join } from 'path';
-import { existsSync, readFileSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, accessSync, constants } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import { injectMessage as injectMessageIntoPty } from './inject.js';
+
+/**
+ * Is `binary` resolvable on PATH and executable RIGHT NOW?
+ *
+ * Used by AgentProcess.handleExit() to tell "the agent crashed" apart from
+ * "the binary was yanked out from under it mid-restart". A torn-down or
+ * half-installed runtime is an environmental condition, not an agent fault,
+ * and must not burn the agent's daily crash budget.
+ *
+ * existsSync FOLLOWS symlinks, which is precisely the property this needs: a
+ * dangling ~/.local/bin/claude -> versions/<deleted-version> reports false,
+ * and that dangling window is the exact state that took the fleet down on
+ * 2026-08-04. A present-but-not-yet-chmod'd binary (partially written by an
+ * in-flight installer) fails the X_OK check and is likewise reported missing.
+ */
+export function isBinaryAvailable(binary: string): boolean {
+  const sep = platform() === 'win32' ? ';' : ':';
+  const pathDirs = (process.env.PATH || '').split(sep).filter(Boolean);
+  for (const dir of pathDirs) {
+    const candidate = join(dir, binary);
+    if (!existsSync(candidate)) continue;
+    try {
+      accessSync(candidate, constants.X_OK);
+      return true;
+    } catch {
+      // Present but not executable — an installer may still be writing it.
+      // Keep scanning; a later PATH entry may hold a usable copy.
+    }
+  }
+  return false;
+}
 
 // node-pty types
 interface IPty {
@@ -37,6 +68,8 @@ export class AgentPTY {
   protected config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
+  /** Optional secondary consumer of raw PTY output (limit-banner scanning). */
+  onOutputChunk: ((data: string) => void) | null = null;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
     this.env = env;
@@ -159,6 +192,7 @@ export class AgentPTY {
     // Set up output capture
     this.pty.onData((data: string) => {
       this.outputBuffer.push(data);
+      try { this.onOutputChunk?.(data); } catch { /* scanner must never kill the PTY */ }
     });
 
     // Set up exit handler
@@ -405,6 +439,27 @@ export class AgentPTY {
         env[key] = process.env[key]!;
       }
     }
+
+    // Pin the Claude Code auto-updater OFF for every agent.
+    //
+    // Each agent runs under its own CLAUDE_CONFIG_DIR (the fix for the
+    // keychain-vs-token problem), so each Claude Code instance believes it is
+    // a standalone install and independently schedules its own update. But all
+    // agents share ONE binary: ~/.local/bin/claude -> versions/<version>.
+    // N private updaters, one shared file, no lock.
+    //
+    // When two of them race, the loser leaves the install torn down: on
+    // 2026-08-04 two agents' updaters fired 250ms apart, both reported
+    // install_failed, and the symlink pointed at an already-deleted 2.1.220 for
+    // ~12 minutes. Any agent that respawned in that window exec'd a dangling
+    // symlink — node-pty hands back a pid, then the child exits 1 having
+    // written zero bytes. The daemon can't distinguish that from an agent
+    // crash, so it charged the daily crash budget and halted agents at the cap.
+    //
+    // Updates are an operator action (run when the fleet is quiet), not
+    // something nine unsupervised agents should each attempt. handleExit()'s
+    // binary-unavailable exemption is the resilience companion to this.
+    env['DISABLE_AUTOUPDATER'] = '1';
 
     // Windows: ensure UTF-8 locale so emoji and Unicode pass through the PTY
     if (platform() === 'win32') {

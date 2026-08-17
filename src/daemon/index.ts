@@ -1,4 +1,5 @@
 import { AgentManager } from './agent-manager.js';
+import { resolveInstanceId, assertSingleDaemon, recordDaemonPid } from './instance-guard.js';
 import { IPCServer } from './ipc-server.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { spawnSync } from 'child_process';
@@ -107,6 +108,27 @@ export function writeDaemonCrashedMarkers(ctxRoot: string): void {
     try {
       writeFileSync(join(stateDir, name, '.daemon-crashed'), ts, 'utf-8');
     } catch { /* swallow per-agent */ }
+  }
+}
+
+export interface BuildManifest { gitSha: string; builtAt: string; }
+
+/**
+ * Read dist/build-manifest.json (written by tsup's onSuccess hook — see
+ * tsup.config.ts). Returns null on any failure: missing file (build
+ * predates this feature, or dist/ isn't built yet), malformed JSON, or a
+ * shape that doesn't match. Never throws — this is provenance logging, not
+ * something that should be able to block daemon startup.
+ */
+export function readBuildManifest(frameworkRoot: string): BuildManifest | null {
+  try {
+    const manifestPath = join(frameworkRoot, 'dist', 'build-manifest.json');
+    if (!existsSync(manifestPath)) return null;
+    const parsed = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+    if (typeof parsed?.gitSha !== 'string' || typeof parsed?.builtAt !== 'string') return null;
+    return { gitSha: parsed.gitSha, builtAt: parsed.builtAt };
+  } catch {
+    return null;
   }
 }
 
@@ -224,7 +246,10 @@ class Daemon {
   private ctxRoot: string;
 
   constructor() {
-    this.instanceId = process.env.CTX_INSTANCE_ID || 'default';
+    // Topology guard (2026-07-13 two-daemon incident): argv + env must agree —
+    // env-only resolution let a --update-env re-bake silently point a
+    // gateway-named pm2 app at instance 'default'. Throws loudly on mismatch.
+    this.instanceId = resolveInstanceId(process.argv, process.env);
     // Always derive ctxRoot from instanceId to avoid inheriting a parent cortextOS's CTX_ROOT
     this.ctxRoot = join(homedir(), '.cortextos', this.instanceId);
   }
@@ -246,15 +271,22 @@ class Daemon {
       process.exit(1);
     }
 
-    // Write PID file
-    const pidFile = join(this.ctxRoot, 'daemon.pid');
-    ensureDir(this.ctxRoot);
-    writeFileSync(pidFile, String(process.pid), 'utf-8');
-    if (process.platform !== 'win32') {
-      try {
-        chmodSync(pidFile, 0o600);
-      } catch { /* best effort */ }
+    // Single-daemon-per-instance boot guard (2026-07-13 incident): refuse to
+    // start if daemon.pid already points at a live daemon for this instance —
+    // overwriting it below would otherwise hide the split-brain it implies.
+    assertSingleDaemon(this.ctxRoot, process.pid);
+
+    const buildManifest = readBuildManifest(frameworkRoot);
+    if (buildManifest) {
+      console.log(`[daemon] Build provenance: sha=${buildManifest.gitSha} builtAt=${buildManifest.builtAt}`);
+    } else {
+      console.log('[daemon] Build provenance: no build-manifest.json found (build predates this feature, or dist/ is unbuilt)');
     }
+
+    // Write PID file + start-time anchor (bare-int format preserved for the
+    // runbook's `cat daemon.pid` invariant; the anchor is what lets the boot
+    // guard above tell a real second daemon from a crash-orphaned recycled pid).
+    recordDaemonPid(this.ctxRoot, process.pid);
 
     // Create agent manager
     this.agentManager = new AgentManager(this.instanceId, this.ctxRoot, frameworkRoot, org);
@@ -283,8 +315,11 @@ class Daemon {
       }
       // Clean up PID file
       try {
-        const { unlinkSync } = require('fs');
-        unlinkSync(pidFile);
+        // rmSync force: pair-cleanup is unconditional — a missing pidfile must
+        // not skip the anchor removal (they travel together or not at all).
+        const { rmSync } = require('fs');
+        rmSync(join(this.ctxRoot, 'daemon.pid'), { force: true });
+        rmSync(join(this.ctxRoot, 'daemon.start-time'), { force: true });
       } catch { /* ignore */ }
       process.exit(0);
     };
@@ -340,8 +375,11 @@ class Daemon {
         this.ipcServer.stop();
       }
       try {
-        const { unlinkSync } = require('fs');
-        unlinkSync(pidFile);
+        // rmSync force: pair-cleanup is unconditional — a missing pidfile must
+        // not skip the anchor removal (they travel together or not at all).
+        const { rmSync } = require('fs');
+        rmSync(join(this.ctxRoot, 'daemon.pid'), { force: true });
+        rmSync(join(this.ctxRoot, 'daemon.start-time'), { force: true });
       } catch { /* ignore */ }
     });
   }
@@ -353,7 +391,15 @@ class Daemon {
 // with TelegramPollers, IPC server, and Claude PTY processes as a side effect.
 // See: https://github.com/grandamenium/cortextos/issues/44
 if (require.main === module) {
-  const daemon = new Daemon();
+  let daemon: Daemon;
+  try {
+    daemon = new Daemon();
+  } catch (err) {
+    // Instance-resolution mismatch (instance-guard) — the message carries the
+    // exact operator fix; a stack trace would bury it.
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
   daemon.start().catch(err => {
     console.error('[daemon] Fatal error:', err);
     process.exit(1);

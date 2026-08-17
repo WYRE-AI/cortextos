@@ -30,7 +30,7 @@ Complete the following in order. Do not skip steps.
 3. Read org knowledge base: `../../knowledge.md` (shared facts all agents need)
 4. Discover available skills: `cortextos bus list-skills --format text`
 5. Discover active agents: `cortextos bus list-agents` (live roster from enabled-agents.json)
-6. **Crons are daemon-managed.** External crons auto-load from `${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json` on daemon start; you do not need to restore them. Use `cortextos bus list-crons $CTX_AGENT_NAME` to see what's scheduled. To add or change a cron at runtime, use the `cron-management` skill (do NOT use CronCreate or `/loop` for persistent scheduling — those are session-only).
+6. **Crons are daemon-managed.** External crons auto-load from `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/crons.json` on daemon start; you do not need to restore them. Use `cortextos bus list-crons $CTX_AGENT_NAME` to see what's scheduled. To add or change a cron at runtime, use the `cron-management` skill (do NOT use CronCreate or `/loop` for persistent scheduling — those are session-only).
 7. Check today's memory file (`memory/$(date -u +%Y-%m-%d).md`) for any in-progress work
 8. If resuming a task, query the knowledge base: `cortextos bus kb-query "<task topic>" --org $CTX_ORG`
 9. Check inbox: `cortextos bus check-inbox`
@@ -50,7 +50,7 @@ Run these steps before any restart (hard or soft) and on context exhaustion.
    TODAY=$(date -u +%Y-%m-%d)
    cat >> "memory/$TODAY.md" << MEMEOF
 
-## Session End - $(date -u +%H:%M:%S UTC)
+## Session End - $(date -u '+%H:%M:%S UTC')
 - Status: [done/interrupted/context-full]
 - Current state: [where things stand — specific enough that the next session can resume cold]
 - Active threads: [anything in progress or mid-task with current state]
@@ -171,7 +171,7 @@ When you CANNOT do something yourself (needs payment, physical access, login, su
 
 ```bash
 # Create the human task with clear step-by-step instructions
-cortextos bus create-task "[HUMAN] <what needs to be done>" --desc "<instructions>" --project human-tasks
+cortextos bus create-task "[HUMAN] <what needs to be done>" --desc "<instructions>" --assignee human --project human-tasks
 
 # Block your own task pointing to it
 cortextos bus update-task <your_task_id> blocked
@@ -232,7 +232,7 @@ Each entry should answer: **"if my context was wiped right now, what would I nee
 
 **Mid-work inline notes — write immediately, don't wait for heartbeat:**
 ```bash
-echo "NOTE $(date -u +%H:%M UTC): <key decision / discovery / user preference / non-obvious thing>" >> "memory/$TODAY.md"
+echo "NOTE $(date -u '+%H:%M UTC'): <key decision / discovery / user preference / non-obvious thing>" >> "memory/$TODAY.md"
 ```
 Use this when: you make a significant decision, learn something about the user, hit a non-obvious situation, or encounter anything you would want the next session to know. One line is enough. The heartbeat is for structured summaries — inline notes capture the moment.
 
@@ -241,7 +241,7 @@ TODAY=$(date -u +%Y-%m-%d)
 mkdir -p memory
 cat >> "memory/$TODAY.md" << MEMEOF
 
-## Session Start - $(date -u +%H:%M:%S UTC)
+## Session Start - $(date -u '+%H:%M:%S UTC')
 - Status: online
 - Crons active: <list from `cortextos bus list-crons $CTX_AGENT_NAME`>
 - Inbox: <N messages or "empty">
@@ -278,25 +278,24 @@ This is the knowledge you have synthesised over time. Not a log — a living doc
 
 Also update GUARDRAILS.md when you identify a pattern of behaviour that should be explicitly prohibited or corrected — not just for yourself but as a guardrail for future sessions.
 
-Update on every heartbeat and at session end. When you update MEMORY.md, ingest it to your `memory-{agent}` KB collection so it is semantically searchable.
+Update on every heartbeat and at session end. When you update MEMORY.md, ingest it to your `agent-{agent}` KB collection so it is semantically searchable.
 
 ### Layer 3: Knowledge Base — Associative Memory (RAG/ChromaDB)
 
 The knowledge base is a semantic vector store (ChromaDB, Gemini Embedding 2). Think of it as your associative memory — not held in your head, but instantly searchable by meaning. It works like your own memory system: Gemini describes every non-text file (image, video, audio, PDF, Office doc) and embeds the description together with the content so you can find things by what they mean, not just what they literally say. Queries return the matching content plus full metadata: source path, similarity score, file type, chunk position, page number, timestamps.
 
-**Three collections — different management models:**
+**Two collections — the name is derived from `--scope`/`--agent`; there is no `--collection` flag:**
 
 | Collection | Scope | What goes in | How managed |
 |---|---|---|---|
-| `memory-{agent}` | Private | MEMORY.md + daily memory files | **Auto** — re-indexed on every heartbeat |
-| `private-{agent}` | Private | Your outputs, research docs, workspace files | **Agent-managed** — ingest when you produce something worth keeping |
-| `shared-{org}` | Org-wide | Research findings, reports, org knowledge | **Agent-managed** — ingest when the whole org benefits |
+| `agent-{agent}` | Private (`--scope private --agent <you>`) | MEMORY.md + daily memory files, plus your outputs, research docs, workspace files | **Auto for memory files** (re-indexed every heartbeat); ingest other outputs when worth keeping |
+| `shared-{org}` | Org-wide (`--scope shared`) | Research findings, reports, org knowledge | **Agent-managed** — ingest when the whole org benefits |
 
-**memory-{agent} is automatic.** On every heartbeat cycle, re-ingest your memory files so they stay current and searchable:
+**Memory re-indexing is automatic.** On every heartbeat cycle, re-ingest your memory files so they stay current and searchable:
 ```bash
 # Run on every heartbeat
 cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
-  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --collection memory-$CTX_AGENT_NAME --force
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
 ```
 
 **When to query — before starting any task:**
@@ -304,21 +303,21 @@ cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
 - When the user asks a factual question about the org, projects, or people
 - When you encounter an error — has this happened before?
 - When referencing named entities (clients, projects, systems)
-- To recall your own past work: query `memory-{agent}` or `private-{agent}` specifically
+- To recall your own past work: query with `--scope private` (hits your `agent-{agent}` collection)
 
-**When to ingest private-{agent} and shared-{org} — your judgment:**
-- After completing a task with a notable output → `private-{agent}`
+**When to ingest agent-{agent} and shared-{org} — your judgment:**
+- After completing a task with a notable output → `agent-{agent}`
 - After completing research → `shared-{org}` (the whole org benefits)
 - After producing a document, report, or significant file → appropriate scope
-- After the user shares a file with you → `private-{agent}`
+- After the user shares a file with you → `agent-{agent}`
 - After a workflow completes → ingest the artifacts
 
 ```bash
 # Query before any task (searches all your collections by default)
 cortextos bus kb-query "your question" --org $CTX_ORG --agent $CTX_AGENT_NAME
 
-# Query only your memory (past experiences, patterns)
-cortextos bus kb-query "question" --org $CTX_ORG --collection memory-$CTX_AGENT_NAME
+# Query only your private collection (past experiences, patterns, outputs)
+cortextos bus kb-query "question" --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private
 
 # Ingest output to your private collection
 cortextos bus kb-ingest /path/to/output --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private
@@ -402,7 +401,7 @@ Always include `msg_id` as reply_to — this auto-ACKs the original. Un-ACK'd me
 
 ## Crons
 
-Crons are **daemon-managed**. The cortextOS daemon reads `${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json` on start and fires each cron by injecting its prompt into your session — no manual restoration needed.
+Crons are **daemon-managed**. The cortextOS daemon reads `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/crons.json` on start and fires each cron by injecting its prompt into your session — no manual restoration needed.
 
 **View scheduled crons:**
 ```bash
@@ -423,7 +422,7 @@ For full CRUD protocol, see `.claude/skills/cron-management/SKILL.md`.
 
 ### The Model
 
-Persistent crons live in `${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json`. The daemon owns this file — it reads it on every agent start, schedules each entry, and fires them by injecting prompts directly into your PTY session. Retry logic: 1s, 4s, 16s on injection failure. Execution is logged to `${CTX_ROOT}/state/${CTX_AGENT_NAME}/cron-execution.log`.
+Persistent crons live in `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/crons.json`. The daemon owns this file — it reads it on every agent start, schedules each entry, and fires them by injecting prompts directly into your PTY session. Retry logic: 1s, 4s, 16s on injection failure. Execution is logged to `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/cron-execution.log`.
 
 Key properties:
 
@@ -445,7 +444,7 @@ For ANY work that should survive restarts — heartbeats, nightly metrics, ecosy
 
 ### Migration from config.json
 
-Automatic. On agent boot, the daemon migrates `config.json` crons to `crons.json` once. A marker file `${CTX_ROOT}/state/${CTX_AGENT_NAME}/.crons-migrated` prevents re-runs. The source `config.json` is left untouched — non-destructive.
+Automatic. On agent boot, the daemon migrates `config.json` crons to `crons.json` once. A marker file `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/.crons-migrated` prevents re-runs. The source `config.json` is left untouched — non-destructive.
 
 You do not need to do anything. If you want to verify: check that `.crons-migrated` exists and `crons.json` is populated.
 
@@ -482,10 +481,10 @@ cortextos bus list-crons $CTX_AGENT_NAME
 cortextos bus get-cron-log $CTX_AGENT_NAME
 
 # Confirm migration ran
-ls "${CTX_ROOT}/state/${CTX_AGENT_NAME}/.crons-migrated"
+ls "${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/.crons-migrated"
 
 # Inspect crons.json directly
-cat "${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json"
+cat "${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/crons.json"
 ```
 
 For full CRUD (update, pause, resume, delete), see `.claude/skills/cron-management/SKILL.md`.

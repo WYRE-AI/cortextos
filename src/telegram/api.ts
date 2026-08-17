@@ -617,7 +617,15 @@ export class TelegramAPI {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-        signal: AbortSignal.timeout(15000),
+        // Was 15000. Real-world sendMessage latency has been observed at
+        // 7-15s, right at the old ceiling. Bumped to match the 60000ms this
+        // file already uses for sendPhoto/sendDocument (line ~295/346) —
+        // no reason POST-with-JSON-body should get a tighter budget than
+        // POST-with-multipart-body. Deliberately NOT adding a retry here:
+        // sendMessage is not idempotent, and a request that times out
+        // client-side after Telegram already processed it would retry into
+        // a duplicate message — worse than the timeout it's meant to fix.
+        signal: AbortSignal.timeout(30000),
       });
       const result = await response.json() as any;
       if (!result.ok) {
@@ -632,7 +640,7 @@ export class TelegramAPI {
       // Surface as a clean retryable error so the poller loop recovers next tick
       // instead of silently hanging on a wedged TCP connection.
       if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
-        throw new Error(`Telegram API request timed out after 15s: ${method}`);
+        throw new Error(`Telegram API request timed out after 30s: ${method}`);
       }
       throw new Error(`Telegram API request failed: ${err}`);
     }

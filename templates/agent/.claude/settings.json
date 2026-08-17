@@ -43,12 +43,31 @@
         ]
       },
       {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cortextos bus hook-activity-beat",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "AskUserQuestion",
         "hooks": [
           {
             "type": "command",
             "command": "cortextos bus hook-ask-telegram",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cortextos bus hook-subagent-priming",
+            "timeout": 5
           }
         ]
       }

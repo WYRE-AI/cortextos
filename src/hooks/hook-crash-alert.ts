@@ -90,6 +90,22 @@ function isQuietHoursLA(now: Date): boolean {
 }
 
 /**
+ * Resolve who a crash alert goes to on the bus: the org's actual orchestrator
+ * (CTX_ORCHESTRATOR_AGENT, set on the PTY env from context.json — see
+ * agent-pty.ts and hook-loop-detector.ts's notifyOrchestrator, same source)
+ * plus 'analyst', deduped in case the orchestrator is already named that.
+ * Falls back to the literal 'chief' only when the env var is unset — matches
+ * this function's pre-fix hardcoded default rather than silently dropping the
+ * recipient. See task_1785632671922: the previous unconditional
+ * ['chief','analyst'] silently mis-queued in any org (e.g. wyre, orchestrator
+ * 'boss') where no agent is actually named 'chief'.
+ */
+export function resolveCrashAlertRecipients(orchestratorEnv: string | undefined): string[] {
+  const orchestrator = orchestratorEnv || 'chief';
+  return Array.from(new Set([orchestrator, 'analyst']));
+}
+
+/**
  * Send a crash notification via `cortextos bus send-message` to the listed
  * recipient agents. Best-effort: failures are swallowed so an alert miss never
  * cascades into a hook crash.
@@ -370,12 +386,20 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Real-crash agent alerts: notify chief + analyst on crash and daemon-crashed
-  // so silent failures get visibility on the bus, not just on Telegram. Gated
-  // by the same dedup window as the Telegram send (handled above), and skipped
-  // for clean exits / planned restarts / rate-limit pauses. Hoisted above the
-  // Telegram-credential gate so agents without BOT_TOKEN/CHAT_ID still reach
-  // the bus (issue #317).
+  // Real-crash agent alerts: notify the orchestrator + analyst on crash and
+  // daemon-crashed so silent failures get visibility on the bus, not just on
+  // Telegram. Gated by the same dedup window as the Telegram send (handled
+  // above), and skipped for clean exits / planned restarts / rate-limit
+  // pauses. Hoisted above the Telegram-credential gate so agents without
+  // BOT_TOKEN/CHAT_ID still reach the bus (issue #317).
+  //
+  // task_1785632671922: recipients previously hardcoded ['chief', 'analyst']
+  // — 'chief' is not a real agent in every org (e.g. wyre's orchestrator is
+  // named 'boss'), so `cortextos bus send-message chief ...` silently
+  // mis-queued into a nonexistent agent's inbox (fire-and-forget execFile
+  // swallows the CLI's own "agent not found" warning) and the orchestrator
+  // never actually got crash alerts in that org. See
+  // resolveCrashAlertRecipients for the fix.
   if (endType === 'crash' || endType === 'daemon-crashed') {
     notifyAgents({
       agentName,
@@ -383,7 +407,7 @@ async function main(): Promise<void> {
       reason,
       lastTask,
       crashCount,
-      recipients: ['chief', 'analyst'],
+      recipients: resolveCrashAlertRecipients(process.env.CTX_ORCHESTRATOR_AGENT),
     });
   }
 

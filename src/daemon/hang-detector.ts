@@ -22,6 +22,45 @@
 // baseline). last_idle.flag closes this: it can't lie about real turn-processing the
 // way an unfired heartbeat-cron can look like silence.
 //
+// TRIPLE-SOURCE (class-3 fix): last_idle.flag itself only writes on turn COMPLETION
+// (the Stop hook). A single work turn longer than the grace window — a build, a full
+// test suite, a long research pass — that spans a delivered cron fire is beatless on
+// BOTH prior sources for the turn's entire duration, even though the session is
+// actively working throughout. last_activity.flag (the PreToolUse hook, written on
+// EVERY tool call, mid-turn) closes this: it's proof of liveness that doesn't wait
+// for the turn to end.
+//
+// CONFIRMED INTERACTION — loop-detector can keep an agent reading "not hung" while it
+// is genuinely stuck spinning (PR #55 review, 2026-08-01). hook-loop-detector.ts (a
+// SEPARATE PreToolUse hook, registered as its own array entry alongside this one) can
+// actively BLOCK a repeated-tool-call loop. Per Claude Code's documented hook-execution
+// model, PreToolUse hooks in different array entries run in PARALLEL with NO
+// short-circuit on block (verified against the official hooks reference, not
+// inferred) — so hook-activity-beat's subprocess still runs and still writes
+// last_activity.flag on EVERY tool-call ATTEMPT, including ones loop-detector denies.
+// The masking is therefore CONTINUOUS for as long as the agent keeps attempting calls,
+// not just on loop-detector's periodic 30-min emergency-escape allowance.
+//
+// This is INTENTIONAL, not a bug to fix here: a tool-call loop is a different failure
+// class than a hang — the agent is alive and actively trying things, just unproductively
+// — and that class belongs to loop-detector (alert + block), not this module (blind
+// restart). A --continue restart of a loop-stuck agent would just resume it back into
+// the same loop, since the loop lives in the conversation/tool-call pattern, not in a
+// frozen process. So last_activity.flag correctly staying fresh here, and hang-detector
+// correctly NOT firing, is the right behavior IF AND ONLY IF loop-detector's own
+// block/escape signal reliably reaches a human for diagnosis+intervention — see the
+// loop-detector-alert-routing follow-up this pin depends on. Two ways to close the gap
+// if that routing ever proves unreliable: (a) make the alert-routing itself reliable
+// (preferred — it's the more precise signal, purpose-built for this exact failure), or
+// (b) bound activity-beat's masking here in hang-detector.ts: don't let it suppress a
+// hang indefinitely when BOTH last_idle_flag AND last_session_heartbeat are stale
+// beyond a larger secondary threshold (that combination — lots of tool activity, zero
+// turn completions, zero heartbeats — IS the loop signature; a legitimately long-but-
+// healthy turn still completes or heartbeats eventually, so it stays protected either
+// way). Pick one path before this fix is allowed to activate (i.e. before it ships in a
+// coordinated restart) — see docs/runbook/daemon-restart-2026-08.md's pre-restart
+// checklist.
+//
 // GOVERNING PRINCIPLE — FAIL SAFE TOWARD NOT-RESTARTING: a missed hang is cheap (the
 // next delivered fire re-catches it); a false restart disrupts a healthy agent and, at
 // fleet scale, is itself a mini-storm. So on ANY uncertainty — absent last_session
@@ -55,15 +94,26 @@ export interface HangEvalInput {
    * behavior for any caller that hasn't wired the new read yet.
    */
   lastIdleFlagAt?: number | null;
+  /**
+   * Class-3 fix: mtime-equivalent of `state/<agent>/last_activity.flag` (ms), or
+   * null/absent if never written. Written by the PreToolUse hook on EVERY tool
+   * call — unlike `lastIdleFlagAt`, which only advances when a turn COMPLETES.
+   * Without this, a single long work turn (build, full test suite, long research
+   * pass) spanning a delivered fire reads as beatless for the turn's whole
+   * duration. Optional (omit entirely) to preserve pre-fix behavior for any
+   * caller that hasn't wired the new read yet.
+   */
+  lastActivityBeatAt?: number | null;
 }
 
-/** The more recent of two beat timestamps, ignoring nulls/undefined; null if both absent. */
-function maxBeat(a: number | null | undefined, b: number | null | undefined): number | null {
-  const av = a ?? null;
-  const bv = b ?? null;
-  if (av === null) return bv;
-  if (bv === null) return av;
-  return Math.max(av, bv);
+/** The most recent of N beat timestamps, ignoring nulls/undefined; null if all absent. */
+function maxBeat(...beats: Array<number | null | undefined>): number | null {
+  let max: number | null = null;
+  for (const b of beats) {
+    if (b === null || b === undefined) continue;
+    if (max === null || b > max) max = b;
+  }
+  return max;
 }
 
 export interface HangEvalResult {
@@ -81,6 +131,8 @@ export interface BootstrapHangEvalInput {
   lastSessionHeartbeat: number | null;
   /** Same dual-source fix as HangEvalInput — see its doc comment. */
   lastIdleFlagAt?: number | null;
+  /** Same class-3 fix as HangEvalInput — see its doc comment. */
+  lastActivityBeatAt?: number | null;
 }
 
 /** Parse an ISO timestamp to epoch ms; null on absent/invalid (fail-safe). */
@@ -105,6 +157,45 @@ export function mostRecentDeliveredFireMs(crons: Cronish[]): number | null {
 }
 
 /**
+ * Most-recent fire the agent has ALREADY HAD `graceMs` to answer.
+ *
+ * Why this exists rather than {@link mostRecentDeliveredFireMs}: the field is
+ * `last_fire_attempted_at` — ATTEMPTED, not consumed — so it keeps advancing
+ * whether or not the agent is alive to receive the fire. Anchoring on the
+ * newest attempt means that for any agent whose tightest cron interval is
+ * <= graceMs, `now - T` is ALWAYS within grace, so evaluateHang returns
+ * "within grace" on every poll and never reaches the beat comparison. The
+ * anchor refreshes itself faster than the grace window can expire, and the
+ * agent becomes undetectable for as long as its crons keep firing.
+ *
+ * The perverse consequence: monitoring an agent MORE closely made it LESS
+ * detectable. On 2026-08-15 the fleet's tightest-cadence agent (15m) went
+ * unflagged for 11 hours, and escaped only when a fire happened to land late.
+ *
+ * Selecting the newest fire that is already older than grace makes detection
+ * latency bounded by roughly (cron interval + graceMs) regardless of cadence,
+ * and leaves infrequent-cron agents behaving exactly as before — for a 4h
+ * cron, the newest fire is virtually always older than grace already.
+ *
+ * Returns null when no fire has ripened yet; evaluateHang treats null as
+ * fail-safe (not hung).
+ */
+export function mostRecentAnswerableFireMs(
+  crons: Cronish[],
+  now: number,
+  graceMs: number,
+): number | null {
+  let max: number | null = null;
+  for (const c of crons) {
+    const t = toMs(c.last_fire_attempted_at);
+    if (t === null) continue;
+    if (now - t <= graceMs) continue; // too fresh to have been answered yet
+    if (max === null || t > max) max = t;
+  }
+  return max;
+}
+
+/**
  * The trigger condition. HUNG iff (positive assertion on every input):
  *   1. a delivered fire T is recorded, AND
  *   2. now - T > grace N, AND
@@ -116,8 +207,8 @@ export function mostRecentDeliveredFireMs(crons: Cronish[]): number | null {
  * we key on delivered-fire-without-beat, not on last-seen age.
  */
 export function evaluateHang(input: HangEvalInput): HangEvalResult {
-  const { now, graceMs, deliveredFireAt: T, lastSessionHeartbeat, lastIdleFlagAt } = input;
-  const S = maxBeat(lastSessionHeartbeat, lastIdleFlagAt);
+  const { now, graceMs, deliveredFireAt: T, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt } = input;
+  const S = maxBeat(lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt);
 
   if (T === null) return { hung: false, reason: 'no delivered fire recorded — fail-safe' };
   if (now - T <= graceMs) {
@@ -156,8 +247,8 @@ export function evaluateHang(input: HangEvalInput): HangEvalResult {
  * governing principle as evaluateHang).
  */
 export function evaluateBootstrapHang(input: BootstrapHangEvalInput): HangEvalResult {
-  const { now, graceMs, restartAt: R, lastSessionHeartbeat, lastIdleFlagAt } = input;
-  const S = maxBeat(lastSessionHeartbeat, lastIdleFlagAt);
+  const { now, graceMs, restartAt: R, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt } = input;
+  const S = maxBeat(lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt);
 
   if (R === null) return { hung: false, reason: 'no restart-time recorded — fail-safe' };
   if (now - R <= graceMs) {
@@ -189,8 +280,9 @@ export function hasBeatSinceRestart(
   restartAt: number | null,
   lastSessionHeartbeat: number | null,
   lastIdleFlagAt?: number | null,
+  lastActivityBeatAt?: number | null,
 ): boolean {
   if (restartAt === null) return false;
-  const s = maxBeat(lastSessionHeartbeat, lastIdleFlagAt);
+  const s = maxBeat(lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt);
   return s !== null && s >= restartAt;
 }

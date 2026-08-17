@@ -98,6 +98,38 @@ export interface Event {
 
 // Heartbeat Types
 
+/**
+ * Which enumeration produced a heartbeat row.
+ *
+ * The roster and the `state/` directory answer DIFFERENT questions — "which agents
+ * exist" versus "which agents have ever written a heartbeat" — and reading only one
+ * of them collapses three distinct conditions into two. `state-only` is a dir with no
+ * roster entry (a phantom, reported as a live agent by a state-only scan);
+ * `roster-only` is an agent that has never beaten (absent entirely from such a scan,
+ * and an absence reads as "no such agent" rather than as a gap).
+ */
+export type HeartbeatSource = 'roster+state' | 'roster-only' | 'state-only';
+
+/** An agent as seen by BOTH enumerations, carrying which one(s) found it. */
+export interface HeartbeatRow {
+  /** Authoritative name: the roster key, or the state DIRECTORY name for orphans. */
+  agent: string;
+  org: string | null;
+  source: HeartbeatSource;
+  /** From the roster. `null` means "not in the roster", NOT "disabled". */
+  enabled: boolean | null;
+  /** `null` when the agent has never beaten, or its file could not be parsed. */
+  heartbeat: Heartbeat | null;
+  /** A heartbeat.json exists but does not parse — reported, never silently skipped. */
+  unreadable?: boolean;
+  /**
+   * The `agent` field inside the file, when it disagrees with the directory name.
+   * The directory is the enumeration axis and the field is what gets displayed, so an
+   * undetected disagreement renders as a plausible agent instead of as corruption.
+   */
+  nameMismatch?: string;
+}
+
 export interface Heartbeat {
   agent: string;
   org: string;
@@ -272,26 +304,30 @@ export interface CronEntry {
 //   "description": "Periodic health check and status update."
 // }
 //
-// Daily morning briefing — fixed local time via cron expression:
+// Daily morning briefing — fixed ET time via cron expression + explicit
+// timezone (DST-native: stays 09:00 ET across both EST and EDT; do NOT
+// hand-compute a UTC offset into `schedule` instead of setting `timezone`):
 // {
 //   "name": "morning-briefing",
-//   "schedule": "0 13 * * *",
+//   "schedule": "0 9 * * *",
+//   "timezone": "America/New_York",
 //   "prompt": "Prepare and send the morning briefing to James.",
 //   "enabled": true,
 //   "created_at": "2026-04-01T00:00:00.000Z",
-//   "description": "Daily 09:00 ET briefing (UTC offset applied in schedule).",
+//   "description": "Daily 09:00 ET briefing.",
 //   "last_fired_at": "2026-04-28T13:00:01.042Z",
 //   "fire_count": 14
 // }
 //
-// Weekly report — cron expression with day-of-week restriction:
+// Weekly report — cron expression with day-of-week restriction, UTC (no
+// `timezone` field — defaults to UTC):
 // {
 //   "name": "weekly-report",
 //   "schedule": "0 16 * * 1",
 //   "prompt": "Compile and send the weekly performance report.",
 //   "enabled": true,
 //   "created_at": "2026-04-01T00:00:00.000Z",
-//   "description": "Every Monday at 12:00 ET (16:00 UTC).",
+//   "description": "Every Monday at 16:00 UTC.",
 //   "fire_count": 3
 // }
 
@@ -340,13 +376,35 @@ export interface CronDefinition {
    *     The cron fires every N units after its previous fire (or after daemon start
    *     if it has never fired).
    *   - 5-field cron expression: `"0 8 * * *"`, `"0 0,6,12,18 * * *"`, `"0 16 * * 1"`
-   *     Evaluated against the daemon's wall clock (daemon timezone = server timezone).
+   *     Evaluated in the timezone given by the `timezone` field (default `"UTC"` —
+   *     NOT the daemon process's ambient/local timezone; see `timezone` below).
    *
    * @example "6h"         — every six hours
-   * @example "0 13 * * *" — daily at 13:00 UTC
-   * @example "0 16 * * 1" — every Monday at 16:00 UTC
+   * @example "0 13 * * *" — daily at 13:00 in this cron's `timezone` (UTC by default)
+   * @example "0 16 * * 1" — every Monday at 16:00 in this cron's `timezone`
    */
   schedule: string;
+
+  /**
+   * IANA timezone this cron's `schedule` (when a 5-field cron expression) is
+   * evaluated in, e.g. `"America/New_York"`, `"Asia/Tokyo"`. Has no effect on
+   * interval-shorthand schedules (`"6h"` etc — those are pure elapsed-time
+   * arithmetic, timezone-independent).
+   *
+   * Defaults to `"UTC"` when absent — a cron with no explicit `timezone`
+   * fires at its literal stated UTC time, regardless of what timezone the
+   * daemon's host machine happens to be in. Set this explicitly for a
+   * human-facing schedule that should track a specific timezone's local
+   * wall-clock across DST transitions (e.g. an 08:00 Eastern morning
+   * briefing that should stay 08:00 ET through both EST and EDT).
+   *
+   * An invalid IANA string makes the cron fail to schedule (`nextFireFromCron`
+   * returns NaN) rather than silently falling back to another timezone.
+   *
+   * @default "UTC"
+   * @example "America/New_York"
+   */
+  timezone?: string;
 
   /**
    * Whether the daemon should fire this cron.
@@ -788,7 +846,7 @@ export interface IPCResponse {
    * "agent does not exist" (NOT_FOUND) from "request collapsed against an
    * in-flight identical op" (DEDUPED). See issue #346.
    */
-  code?: 'NOT_FOUND' | 'DEDUPED' | 'INVALID_INPUT' | 'NOT_RUNNING';
+  code?: 'NOT_FOUND' | 'DEDUPED' | 'INVALID_INPUT' | 'NOT_RUNNING' | 'RESTARTING';
 }
 
 // Agent Discovery Types

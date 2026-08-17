@@ -100,7 +100,32 @@ export function sendMessage(
 const lockWarnLastAt = new Map<string, number>();
 const LOCK_WARN_INTERVAL_MS = 60_000;
 
-export function checkInbox(paths: BusPaths): InboxMessage[] {
+/**
+ * Result of {@link checkInboxWithStatus}.
+ *
+ * `skipped` separates two cases that a bare `[]` merges:
+ *
+ *   - `skipped: false` — the inbox was read. An empty `messages` means there
+ *     is genuinely nothing pending.
+ *
+ *   - `skipped: true` — the lock could not be acquired, so the inbox was never
+ *     opened. `messages: []` is the absence of a look, not an absence of mail.
+ *
+ * The distinction is easy to under-rate because delivery self-heals: the next
+ * poll retries and stale inflight recovers after 5 minutes, so a skipped poll
+ * costs only latency. It matters anyway because `bus check-inbox` prints this
+ * to stdout, and an agent reading `[]` writes "inbox empty, nothing owed to
+ * anyone" into its own session state — a durable claim derived from a value
+ * that cannot support it. The warning at the skip site is rate-limited to once
+ * per inbox per minute, so under a 1s poll 59 of every 60 skips are silent in
+ * BOTH channels.
+ */
+export interface InboxCheck {
+  messages: InboxMessage[];
+  skipped: boolean;
+}
+
+export function checkInboxWithStatus(paths: BusPaths): InboxCheck {
   const { inbox, inflight } = paths;
   ensureDir(inbox);
   ensureDir(inflight);
@@ -113,7 +138,7 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
       lockWarnLastAt.set(inbox, now);
       console.warn(`[bus/message] WARNING: could not acquire inbox lock at ${inbox} — delivery skipped this poll (stale .lock.d?)`);
     }
-    return [];
+    return { messages: [], skipped: true };
   }
   lockWarnLastAt.delete(inbox);
 
@@ -127,7 +152,7 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
       .sort();
 
     if (files.length === 0) {
-      return [];
+      return { messages: [], skipped: false }; // looked, genuinely nothing there
     }
 
     // Security (H10): Load signing key for HMAC verification.
@@ -171,10 +196,28 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
       }
     }
 
-    return messages;
+    // NOTE: `messages` can still be empty here if every file was quarantined
+    // to .errors/ (HMAC failure or corrupt JSON). That is a THIRD empty case —
+    // "looked, found mail, rejected all of it" — but unlike a skipped poll it
+    // is already loud: each rejection logs at error/warn level unconditionally,
+    // with no rate limit. Left out of `skipped` deliberately so the flag keeps
+    // one meaning: the inbox was never opened.
+    return { messages, skipped: false };
   } finally {
     releaseLock(inbox);
   }
+}
+
+/**
+ * Back-compat wrapper over {@link checkInboxWithStatus}.
+ *
+ * @returns only the message array, DISCARDING whether the inbox was actually
+ *          read. `[]` means "nothing pending" OR "could not look". Use
+ *          {@link checkInboxWithStatus} anywhere that emptiness is reported to
+ *          a human, recorded as state, or read as "nothing owed".
+ */
+export function checkInbox(paths: BusPaths): InboxMessage[] {
+  return checkInboxWithStatus(paths).messages;
 }
 
 /**

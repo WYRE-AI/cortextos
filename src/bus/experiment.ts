@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, existsSync, appendFileSync, unlinkSync } fro
 import { join } from 'path';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomString } from '../utils/random.js';
+import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
 
 // --- Types ---
 
@@ -15,8 +16,13 @@ export interface Experiment {
   window: string;
   measurement: string;
   status: 'proposed' | 'running' | 'completed';
-  baseline_value: number;
+  baseline_value: number | null;
   result_value: number | null;
+  /** Independent qualitative-score field (--score). Distinct from result_value,
+   * which always records the raw measuredValue actually passed to
+   * evaluateExperiment — see that function's docstring for why they must not
+   * be conflated. null when no score was given. */
+  score: number | null;
   decision: 'keep' | 'discard' | null;
   learning: string;
   experiment_commit: string | null;
@@ -35,6 +41,7 @@ export interface ExperimentCreateOptions {
   measurement?: string;
   approval_required?: boolean;
   kind?: 'intervention' | 'snapshot';
+  baseline?: number;
 }
 
 export interface ExperimentEvaluateOptions {
@@ -140,6 +147,27 @@ function saveConfig(agentDir: string, config: ExperimentConfig): void {
 // --- Public API ---
 
 /**
+ * Guard for the create-experiment CLI boundary: refuses a missing --baseline
+ * up front instead of letting the caller find out from evaluate-experiment's
+ * refusal after the measurement window has already run and been wasted
+ * (evaluateExperiment's own null-baseline guard is the last line of defense,
+ * not the first). `raw` is the CLI flag's raw string value (undefined when
+ * the flag was omitted) — pass `'0'` explicitly for a genuine from-zero
+ * baseline, since that's a real value, not an omission.
+ */
+export function validateExperimentBaseline(raw: string | undefined): void {
+  if (raw === undefined) {
+    throw new Error(
+      'create-experiment refused: no --baseline given.\n' +
+      'evaluate-experiment will refuse to score this experiment later (comparing against an\n' +
+      'implicit 0 baseline structurally forces every direction=higher result to KEEP) — but\n' +
+      'that refusal only fires after the measurement window has already run, wasting it.\n' +
+      'Pass --baseline <n>, or --baseline 0 if genuinely starting from zero.',
+    );
+  }
+}
+
+/**
  * Create a new experiment proposal.
  *
  * Fields with no explicit option fall back to the matching cycle in
@@ -173,8 +201,9 @@ export function createExperiment(
     window: options?.window ?? cycleDefaults.window ?? '24h',
     measurement: options?.measurement ?? cycleDefaults.measurement ?? '',
     status: 'proposed',
-    baseline_value: 0,
+    baseline_value: options?.baseline ?? null,
     result_value: null,
+    score: null,
     decision: null,
     learning: '',
     experiment_commit: null,
@@ -265,32 +294,40 @@ export function evaluateExperiment(
     throw new Error(`Experiment ${experimentId} is '${experiment.status}', expected 'running'`);
   }
 
-  // Compare measured vs baseline using direction
+  if (experiment.baseline_value === null) {
+    throw new Error(
+      `Experiment ${experimentId} has no baseline_value — it was created without --baseline. ` +
+      `Refusing to evaluate: comparing against an implicit 0 baseline structurally forces ` +
+      `every 'direction=higher' result to KEEP, which is a measurement-integrity bug, not a ` +
+      `valid measurement. Re-create the experiment with --baseline <n>.`,
+    );
+  }
+  const baseline = experiment.baseline_value;
+
+  // The value the keep/discard decision (and, on keep, the next baseline) is
+  // computed against. For qualitative metrics the agent passes 0 as a
+  // placeholder measuredValue and --score 7 as the real one, so score — when
+  // given — IS the effective value, not measuredValue. This does NOT touch
+  // result_value below: result_value always records measuredValue exactly as
+  // passed, and score (when given) is stored in its own field. Conflating the
+  // two used to overwrite result_value with the score, destroying the record
+  // of what was actually passed as measuredValue (e.g. the placeholder 0) and
+  // leaving no way to tell, from stored history, whether a given number was a
+  // real measurement or a qualitative score.
+  const effectiveValue = options?.score !== undefined ? options.score : measuredValue;
+
   let decision: 'keep' | 'discard';
   if (experiment.direction === 'higher') {
-    decision = measuredValue > experiment.baseline_value ? 'keep' : 'discard';
+    decision = effectiveValue > baseline ? 'keep' : 'discard';
   } else {
-    decision = measuredValue < experiment.baseline_value ? 'keep' : 'discard';
+    decision = effectiveValue < baseline ? 'keep' : 'discard';
   }
 
   experiment.status = 'completed';
   experiment.completed_at = nowISO();
   experiment.result_value = measuredValue;
+  experiment.score = options?.score ?? null;
   experiment.decision = decision;
-
-  // For qualitative metrics: if score is provided, use it as the measured value
-  // (agent passes 0 as placeholder measuredValue and --score 7 as the actual value)
-  if (options?.score !== undefined) {
-    measuredValue = options.score;
-    // Re-evaluate decision with the correct measured value
-    if (experiment.direction === 'higher') {
-      decision = measuredValue > experiment.baseline_value ? 'keep' : 'discard';
-    } else {
-      decision = measuredValue < experiment.baseline_value ? 'keep' : 'discard';
-    }
-    experiment.result_value = measuredValue;
-    experiment.decision = decision;
-  }
 
   // Build learning from options
   const learningParts: string[] = [];
@@ -300,33 +337,48 @@ export function evaluateExperiment(
     experiment.learning = learningParts.join(' — ');
   }
 
-  // If keep, baseline becomes the measured value
+  // If keep, baseline becomes the effective (decision-driving) value — for a
+  // qualitative metric that's the score, so the NEXT evaluation on this
+  // metric (which will also pass a placeholder measuredValue + a real
+  // --score) compares score against score, not score against a stale
+  // placeholder.
   if (decision === 'keep') {
-    experiment.baseline_value = measuredValue;
+    experiment.baseline_value = effectiveValue;
   }
 
   saveExperiment(agentDir, experiment);
 
-  // Append to results.tsv
+  // Append to results.tsv. measured_value always mirrors result_value (raw,
+  // never the score) — score gets its own column — so the tsv can't drift
+  // from the JSON source of truth the way it used to when both were derived
+  // from the same silently-reassigned local.
   const expDir = join(agentDir, 'experiments');
   ensureDir(expDir);
   const tsvPath = join(expDir, 'results.tsv');
   if (!existsSync(tsvPath)) {
     appendFileSync(
       tsvPath,
-      'experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\n',
+      'experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\tscore\n',
       'utf-8',
     );
   }
+  // score is APPENDED last, not inserted mid-row: the header is only ever
+  // written for a brand-new file (guarded above), so a pre-existing
+  // results.tsv keeps its original 8-column header forever. A mid-row
+  // insert would silently shift baseline/decision/hypothesis/timestamp one
+  // position out of alignment with that old header on every future row —
+  // a trailing column is backward-compatible for any positional reader,
+  // an inserted one is not (walter, cortextos#90 review).
   const tsvLine = [
     experiment.id,
     experiment.agent,
     experiment.metric,
     String(measuredValue),
-    String(decision === 'keep' ? measuredValue : experiment.baseline_value),
+    String(decision === 'keep' ? effectiveValue : baseline),
     decision,
     experiment.hypothesis,
     experiment.completed_at,
+    experiment.score === null ? '' : String(experiment.score),
   ].join('\t');
   appendFileSync(tsvPath, tsvLine + '\n', 'utf-8');
 
@@ -335,11 +387,15 @@ export function evaluateExperiment(
   if (!existsSync(learningsPath)) {
     appendFileSync(learningsPath, '# Experiment Learnings\n\n', 'utf-8');
   }
+  const resultLine =
+    experiment.score !== null
+      ? `- **Result:** score ${experiment.score} (measured_value: ${measuredValue}, baseline: ${decision === 'keep' ? effectiveValue : baseline})`
+      : `- **Result:** ${measuredValue} (baseline: ${decision === 'keep' ? effectiveValue : baseline})`;
   const learningEntry = [
     `## ${experiment.id} (${decision})`,
     `- **Metric:** ${experiment.metric}`,
     `- **Hypothesis:** ${experiment.hypothesis}`,
-    `- **Result:** ${measuredValue} (baseline: ${decision === 'keep' ? measuredValue : experiment.baseline_value})`,
+    resultLine,
     experiment.learning ? `- **Learning:** ${experiment.learning}` : '',
     '',
   ]
@@ -398,6 +454,28 @@ export function listExperiments(
   // Sort by created_at desc
   experiments.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
+  return experiments;
+}
+
+/**
+ * List experiments across every agent in the system, not just one directory.
+ *
+ * task_1785723303692: `bus list-experiments` with no --agent used to silently
+ * fall back to the caller's own agentDir — a "list every experiment" scan
+ * quietly returning a subset with no error. Uses the same canonical fleet
+ * enumerator as list-agents/checkGoalStaleness so the definition of "every
+ * agent" can't drift between callers.
+ */
+export function listAllExperiments(
+  frameworkRoot: string,
+  ctxRoot: string,
+  filters?: Pick<ExperimentFilters, 'status' | 'metric'>,
+): Experiment[] {
+  const agents = discoverAllAgents(frameworkRoot, ctxRoot);
+  const experiments = agents.flatMap(a =>
+    listExperiments(resolveAgentDir(frameworkRoot, a.org, a.name), filters),
+  );
+  experiments.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
   return experiments;
 }
 

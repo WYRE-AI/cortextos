@@ -387,7 +387,7 @@ cortextos enable "$AGENT" --org "$ORG" --restart
 ### Agent Not Responding to Telegram
 1. Check .env exists and has BOT_TOKEN + CHAT_ID + ALLOWED_USER
 2. Check fast-checker is running: `ps aux | grep fast-checker | grep $AGENT`
-3. Check fast-checker log: `tail -10 $HOME/.cortextos/default/logs/$AGENT/fast-checker.log`
+3. Check the daemon log (the fast-checker runs inside the daemon and has no log file of its own): `tail -30 ~/.pm2/logs/cortextos-daemon-out.log`
 4. Check agent status: `cortextos status`
 
 ### Messages Going to Wrong Person
@@ -398,7 +398,7 @@ cortextos enable "$AGENT" --org "$ORG" --restart
 
 ### Agent Keeps Crashing
 1. Check crash count: `cat $HOME/.cortextos/default/state/$AGENT/.crash_count_today`
-2. Check stderr: `tail -20 $HOME/.cortextos/default/logs/$AGENT/stderr.log`
+2. Check output (agents run under a PTY, so stderr is merged into stdout — there is no `stderr.log`): `tail -20 $HOME/.cortextos/default/logs/$AGENT/stdout.log`
 3. Common causes: rate limit, auth expired, context exhaustion
 4. Fix: reset crash count, fix root cause, `cortextos enable <agent> --restart`
 

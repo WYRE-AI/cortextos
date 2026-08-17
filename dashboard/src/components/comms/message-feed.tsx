@@ -4,6 +4,8 @@ import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
 import { TimeAgo } from '@/components/shared';
 import { IconArrowRight } from '@tabler/icons-react';
+import { usePagination } from '@/hooks/use-pagination';
+import { PaginationControls } from '@/components/ui/pagination-controls';
 
 interface BusMessage {
   id: string;
@@ -22,6 +24,9 @@ interface MessageFeedProps {
 }
 
 export function MessageFeed({ messages, onAgentClick, onMessageClick }: MessageFeedProps) {
+  // Hook must run before any early return.
+  const p = usePagination(messages, 25);
+
   if (messages.length === 0) {
     return (
       <p className="py-12 text-center text-sm text-muted-foreground">
@@ -32,7 +37,7 @@ export function MessageFeed({ messages, onAgentClick, onMessageClick }: MessageF
 
   return (
     <div className="space-y-2">
-      {messages.map((msg) => (
+      {p.pageItems.map((msg) => (
         <Card
           key={msg.id}
           className="cursor-pointer p-4 transition-colors hover:bg-muted/50"
@@ -55,6 +60,18 @@ export function MessageFeed({ messages, onAgentClick, onMessageClick }: MessageF
           <p className="text-sm text-muted-foreground whitespace-pre-wrap break-words line-clamp-3">{msg.text}</p>
         </Card>
       ))}
+      <PaginationControls
+        page={p.page}
+        pageCount={p.pageCount}
+        rangeStart={p.rangeStart}
+        rangeEnd={p.rangeEnd}
+        total={p.total}
+        canPrev={p.canPrev}
+        canNext={p.canNext}
+        onPrev={p.prev}
+        onNext={p.next}
+        label="messages"
+      />
     </div>
   );
 }

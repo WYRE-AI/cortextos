@@ -26,6 +26,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { createHash } from 'crypto';
+import { execFile } from 'child_process';
 import { readStdin, parseHookInput } from './index.js';
 
 export const HISTORY_SIZE = 30;
@@ -160,6 +161,52 @@ function blockCall(reason: string): void {
   process.exit(0);
 }
 
+/**
+ * Alert the org's orchestrator agent directly via `cortextos bus send-message`,
+ * fire-and-forget — mirrors hook-crash-alert.ts's notifyAgents() pattern (same
+ * PATH-hardened execFile approach: PM2's spawned daemon doesn't inherit the
+ * npm-link target, so a bare 'cortextos' can ENOENT — see that function's
+ * comment). Best-effort: any failure is swallowed so a notify miss never
+ * crashes the hook.
+ *
+ * Reads CTX_ORCHESTRATOR_AGENT (set on the PTY env from the org's
+ * context.json — see agent-pty.ts) rather than a hardcoded recipient name,
+ * so this works across orgs with differently-named orchestrators. No-ops if
+ * unset (context.json missing/malformed) or if the orchestrator IS this
+ * agent (an orchestrator alerting itself is a no-op, not a bug).
+ *
+ * This closes task_1785591582468's HARD PRE-ACTIVATION GATE for PR #55: the
+ * emergency-escape alert previously only reached stderr (visible to no one
+ * unless the stuck agent itself happened to notice and self-report). Wiring
+ * it to the orchestrator's bus inbox means a human gets paged even when the
+ * looping agent can't help itself. See hang-detector.ts's file-header
+ * comment for the full masking analysis this closes path (a) of.
+ */
+export function notifyOrchestrator(agentName: string, message: string): void {
+  const orchestrator = process.env.CTX_ORCHESTRATOR_AGENT;
+  if (!orchestrator || orchestrator === agentName) return;
+  const body = `[loop-detector] ${agentName} is stuck in a blocked tool-call loop — ${message}`;
+  const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+  const cliPath = frameworkRoot ? join(frameworkRoot, 'dist', 'cli.js') : null;
+  try {
+    if (cliPath) {
+      execFile(
+        process.execPath,
+        [cliPath, 'bus', 'send-message', orchestrator, 'high', body],
+        { timeout: 10_000 },
+        () => { /* fire-and-forget */ },
+      );
+    } else {
+      execFile(
+        'cortextos',
+        ['bus', 'send-message', orchestrator, 'high', body],
+        { timeout: 10_000 },
+        () => { /* fire-and-forget */ },
+      );
+    }
+  } catch { /* best-effort, never throw */ }
+}
+
 export type HookAction = 'allow' | 'block' | 'escape';
 
 export interface HookDecision {
@@ -265,6 +312,7 @@ async function main(): Promise<void> {
 
   if (decision.action === 'escape' && decision.alertMessage) {
     process.stderr.write(decision.alertMessage + '\n');
+    notifyOrchestrator(agentName, decision.alertMessage);
   }
 
   process.exit(0);

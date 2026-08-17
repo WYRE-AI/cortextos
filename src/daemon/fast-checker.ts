@@ -4,9 +4,19 @@ import { join } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import { readCrons } from '../bus/crons.js';
-import { evaluateHang, evaluateBootstrapHang, mostRecentDeliveredFireMs, hasBeatSinceRestart } from './hang-detector.js';
-import { detectRateLimitInLog } from '../pty/rate-limit-detector.js';
-import { rotateOAuth } from '../bus/oauth.js';
+import { evaluateHang, evaluateBootstrapHang, mostRecentAnswerableFireMs, hasBeatSinceRestart } from './hang-detector.js';
+
+/**
+ * Grace window for the hang sensors.
+ *
+ * Single source of truth on purpose: it feeds BOTH the fire anchor
+ * (mostRecentAnswerableFireMs) and evaluateHang. If those two ever used
+ * different values the anchor could hand back a fire that evaluateHang then
+ * rejects as within grace, silently restoring the blind spot this constant
+ * was extracted to close.
+ */
+const HANG_GRACE_MS = 15 * 60_000;
+import { isLimitBlocked } from './rotation-manager.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
@@ -20,11 +30,14 @@ type LogFn = (msg: string) => void;
 
 /**
  * Post-boot grace window (ms) during which soft context-handoff actions are
- * suppressed. Runtime-aware: codex-app-server and opencode briefly report
- * inflated prior prompt-cache context tokens, and that spurious spike can land
- * ~6-8min after a fresh boot (observed double-handoffs ~6-8min apart on a codex
- * agent), OUTSIDE a short grace. Those runtimes get a 10min window; all others
- * keep the original 2min.
+ * suppressed. Runtime-aware: codex-app-server (and opencode, upstream-only
+ * runtime kept here for parity) briefly report inflated prior prompt-cache
+ * context tokens, and that spurious spike can land ~6-8min after a fresh boot
+ * (observed double-handoffs ~6-8min apart on a codex agent), OUTSIDE a short
+ * grace. Those runtimes get a 10min window; all others keep 2min.
+ * Ported from upstream (grandamenium/cortextos) — additive only, does not
+ * touch the consecutive-restart circuit breaker below (see that field's
+ * comment for why it must stay consecutive, not windowed).
  */
 export function handoffGraceMs(runtime: string | undefined): number {
   if (runtime === 'codex-app-server' || runtime === 'opencode') return 600_000;
@@ -79,7 +92,9 @@ export class FastChecker {
   private ctxHandoffFiredAt: number = 0;    // fires once per session (0 = not yet)
   private ctxHandoffDeadlineAt: number = 0; // timestamp after which force-restart fires
   private ctxLastSessionId: string | null = null; // detects new session → clears stale deadline
-  private ctxSessionStartedAt: number = 0; // when current session_id was first observed — handoff grace window anchor
+  // Anchors the post-boot handoff grace window (see handoffGraceMs above). Set
+  // when a new session_id is first observed; 0 means no session seen yet.
+  private ctxSessionStartedAt: number = 0;
   private ctxHandoffLeaseId: string | null = null;
   private ctxHandoffQueuedLogAt: number = 0;
   // 2026-07-14 (freeze#4 fix): was a timestamp array capped by a 15min *window*
@@ -425,7 +440,10 @@ Reply using: cortextos slack send ${channel} '<your reply>' --as ${agentName}
     const removed = newReaction.length === 0 && oldReaction.length > 0;
     const label = removed ? `removed ${render(oldReaction)}` : render(newReaction);
 
-    return `=== REACTION from [USER: ${from}] (chat_id:${chatId}) on message ${messageId}: ${label} ===
+    // sanitizeForPtyInjection matches the 5 sibling formatTelegram* paths (#606 residual): the caller's
+    // stripControlChars deliberately keeps \n/\r, so a raw display-name could forge a `=== TELEGRAM ===`
+    // containment header (#592/#597 class). Sanitize at the boundary, not the caller.
+    return `=== REACTION from [USER: ${sanitizeForPtyInjection(from)}] (chat_id:${chatId}) on message ${messageId}: ${label} ===
 
 `;
   }
@@ -1112,10 +1130,10 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         }
         this.ctxLastSessionId = incomingSessionId;
         // Anchor the handoff grace window. A freshly-started session begins at low
-        // context, so context-handoff actions are suppressed for HANDOFF_GRACE_MS to
-        // avoid acting on a transient/stale high reading (observed on fresh codex
-        // app-server threads that briefly report prior prompt-cache tokens) that
-        // would otherwise fire an immediate handoff → restart → fresh-session loop.
+        // context, so soft context-handoff actions are suppressed for HANDOFF_GRACE_MS
+        // to avoid acting on a transient/stale high reading (observed on fresh codex
+        // app-server threads that briefly report prior prompt-cache tokens) that would
+        // otherwise fire an immediate handoff → restart → fresh-session loop.
         this.ctxSessionStartedAt = now;
       }
     } catch { return; }
@@ -1187,14 +1205,13 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // (warning + handoff) while the session is younger than HANDOFF_GRACE_MS. A
     // just-started session cannot legitimately be at genuine overflow, so a high
     // reading inside this window is a transient/stale spike (e.g. a fresh codex
-    // app-server thread briefly reporting prior prompt-cache tokens). Without this,
-    // such a spike fired an immediate handoff → cooperative hard-restart → fresh
-    // session, repeating every ~1-2min. The window is runtime-aware: codex-app-server
-    // and opencode can emit that spurious spike ~6-8min after boot (observed
-    // double-handoffs ~6-8min apart on a codex agent), so they get a 10min grace
-    // while all other runtimes keep 2min — see handoffGraceMs(). Hard API-overflow
-    // detection above is NOT gated by grace, so a genuine overflow is still caught
-    // immediately.
+    // app-server thread briefly reporting prior prompt-cache tokens). The window
+    // is runtime-aware — see handoffGraceMs(). Deliberately NOT applied to Tier 3
+    // (deadline-exceeded force-restart) or the hard API-overflow check above: a
+    // genuine overflow or an unmet handoff deadline must still act regardless of
+    // how young the session is. Also independent of the consecutive circuit
+    // breaker and the separate hang-detector subsystem — neither reads this
+    // window, so this only ever suppresses Tier 1/2, never a safety backstop.
     const HANDOFF_GRACE_MS = handoffGraceMs(this.agent.getConfig().runtime);
     const withinHandoffGrace =
       this.ctxSessionStartedAt > 0 && now - this.ctxSessionStartedAt < HANDOFF_GRACE_MS;
@@ -1428,6 +1445,17 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     try {
       if (!existsSync(this.ctxCircuitFile)) return;
       const data = JSON.parse(readFileSync(this.ctxCircuitFile, 'utf-8'));
+      // Defensive shape check: upstream (grandamenium/cortextos) persists this file
+      // as `{ restarts: number[] }` (windowed circuit breaker) instead of wyre's
+      // `{ consecutiveWithoutRecovery, handoffFires, brokenAt }`. No evidence this
+      // has ever happened here, but if a state dir were ever touched by
+      // upstream-shaped code, the fields below would silently default to 0/[]/null
+      // with no signal. A timestamp array isn't losslessly convertible to a
+      // consecutive-without-recovery count, so this only makes the reset visible
+      // instead of silent — it does not attempt to migrate the array's data.
+      if (Array.isArray(data.restarts) && typeof data.consecutiveWithoutRecovery !== 'number') {
+        this.log('.ctx-circuit.json is in upstream-shaped format (restarts: number[]) — resetting to wyre\'s consecutive-counter defaults');
+      }
       this.consecutiveCtxRestartsWithoutRecovery = typeof data.consecutiveWithoutRecovery === 'number' ? data.consecutiveWithoutRecovery : 0;
       this.ctxHandoffFires = Array.isArray(data.handoffFires) ? data.handoffFires : [];
       this.ctxCircuitBrokenAt = typeof data.brokenAt === 'number' ? data.brokenAt : null;
@@ -1486,7 +1514,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // Sensor inputs (fail-safe: any read error → return, i.e. treated as not-hung).
     let deliveredFireAt: number | null;
     try {
-      deliveredFireAt = mostRecentDeliveredFireMs(readCrons(this.agent.name));
+      // Anchor on the newest fire the agent has ALREADY had grace to answer,
+      // not the newest fire attempted. last_fire_attempted_at advances whether
+      // or not the agent is alive, so anchoring on it means any agent whose
+      // cron interval is <= graceMs keeps a permanently fresh anchor and can
+      // never leave the grace branch. See mostRecentAnswerableFireMs.
+      deliveredFireAt = mostRecentAnswerableFireMs(readCrons(this.agent.name), now, HANG_GRACE_MS);
     } catch { return; }
 
     let lastSessionHeartbeat: number | null = null;
@@ -1513,8 +1546,23 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     } catch { return; }
 
-    const fireVerdict = evaluateHang({ now, graceMs: 15 * 60_000, deliveredFireAt, lastSessionHeartbeat, lastIdleFlagAt });
+    // Class-3 fix: last_activity.flag is written by the PreToolUse hook on EVERY
+    // tool call, mid-turn — unlike last_idle.flag, which only advances when a turn
+    // COMPLETES. Without this, a single work turn longer than the grace window
+    // (a build, a full test suite) spanning a delivered fire reads as beatless for
+    // the turn's entire duration. See hang-detector.ts's triple-source doc comment.
+    let lastActivityBeatAt: number | null = null;
+    try {
+      const activityPath = join(this.paths.stateDir, 'last_activity.flag');
+      if (existsSync(activityPath)) {
+        const t = parseInt(readFileSync(activityPath, 'utf-8').trim(), 10) * 1000;
+        lastActivityBeatAt = Number.isFinite(t) ? t : null;
+      }
+    } catch { return; }
+
+    const fireVerdict = evaluateHang({ now, graceMs: HANG_GRACE_MS, deliveredFireAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt });
     if (fireVerdict.hung) {
+      if (this.hangSuppressedByLimit()) return;
       this.log(`Hang detected for ${this.agent.name}: ${fireVerdict.reason}`);
       this.forceHangRestart(fireVerdict.reason).catch(err => this.log(`forceHangRestart failed: ${err}`));
       return;
@@ -1533,14 +1581,14 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     } catch { return; }
 
-    const bootVerdict = evaluateBootstrapHang({ now, graceMs: 15 * 60_000, restartAt, lastSessionHeartbeat, lastIdleFlagAt });
+    const bootVerdict = evaluateBootstrapHang({ now, graceMs: HANG_GRACE_MS, restartAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt });
 
     // Confirmed recovery: a genuine beat landed at/after this restart, so the loop
     // actually broke — reset the halt counter. Gated on hasBeatSinceRestart (not on
     // bootVerdict.hung being merely false) because "not hung this tick" also covers
     // fail-safe cases (unknown restart-time, still within grace) that say nothing
     // about whether a beat has actually occurred yet.
-    if (hasBeatSinceRestart(restartAt, lastSessionHeartbeat, lastIdleFlagAt) && this.consecutiveHangRestartsWithoutBeat > 0) {
+    if (hasBeatSinceRestart(restartAt, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt) && this.consecutiveHangRestartsWithoutBeat > 0) {
       this.consecutiveHangRestartsWithoutBeat = 0;
       this.saveHangCircuit();
       this.log(`Hang-restart loop counter reset for ${this.agent.name} — genuine beat confirmed since last restart`);
@@ -1549,7 +1597,16 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     if (!bootVerdict.hung) return;
 
     this.log(`Bootstrap hang detected for ${this.agent.name}: ${bootVerdict.reason}`);
+    if (this.hangSuppressedByLimit()) return;
     this.forceHangRestart(bootVerdict.reason).catch(err => this.log(`forceHangRestart failed: ${err}`));
+  }
+
+  /** Rate-limit-blocked sessions look hung (no beats) but restarting burns a
+   *  fresh session into the same wall — the rotation manager owns recovery. */
+  private hangSuppressedByLimit(): boolean {
+    if (!isLimitBlocked(this.paths.ctxRoot, this.agent.name)) return false;
+    this.log(`${this.agent.name} limit-blocked — hang restart suppressed (rotation manager owns recovery)`);
+    return true;
   }
 
   /**
@@ -1565,18 +1622,6 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // sessionRefresh — the session-time-cap rollover timer — bypassed this gate
     // entirely and was confirmed as the actual race that hit boss+forge).
     const now = Date.now();
-
-    // Rate-limit-aware restart (freeze#4 Fix 2): a blind restart just re-hits the
-    // SAME exhausted account, producing an unbounded storm — proven: 14 hang-restart
-    // cycles over 4 hours during the fleet-wide weekly-limit exhaustion, because
-    // every restart resumes into the SAME interactive keychain login and re-blocks on
-    // Claude Code's `/rate-limit-options` dialog. Check stdout.log for an Anthropic
-    // rate-limit/weekly-limit signature BEFORE the halt-after-N logic below, and
-    // route to account rotation instead of a blind restart when one is found.
-    if (detectRateLimitInLog(join(this.paths.logDir, 'stdout.log'))) {
-      await this.handleRateLimitedHang(reason);
-      return;
-    }
 
     // Halt-after-N: if restarting isn't clearing the hang, stop and escalate — don't
     // loop. Consecutive, not windowed — see the field's comment for why a window
@@ -1613,65 +1658,6 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // lock internally.
     hardRestart(this.paths, this.agent.name, `HANG-FORCE-RESTART: ${reason}`);
     this.agent.sessionRefresh().catch(err => this.log(`Hang restart failed: ${err}`));
-  }
-
-  /**
-   * Rate-limit-aware branch of forceHangRestart (freeze#4 Fix 2): a blind restart
-   * resumes into the SAME exhausted account and re-blocks on the same wall, so
-   * instead we rotate to the next healthy account first.
-   *   - Rotation succeeds → restart fresh under the new account. This restart has a
-   *     KNOWN, ADDRESSED cause (the exhausted account was swapped out), not an
-   *     unresolved hang, so it resets the halt-after-N counter rather than counting
-   *     toward it.
-   *   - Rotation fails (no healthy account, preflight rejected, accounts.json
-   *     missing, etc) → halt+alert immediately. Do NOT loop: a blind restart after a
-   *     failed rotation would just re-hit the same exhausted wall again.
-   */
-  private async handleRateLimitedHang(reason: string): Promise<void> {
-    const now = Date.now();
-    this.log(`Rate-limit signature detected in stdout.log for ${this.agent.name} — skipping blind restart, attempting OAuth account rotation. ${reason}`);
-
-    let result: { rotated: boolean; reason: string; from?: string; to?: string };
-    try {
-      // force:true — we already have unambiguous LIVE evidence (the stdout.log
-      // signature). rotateOAuth's own needsRotation gate checks the CURRENT
-      // account's CACHED utilization in accounts.json, which nothing keeps live
-      // for the active account (checkUsageApi is CLI-manual-only); those numbers
-      // can sit at stale/zero placeholders even while the account is genuinely
-      // exhausted, silently vetoing rotation despite the live signal. force only
-      // skips that staler gate — the preflight against the candidate account
-      // still runs unconditionally and still validates the new token for real.
-      result = await rotateOAuth(this.paths.ctxRoot, this.frameworkRoot, this.agent.getOrg(), {
-        reason: `rate-limit-blocked hang restart: ${reason}`,
-        force: true,
-      });
-    } catch (err) {
-      result = { rotated: false, reason: `rotation threw: ${err}` };
-    }
-
-    if (!result.rotated) {
-      this.hangHaltedAt = now;
-      this.saveHangCircuit();
-      const msg = `Agent ${this.agent.name} HANG auto-heal HALTED — rate-limit detected and OAuth rotation failed (${result.reason}). Auto-restart paused 30min; needs manual attention (cortextos start ${this.agent.name}).`;
-      this.log(msg);
-      if (this.telegramApi && this.chatId) {
-        this.telegramApi.sendMessage(this.chatId, msg).catch(() => {});
-      }
-      return;
-    }
-
-    this.consecutiveHangRestartsWithoutBeat = 0;
-    this.hangLastRestartAt = now;
-    this.saveHangCircuit();
-
-    const msg = `Agent ${this.agent.name} was rate-limited (account "${result.from}" exhausted) — rotated to "${result.to}" and restarting fresh.`;
-    this.log(msg);
-    if (this.telegramApi && this.chatId) {
-      this.telegramApi.sendMessage(this.chatId, msg).catch(() => {});
-    }
-
-    hardRestart(this.paths, this.agent.name, `RATE-LIMIT-ROTATE-RESTART: ${reason}`);
-    this.agent.sessionRefresh().catch(err => this.log(`Rate-limit rotate-restart failed: ${err}`));
   }
 
   /**

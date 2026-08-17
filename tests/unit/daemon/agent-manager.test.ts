@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { buildReplyContext } from '../../../src/daemon/agent-manager.js';
@@ -456,6 +456,37 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
     await am.restartAgent('alice');
 
     expect(stopSpy).toHaveBeenCalledWith('alice');
+    expect(startSpy).toHaveBeenCalledWith('alice', '');
+  });
+
+  it('resets context_status.json to 0% between stop and start, so a fresh FastChecker never reads the dying session\'s stale high percentage', async () => {
+    // Regression test: this is the cooperative `cortextos bus hard-restart` path an
+    // agent calls itself after a Tier-2 context handoff. Unlike fast-checker.ts's own
+    // forceContextRestart (Tier-3), this path used to leave context_status.json
+    // untouched — so the brand-new FastChecker startAgent() creates (fresh
+    // ctxHandoffFiredAt=0 default) would read the old session's last-written,
+    // possibly still-high percentage and immediately re-fire a handoff in a session
+    // that hasn't used any context yet.
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', { process: {}, checker: {}, poller: { stop() {} } });
+
+    const stateDir = join(ctxRoot, 'state', 'alice');
+    mkdirSync(stateDir, { recursive: true });
+    const statusPath = join(stateDir, 'context_status.json');
+    writeFileSync(statusPath, JSON.stringify({ used_percentage: 62, exceeds_200k_tokens: false, session_id: 'old-session', written_at: new Date(0).toISOString() }));
+
+    let statusAtStartTime: any = null;
+    const stopSpy = vi.spyOn(am, 'stopAgent').mockResolvedValue();
+    const startSpy = vi.spyOn(am, 'startAgent').mockImplementation(async () => {
+      // Capture the file's contents exactly as the fresh FastChecker would see them
+      statusAtStartTime = JSON.parse(readFileSync(statusPath, 'utf-8'));
+    });
+
+    await am.restartAgent('alice');
+
+    expect(stopSpy).toHaveBeenCalledWith('alice');
+    expect(statusAtStartTime.used_percentage).toBe(0);
+    expect(statusAtStartTime.exceeds_200k_tokens).toBe(false);
     expect(startSpy).toHaveBeenCalledWith('alice', '');
   });
 });

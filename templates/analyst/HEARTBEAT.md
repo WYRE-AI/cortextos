@@ -90,7 +90,7 @@ MEMORY_DIR="$(pwd)/memory"
 mkdir -p "$MEMORY_DIR"
 cat >> "$MEMORY_DIR/$TODAY.md" << MEMORY
 
-## Heartbeat Update - $(date -u +%H:%M UTC) / $LOCAL_TIME
+## Heartbeat Update - $(date -u '+%H:%M UTC') / $LOCAL_TIME
 - WORKING ON: <task_id or "none">
 - Status: <healthy/working/blocked>
 - Inbox: <N messages processed>
@@ -128,6 +128,56 @@ If you learned something this cycle that should persist across sessions:
 - User preferences discovered
 - System behaviors noted
 - Append to MEMORY.md
+
+---
+
+## Promotion check — is MEMORY.md behind today's daily memory?
+
+**Run this BEFORE the KB re-ingest step below.** Nothing promotes between memory layers
+automatically, and "MEMORY.md is current" and "MEMORY.md has not been touched in four hours"
+otherwise produce the same output: none.
+
+```bash
+LATEST=$(ls -1 memory/2*-*-*.md 2>/dev/null | sort | tail -1)
+if [ ! -f MEMORY.md ] || [ -z "$LATEST" ]; then
+  MISS=""; [ -f MEMORY.md ] || MISS="MEMORY.md"; [ -n "$LATEST" ] || MISS="$MISS any memory/YYYY-MM-DD.md"
+  echo "PROMOTION CHECK: NOT CHECKED — missing:$MISS (this is NOT a pass)"
+else
+  M=$(stat -f %m MEMORY.md 2>/dev/null || stat -c %Y MEMORY.md)
+  D=$(stat -f %m "$LATEST" 2>/dev/null || stat -c %Y "$LATEST")
+  GAP=$(( D - M ))
+  if [ "$GAP" -gt 14400 ]; then
+    echo "PROMOTION CHECK: UNPROMOTED — $LATEST is $((GAP/3600))h$(( (GAP%3600)/60 ))m newer than MEMORY.md (threshold 4h). Promote durable lessons to MEMORY.md NOW, before finishing this heartbeat."
+  else
+    echo "PROMOTION CHECK: OK — gap $((GAP/60))m vs $LATEST (threshold 4h)"
+  fi
+fi
+```
+
+**Three distinct outcomes on purpose.** `NOT CHECKED` is not a pass — a missing file must never read
+as healthy. **Act on `UNPROMOTED` in this cycle**; deferring it is how the gap grew in the first place.
+
+**Compares against the NEWEST daily memory file, not today's.** Looking only at today's file means that at every UTC midnight a real backlog silently becomes `NOT CHECKED` — the flag disappears exactly when yesterday's unpromoted work is still unpromoted.
+
+**Threshold is one heartbeat interval (4h), matching the cron.** Bounded-latency detector, not
+immunity: an agent that stops promoting is caught at the **next** heartbeat, so worst-case
+onset-to-flag is ~2 intervals. A gap under 4h is by design invisible to it.
+
+## Step 9: Re-ingest memory to knowledge base
+
+Full reference: `.claude/skills/knowledge-base/SKILL.md`
+
+Keep your memory collection searchable and current:
+
+```bash
+cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u '+%Y-%m-%d').md \
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --force
+```
+
+This runs on every heartbeat cycle. It ensures past experiences, patterns,
+and analyses are semantically searchable for future tasks (collection
+`agent-{name}`, derived from --scope/--agent). Skip if GEMINI_API_KEY is
+not configured.
 
 ---
 

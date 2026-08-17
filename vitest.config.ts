@@ -16,6 +16,7 @@ export default defineConfig({
   test: {
     globals: true,
     testTimeout: 10000,
+    setupFiles: ['tests/setup/sanitize-ctx-env.ts'],
     include: [
       'tests/**/*.test.ts',
       'dashboard/src/**/__tests__/**/*.test.ts',

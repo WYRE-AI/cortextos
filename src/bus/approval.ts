@@ -270,13 +270,15 @@ export function updateApproval(
 }
 
 /**
- * List pending approvals.
+ * Read every parseable approval out of one bucket directory ('pending' | 'resolved').
+ * A missing directory is an empty bucket, not an error — resolved/ does not exist
+ * until the first approval is decided.
  */
-export function listPendingApprovals(paths: BusPaths): Approval[] {
-  const pendingDir = join(paths.approvalDir, 'pending');
+function readApprovalDir(paths: BusPaths, bucket: 'pending' | 'resolved'): Approval[] {
+  const dir = join(paths.approvalDir, bucket);
   let files: string[];
   try {
-    files = readdirSync(pendingDir).filter(f => f.endsWith('.json'));
+    files = readdirSync(dir).filter(f => f.endsWith('.json'));
   } catch {
     return [];
   }
@@ -284,14 +286,81 @@ export function listPendingApprovals(paths: BusPaths): Approval[] {
   const approvals: Approval[] = [];
   for (const file of files) {
     try {
-      const content = readFileSync(join(pendingDir, file), 'utf-8');
+      const content = readFileSync(join(dir, file), 'utf-8');
       approvals.push(JSON.parse(content));
     } catch {
       // Skip corrupt
     }
   }
+  return approvals;
+}
 
+function sortByCreatedDesc(approvals: Approval[]): Approval[] {
   return approvals.sort(
     (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
   );
+}
+
+/**
+ * List pending approvals.
+ */
+export function listPendingApprovals(paths: BusPaths): Approval[] {
+  return sortByCreatedDesc(readApprovalDir(paths, 'pending'));
+}
+
+/**
+ * List approvals across BOTH buckets, optionally filtered by status.
+ *
+ * Why this exists: updateApproval MOVES a decided approval from pending/ to
+ * resolved/, and every read path used to look only at pending/. That made a
+ * resolved approval unreachable from the CLI — an agent could not answer
+ * "was I approved?" about its own request once the decision landed, because
+ * the only copy of the outcome had left the directory anything could see.
+ * The inbox notification sent by updateApproval is delivered exactly once,
+ * so an agent that restarts past that message had no recovery path at all.
+ */
+export function listApprovals(paths: BusPaths, status?: ApprovalStatus): Approval[] {
+  const all = [...readApprovalDir(paths, 'pending'), ...readApprovalDir(paths, 'resolved')];
+  return sortByCreatedDesc(status ? all.filter(a => a.status === status) : all);
+}
+
+/**
+ * Which status `list-approvals` should filter on, given its flags.
+ *
+ * DEFAULT STAYS PENDING-ONLY. Callers predate this command growing a resolved/
+ * reader and mean "what still needs a decision" — the orchestrator heartbeat and
+ * its approval-sweep cron among them, and that cron reminds the user about
+ * anything pending for over an hour. Widening the bare invocation to every
+ * bucket turns long-settled approvals into fresh reminders. Reaching resolved
+ * records is opt-in: an explicit --status, or --all for everything.
+ *
+ * Returns undefined to mean "no filter" (i.e. every status).
+ */
+export function resolveListStatus(
+  status?: ApprovalStatus,
+  all?: boolean,
+): ApprovalStatus | undefined {
+  if (status) return status;
+  return all ? undefined : 'pending';
+}
+
+/**
+ * Fetch a single approval by id, looking in pending/ THEN resolved/.
+ *
+ * Returns null only when the id is in NEITHER bucket — that is the one true
+ * "does not exist". Callers must distinguish this null from an empty list:
+ * reporting a decided approval as absent is precisely the failure this
+ * function was added to remove.
+ */
+export function getApproval(paths: BusPaths, approvalId: string): Approval | null {
+  for (const bucket of ['pending', 'resolved'] as const) {
+    const filePath = join(paths.approvalDir, bucket, `${approvalId}.json`);
+    if (!existsSync(filePath)) continue;
+    try {
+      return JSON.parse(readFileSync(filePath, 'utf-8')) as Approval;
+    } catch {
+      // Corrupt file — treat as unreadable rather than absent; keep looking.
+    }
+  }
+  return null;
 }

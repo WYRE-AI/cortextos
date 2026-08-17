@@ -103,8 +103,9 @@ describe('agent-pidfile', () => {
     expect(existsSync(join(stateDir, 'agent.pid'))).toBe(false);
   });
 
-  it('CATASTROPHIC GUARD: reapOrphan REFUSES to kill an unverified (recycled) live pid', async () => {
+  it('CATASTROPHIC GUARD: reapOrphan REFUSES to kill an unverified (recycled) live pid + KEEPS its pidfile', async () => {
     const pid = spawnChild();
+    writeAgentPid(stateDir, 'x', pid, process.pid);
     const rec: AgentPidRecord = {
       pid, agentName: 'x', spawnedAt: Date.now(),
       startedAt: (processStartTimeMs(pid) ?? Date.now()) - 10 * 60_000, // recycled anchor
@@ -115,10 +116,14 @@ describe('agent-pidfile', () => {
     expect(res.verdict).toBe('unverified');
     await sleep(100);
     expect(isPidAlive(pid)).toBe(true); // the innocent process is STILL ALIVE
+    // ACCRETION GUARD: never delete a still-alive process's pidfile — otherwise
+    // the orphan would evade the next boot-reap and accrete.
+    expect(existsSync(join(stateDir, 'agent.pid'))).toBe(true);
   });
 
-  it('reapOrphan kills an ownership-confirmed live orphan (SIGTERM path)', async () => {
+  it('reapOrphan kills an ownership-confirmed live orphan (SIGTERM path) + clears its pidfile', async () => {
     const pid = spawnChild();
+    writeAgentPid(stateDir, 'x', pid, process.pid);
     const rec: AgentPidRecord = {
       pid, agentName: 'x', spawnedAt: Date.now(),
       startedAt: processStartTimeMs(pid), // true start time => owned
@@ -129,6 +134,7 @@ describe('agent-pidfile', () => {
     expect(res.reaped).toBe(true);
     await sleep(200);
     expect(isPidAlive(pid)).toBe(false); // confirmed reaped
+    expect(existsSync(join(stateDir, 'agent.pid'))).toBe(false); // pidfile cleared on confirmed reap
   });
 
   it('reapOrphan re-verifies ownership then SIGKILLs a still-owned orphan that ignores SIGTERM', async () => {

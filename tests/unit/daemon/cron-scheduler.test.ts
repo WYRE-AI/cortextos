@@ -32,7 +32,7 @@ vi.mock('../../../src/bus/crons.js', () => ({
 // Imports AFTER mock setup
 // ---------------------------------------------------------------------------
 
-import { CronScheduler, nextFireFromCron } from '../../../src/daemon/cron-scheduler';
+import { CronScheduler, nextFireFromCron, computeReferenceMs } from '../../../src/daemon/cron-scheduler';
 import type { CronDefinition } from '../../../src/types/index';
 
 // ---------------------------------------------------------------------------
@@ -55,28 +55,40 @@ const TICK = CronScheduler.TICK_INTERVAL_MS; // 30_000 ms
 // ---------------------------------------------------------------------------
 // nextFireFromCron — unit tests for the cron expression parser
 //
-// These tests are timezone-agnostic: rather than hardcoding UTC epoch ms
-// values (which would break on machines not set to UTC), we verify:
-//   (a) the result is a valid number,
-//   (b) the local-time fields (hour, minute, day-of-week) of the result
-//       match what the cron expression requests.
+// nextFireFromCron defaults to UTC (see the timezone-aware describe block
+// below for why) — these tests assert against explicit UTC getters/setters
+// so they pass deterministically regardless of the host machine's ambient
+// timezone, matching the code's own UTC-independent-of-ambient-TZ default.
+// A non-UTC ambient TZ is force-set in beforeEach so a regression back to
+// ambient-local Date getters would be caught here too, not only in the
+// dedicated timezone-aware suite.
 // ---------------------------------------------------------------------------
 
-/** Pull the local-time components out of an epoch-ms value. */
-function localOf(ms: number) {
+/** Pull the UTC calendar components out of an epoch-ms value. */
+function utcOf(ms: number) {
   const d = new Date(ms);
   return {
-    minutes:    d.getMinutes(),
-    hours:      d.getHours(),
-    date:       d.getDate(),
-    month:      d.getMonth() + 1,
-    dayOfWeek:  d.getDay(),
+    minutes:    d.getUTCMinutes(),
+    hours:      d.getUTCHours(),
+    date:       d.getUTCDate(),
+    month:      d.getUTCMonth() + 1,
+    dayOfWeek:  d.getUTCDay(),
   };
 }
 
 describe('nextFireFromCron', () => {
+  const originalTz = process.env.TZ;
+
+  beforeEach(() => {
+    process.env.TZ = 'America/New_York';
+  });
+
+  afterEach(() => {
+    if (originalTz === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTz;
+  });
+
   it('computes correct next fire for "*/5 * * * *" (every 5 minutes)', () => {
-    // Use the current time as the reference so this is always timezone-safe.
     const fromMs = Date.now();
     const next = nextFireFromCron('*/5 * * * *', fromMs);
     expect(next).not.toBeNaN();
@@ -84,72 +96,70 @@ describe('nextFireFromCron', () => {
     expect(next).toBeGreaterThan(fromMs);
     expect(next).toBeLessThanOrEqual(fromMs + 5 * 60_000 + 60_000);
     // The minute must be a multiple of 5
-    expect(localOf(next).minutes % 5).toBe(0);
+    expect(utcOf(next).minutes % 5).toBe(0);
     // Seconds must be zero (whole minute)
     expect(next % 60_000).toBe(0);
   });
 
-  it('computes next fire at local hour 13 for "0 13 * * *" when before 13:00 today', () => {
-    // Construct a "from" time that is in local hour 12 today.
+  it('computes next fire at UTC hour 13 for "0 13 * * *" when before 13:00 UTC today', () => {
     const ref = new Date();
-    ref.setHours(12, 0, 0, 0);
+    ref.setUTCHours(12, 0, 0, 0);
     const fromMs = ref.getTime();
 
     const next = nextFireFromCron('0 13 * * *', fromMs);
     expect(next).not.toBeNaN();
 
-    const loc = localOf(next);
-    expect(loc.hours).toBe(13);
-    expect(loc.minutes).toBe(0);
+    const utc = utcOf(next);
+    expect(utc.hours).toBe(13);
+    expect(utc.minutes).toBe(0);
     // Must be the same calendar date (still today)
-    expect(loc.date).toBe(new Date(fromMs).getDate());
+    expect(utc.date).toBe(new Date(fromMs).getUTCDate());
   });
 
-  it('wraps to next day when local hour 13 has already passed today', () => {
-    // Construct a "from" time in local hour 14 today.
+  it('wraps to next day when UTC hour 13 has already passed today', () => {
     const ref = new Date();
-    ref.setHours(14, 0, 0, 0);
+    ref.setUTCHours(14, 0, 0, 0);
     const fromMs = ref.getTime();
 
     const next = nextFireFromCron('0 13 * * *', fromMs);
     expect(next).not.toBeNaN();
 
-    const loc = localOf(next);
-    expect(loc.hours).toBe(13);
-    expect(loc.minutes).toBe(0);
+    const utc = utcOf(next);
+    expect(utc.hours).toBe(13);
+    expect(utc.minutes).toBe(0);
     // Must be tomorrow (date + 1), accounting for month wrap
     const expectedDate = new Date(fromMs);
-    expectedDate.setDate(expectedDate.getDate() + 1);
-    expect(loc.date).toBe(expectedDate.getDate());
+    expectedDate.setUTCDate(expectedDate.getUTCDate() + 1);
+    expect(utc.date).toBe(expectedDate.getUTCDate());
   });
 
   it('handles comma-list: "0 0,6,12,18 * * *" — picks the next matching hour', () => {
-    // Set from = local 05:00 so next matching hour is 6.
+    // Set from = UTC 05:00 so next matching hour is 6.
     const ref = new Date();
-    ref.setHours(5, 0, 0, 0);
+    ref.setUTCHours(5, 0, 0, 0);
     const fromMs = ref.getTime();
 
     const next = nextFireFromCron('0 0,6,12,18 * * *', fromMs);
     expect(next).not.toBeNaN();
 
-    const loc = localOf(next);
-    expect([0, 6, 12, 18]).toContain(loc.hours);
-    expect(loc.minutes).toBe(0);
+    const utc = utcOf(next);
+    expect([0, 6, 12, 18]).toContain(utc.hours);
+    expect(utc.minutes).toBe(0);
     expect(next).toBeGreaterThan(fromMs);
   });
 
-  it('handles ranges: "0 8-10 * * *" — fires within [8,9,10] local hours', () => {
+  it('handles ranges: "0 8-10 * * *" — fires within [8,9,10] UTC hours', () => {
     const ref = new Date();
-    ref.setHours(7, 59, 0, 0);
+    ref.setUTCHours(7, 59, 0, 0);
     const fromMs = ref.getTime();
 
     const next = nextFireFromCron('0 8-10 * * *', fromMs);
     expect(next).not.toBeNaN();
 
-    const loc = localOf(next);
-    expect(loc.hours).toBeGreaterThanOrEqual(8);
-    expect(loc.hours).toBeLessThanOrEqual(10);
-    expect(loc.minutes).toBe(0);
+    const utc = utcOf(next);
+    expect(utc.hours).toBeGreaterThanOrEqual(8);
+    expect(utc.hours).toBeLessThanOrEqual(10);
+    expect(utc.minutes).toBe(0);
   });
 
   it('handles day-of-week restriction: "0 16 * * 1" — fires on a Monday', () => {
@@ -158,16 +168,133 @@ describe('nextFireFromCron', () => {
     expect(next).not.toBeNaN();
     expect(next).toBeGreaterThan(fromMs);
 
-    const loc = localOf(next);
-    expect(loc.dayOfWeek).toBe(1); // Monday
-    expect(loc.hours).toBe(16);
-    expect(loc.minutes).toBe(0);
+    const utc = utcOf(next);
+    expect(utc.dayOfWeek).toBe(1); // Monday
+    expect(utc.hours).toBe(16);
+    expect(utc.minutes).toBe(0);
     // Must be within the next 7 days
     expect(next - fromMs).toBeLessThanOrEqual(8 * 24 * 60 * 60_000);
   });
 
   it('returns NaN for invalid expression (wrong field count)', () => {
     expect(nextFireFromCron('* * * *', Date.now())).toBeNaN();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// nextFireFromCron — timezone-aware evaluation (bug: cron-expr fields were
+// matched against the process's ambient local timezone via Date getters,
+// e.g. getHours(). On a daemon with no TZ env override, Node falls back to
+// the OS timezone (America/New_York on the fleet host), so a cron authored
+// as "0 9 * * 1" (intended as 09:00 UTC) actually fired at 09:00 ET
+// (13:00 UTC) — a silent 4-5h (DST-dependent) offset. Fix: nextFireFromCron
+// takes an explicit `timezone` parameter (IANA string, default "UTC") and
+// extracts cron fields via Intl.DateTimeFormat for THAT timezone, independent
+// of the process's ambient TZ.
+//
+// These tests force process.env.TZ to a non-UTC zone in beforeEach so the
+// bug (and the fix) are proven deterministically regardless of which
+// timezone the host machine or CI runner happens to be in.
+// ---------------------------------------------------------------------------
+describe('nextFireFromCron — timezone-aware evaluation', () => {
+  const originalTz = process.env.TZ;
+
+  beforeEach(() => {
+    // Force a non-UTC ambient TZ so a test that (bug) reads local Date
+    // getters cannot accidentally pass just because the host happens to be
+    // UTC already.
+    process.env.TZ = 'America/New_York';
+  });
+
+  afterEach(() => {
+    if (originalTz === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTz;
+  });
+
+  it('defaults to UTC when no timezone is given, regardless of ambient process TZ', () => {
+    // Monday 2026-07-13, 08:00 UTC — one hour before the 09:00 UTC target.
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    const next = nextFireFromCron('0 9 * * 1', fromMs);
+    expect(next).toBe(Date.parse('2026-07-13T09:00:00.000Z'));
+  });
+
+  it('respects an explicit IANA timezone in summer (EDT, UTC-4)', () => {
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    const next = nextFireFromCron('0 9 * * 1', fromMs, 'America/New_York');
+    // 9am EDT on 2026-07-13 is 13:00 UTC.
+    expect(next).toBe(Date.parse('2026-07-13T13:00:00.000Z'));
+  });
+
+  it('respects an explicit IANA timezone in winter (EST, UTC-5) — DST-native, not a fixed offset', () => {
+    // 2026-01-12 is a Monday.
+    const fromMs = Date.parse('2026-01-12T08:00:00.000Z');
+    const next = nextFireFromCron('0 9 * * 1', fromMs, 'America/New_York');
+    // 9am EST on 2026-01-12 is 14:00 UTC (not 13:00 — proves this isn't a
+    // hardcoded UTC-4 offset, it's genuine DST-aware timezone evaluation).
+    expect(next).toBe(Date.parse('2026-01-12T14:00:00.000Z'));
+  });
+
+  it('day-of-week (and hour) fields are evaluated in the target timezone, not UTC/ambient-local', () => {
+    // 2026-07-13 23:30 UTC is still Monday in UTC, but already Tuesday
+    // 08:30 in Asia/Tokyo (UTC+9, no DST). A "Tuesday 09:00" cron evaluated
+    // in Asia/Tokyo should fire ~30min later (Tuesday 00:00 UTC); the same
+    // expression evaluated with the UTC default should not fire until
+    // Tuesday 09:00 UTC, 9.5h later — proves dow+hour use the GIVEN
+    // timezone's calendar day, not UTC's.
+    const fromMs = Date.parse('2026-07-13T23:30:00.000Z');
+
+    const nextTokyo = nextFireFromCron('0 9 * * 2', fromMs, 'Asia/Tokyo');
+    expect(nextTokyo).toBe(Date.parse('2026-07-14T00:00:00.000Z')); // 09:00 JST Tue = 00:00 UTC Tue
+
+    const nextUtcDefault = nextFireFromCron('0 9 * * 2', fromMs);
+    expect(nextUtcDefault).toBe(Date.parse('2026-07-14T09:00:00.000Z')); // 09:00 UTC Tue
+  });
+
+  it('rejects an invalid IANA timezone by returning NaN rather than throwing', () => {
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    expect(nextFireFromCron('0 9 * * 1', fromMs, 'Not/AZone')).toBeNaN();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// nextFireFromCron — infeasible dom+month pre-check (PR #21 fast-follow)
+//
+// A dom+month combination that exists in no month ("0 0 31 2 *" — Feb 31)
+// passes per-field expansion, so without a pre-check the minute scan walks
+// the entire 366-day window (527K formatToParts calls, ~1.2s measured on
+// this branch) just to return NaN — per reload and per list-crons preview.
+// The pre-check rejects in O(fields). Feb deliberately counts 29 days:
+// "29 2" stays feasible (leap years) and is answered by the real scan.
+// ---------------------------------------------------------------------------
+describe('nextFireFromCron — infeasible dom+month pre-check', () => {
+  it('returns NaN for impossible calendar dates without scanning (Feb 31, Apr 31)', () => {
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    const t0 = performance.now();
+    expect(nextFireFromCron('0 0 31 2 *', fromMs)).toBeNaN();
+    expect(nextFireFromCron('0 0 31 4 *', fromMs)).toBeNaN();
+    expect(nextFireFromCron('30 6 30 2 *', fromMs, 'America/New_York')).toBeNaN();
+    const elapsed = performance.now() - t0;
+    // Pre-check is O(fields) (<1ms). The bound is ~100x headroom for CI
+    // jitter while still failing loudly on any full-window scan (~1.2s each).
+    expect(elapsed).toBeLessThan(120);
+  });
+
+  it('still finds a date when ANY expanded month admits an expanded day (31 in "1,2" months)', () => {
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    // Feb 31 is impossible but Jan 31 is real — expression stays feasible.
+    const next = nextFireFromCron('0 0 31 1,2 *', fromMs);
+    expect(next).toBe(Date.parse('2027-01-31T00:00:00.000Z'));
+  });
+
+  it('keeps "0 0 29 2 *" feasible and resolves it to a real Feb 29 when one is in the window', () => {
+    // From mid-2027 the next Feb 29 (2028) is within the 366-day scan window.
+    const fromMs = Date.parse('2027-06-01T00:00:00.000Z');
+    expect(nextFireFromCron('0 0 29 2 *', fromMs)).toBe(Date.parse('2028-02-29T00:00:00.000Z'));
+  });
+
+  it('leaves ordinary expressions untouched (Jan 31 exact date)', () => {
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    expect(nextFireFromCron('15 4 31 1 *', fromMs)).toBe(Date.parse('2027-01-31T04:15:00.000Z'));
   });
 });
 
@@ -229,6 +356,29 @@ describe('CronScheduler', () => {
     expect(fired).toHaveLength(0);
   });
 
+  it('a cron-expression cron with an explicit timezone field fires at the correct (offset) UTC instant', async () => {
+    // Pin the fake clock to an absolute, known instant: Monday 2026-07-13,
+    // 08:00 UTC — one hour before "0 9 * * 1" fires in UTC (default), and
+    // 5 hours before it fires at 9am America/New_York (EDT, UTC-4).
+    vi.setSystemTime(new Date('2026-07-13T08:00:00.000Z'));
+
+    mockReadCrons.mockReturnValue([
+      makeCron({ schedule: '0 9 * * 1', timezone: 'America/New_York' }),
+    ]);
+    scheduler.start();
+
+    // Advance 1h — the UTC-default fire time (09:00 UTC) — should NOT have
+    // fired yet, proving the timezone field is actually being honored
+    // (not silently ignored in favor of a UTC/ambient default).
+    await vi.advanceTimersByTimeAsync(60 * 60_000 + TICK);
+    expect(fired).toHaveLength(0);
+
+    // Advance to 13:00 UTC (9am EDT) — should fire now.
+    await vi.advanceTimersByTimeAsync(4 * 60 * 60_000);
+    expect(fired).toHaveLength(1);
+    expect(fired[0].name).toBe('test-cron');
+  });
+
   it('disabled cron does not fire', async () => {
     mockReadCrons.mockReturnValue([makeCron({ schedule: '1m', enabled: false })]);
     scheduler.start();
@@ -288,6 +438,7 @@ describe('CronScheduler', () => {
     mockReadCrons.mockReturnValue([
       makeCron({
         schedule:      '24h',
+        created_at:    new Date(Date.now() - 48 * 3_600_000).toISOString(),
         last_fired_at: new Date(Date.now() - 25 * 3_600_000).toISOString(),
       }),
     ]);
@@ -421,6 +572,76 @@ describe('CronScheduler', () => {
   });
 
   // -------------------------------------------------------------------------
+  // reload() — a PROMPT-ONLY edit must not re-phase the cron.
+  //
+  // Regression guard for the 2026-08-15 fleet incident: editing a cron's prompt
+  // via remove-then-add silently re-phased it (boss's `check-approvals` moved
+  // 18:14/20:14Z -> 19:20/21:20Z, destroying a backstop nobody knew they had).
+  //
+  // `bus update-cron --prompt` avoids this at TWO independent levels:
+  //   1. changeKeyFor() is `name|schedule` (cron-scheduler.ts:208-210), so a
+  //      prompt-only edit keeps the key and nextFireAt is preserved outright.
+  //   2. updateCron() shallow-merges (bus/crons.ts:250-267), so `last_fired_at`
+  //      survives even when the schedule DOES change.
+  // The two existing tests above cover "identical definition" and "changed
+  // schedule".  Neither covers "changed prompt, same schedule" — which is the
+  // case the incident actually turned on.
+  //
+  // Part (b) is a SCHEDULER-LEVEL statement about a definition that carries no
+  // fire history at all: with nothing to anchor on, created_at is the anchor,
+  // and that is unchanged (10e3011f). It is no longer a statement about what
+  // the CLI does — this file mocks src/bus/crons.js wholesale, so it cannot see
+  // that removeCron now leaves the fire behind as a cron-state.json tombstone.
+  // A real remove-then-add therefore keeps its phase; that is pinned end-to-end
+  // against the unmocked path in tests/unit/bus/cron-phase-across-remove-add.
+  // -------------------------------------------------------------------------
+
+  it('update-cron holds a cron\'s phase; a definition with no fire history anchors on created_at', async () => {
+    const base    = Date.now();
+    const THREE_H = 3 * 60 * 60 * 1000;
+    const FOUR_H  = 4 * 60 * 60 * 1000;
+    const created = new Date(base - THREE_H).toISOString();
+
+    // A 4h cron created 3h ago: anchored on created_at, it is due in 1h.
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'phase', schedule: '4h', prompt: 'original', created_at: created }),
+    ]);
+    scheduler.start();
+    const before = scheduler.getNextFireTimes().find(e => e.name === 'phase')!;
+    expect(before.nextFireAt).toBe(base - THREE_H + FOUR_H);
+
+    // (a) update-cron: prompt rewritten, created_at (and any last_fired_at)
+    //     preserved by the shallow merge. Phase must NOT move.
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'phase', schedule: '4h', prompt: 'rewritten', created_at: created }),
+    ]);
+    scheduler.reload();
+    const afterUpdate = scheduler.getNextFireTimes().find(e => e.name === 'phase')!;
+    expect(afterUpdate.nextFireAt).toBe(before.nextFireAt);
+
+    // (b) the cron disappears, then returns as a NEW definition with a fresh
+    //     created_at and no fire history of any kind. Two reloads, because that
+    //     is the shape the scheduler sees across a remove and a re-add.
+    mockReadCrons.mockReturnValue([]);            // remove-cron
+    scheduler.reload();
+    expect(scheduler.getNextFireTimes().find(e => e.name === 'phase')).toBeUndefined();
+
+    mockReadCrons.mockReturnValue([               // add-cron
+      makeCron({ name: 'phase', schedule: '4h', prompt: 'rewritten',
+                 created_at: new Date(base).toISOString() }),
+    ]);
+    scheduler.reload();
+    const afterReadd = scheduler.getNextFireTimes().find(e => e.name === 'phase')!;
+
+    // With no fire on record the anchor is created_at, so the phase slips by
+    // the full 3h of elapsed life. This is the shape the 2026-08-15 defect took
+    // (boss's check-approvals moved 18:14/20:14Z -> 19:20/21:20Z); the fix is
+    // to stop producing this input, not to re-anchor a cron that never fired.
+    expect(afterReadd.nextFireAt).toBe(base + FOUR_H);
+    expect(afterReadd.nextFireAt - before.nextFireAt).toBe(THREE_H);
+  });
+
+  // -------------------------------------------------------------------------
   // reload() during in-flight fire — race condition probe
   //
   // If reload() runs while a fire's onFire is awaiting, the old ScheduledCron
@@ -465,8 +686,9 @@ describe('CronScheduler', () => {
     // Two crons so the post-removal state is legitimately non-empty (avoiding
     // the empty-result fallback bug in this assertion).
     const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+    const twentyMinAgo = new Date(Date.now() - 20 * 60_000).toISOString();
     mockReadCrons.mockReturnValue([
-      makeCron({ name: 'doomed', schedule: '10m', last_fired_at: tenMinAgo, fire_count: 1 }),
+      makeCron({ name: 'doomed', schedule: '10m', created_at: twentyMinAgo, last_fired_at: tenMinAgo, fire_count: 1 }),
       makeCron({ name: 'survivor', schedule: '24h', last_fired_at: new Date(Date.now() - 1_000).toISOString() }),
     ]);
 
@@ -566,9 +788,10 @@ describe('CronScheduler', () => {
     });
 
     // Start with a cron that fires immediately (catch-up)
+    const twentyMinAgo = new Date(Date.now() - 20 * 60_000).toISOString();
     const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
     mockReadCrons.mockReturnValue([
-      makeCron({ name: 'racy', schedule: '10m', last_fired_at: tenMinAgo, fire_count: 1 }),
+      makeCron({ name: 'racy', schedule: '10m', created_at: twentyMinAgo, last_fired_at: tenMinAgo, fire_count: 1 }),
     ]);
 
     raceScheduler.start();
@@ -581,7 +804,7 @@ describe('CronScheduler', () => {
     // crons.json's last_fired_at is still the stale 10-min-ago value
     // because the in-flight fire's persist hasn't run yet.
     mockReadCrons.mockReturnValue([
-      makeCron({ name: 'racy', schedule: '1m', last_fired_at: tenMinAgo, fire_count: 1 }),
+      makeCron({ name: 'racy', schedule: '1m', created_at: twentyMinAgo, last_fired_at: tenMinAgo, fire_count: 1 }),
     ]);
     raceScheduler.reload();
 
@@ -629,6 +852,7 @@ describe('CronScheduler', () => {
     let diskCron = makeCron({
       name: 'daily-job',
       schedule: '1h',
+      created_at: new Date(Date.now() - 5 * 24 * 3_600_000).toISOString(),
       last_fired_at: oneHourAgo,
       fire_count: 5,
     });
@@ -696,6 +920,7 @@ describe('CronScheduler', () => {
       makeCron({
         name:          'overdue',
         schedule:      '1h',
+        created_at:    new Date(Date.now() - 5 * 3_600_000).toISOString(),
         last_fired_at: twoHoursAgo,
         fire_count:    5,
       }),
@@ -725,6 +950,50 @@ describe('CronScheduler', () => {
     await vi.advanceTimersByTimeAsync(TICK);
 
     expect(fired.some(c => c.name === 'fresh')).toBe(false);
+  });
+
+  it('a NEVER-fired cron created N days ago (N > interval) catch-up fires on a fresh load, anchored on created_at — not silently reset to now+interval', async () => {
+    // Regression for the never-fired-cron restart race: without last_fired_at,
+    // last_fire_attempted_at, or a cron-state.json entry, referenceMs used to
+    // fall straight back to "now" on every fresh CronScheduler construction
+    // (i.e. every daemon restart, not just a live crons.json reload) — so a
+    // never-fired cron's nextFireAt perpetually reset to now+interval and
+    // could never fire if restarts kept landing just inside that window.
+    // created_at anchors referenceMs the same way last_fired_at already does
+    // for crons that HAVE fired, so this behaves like any other overdue cron:
+    // one catch-up fire, then resumes normal cadence.
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 3_600_000).toISOString();
+    mockReadCrons.mockReturnValue([
+      makeCron({
+        name:       'never-fired-long-interval',
+        schedule:   '3d', // 72h — longer than the daemon's ~71h auto-rotation cadence
+        created_at: fourDaysAgo,
+        // No last_fired_at / last_fire_attempted_at / fire_count — genuinely never fired.
+      }),
+    ]);
+
+    scheduler.start(); // isReload=false — the exact "fresh construction" path this fixes
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(fired.some(c => c.name === 'never-fired-long-interval')).toBe(true);
+  });
+
+  it('a NEVER-fired cron created recently (created_at < interval ago) does NOT catch-up fire — symmetric with the fired-cron case', async () => {
+    const oneHourAgo = new Date(Date.now() - 3_600_000).toISOString();
+    mockReadCrons.mockReturnValue([
+      makeCron({
+        name:       'never-fired-fresh',
+        schedule:   '1d',
+        created_at: oneHourAgo,
+      }),
+    ]);
+
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(fired.some(c => c.name === 'never-fired-fresh')).toBe(false);
   });
 
   // -------------------------------------------------------------------------
@@ -795,3 +1064,91 @@ describe('CronScheduler', () => {
     expect(names).not.toContain('c'); // disabled, not scheduled
   });
 });
+
+// ---------------------------------------------------------------------------
+// computeReferenceMs — phase anchoring
+//
+// created_at is a FALLBACK for a never-fired cron, never a candidate competing
+// with real fire records. Editing a cron's prompt is remove-then-add (add-cron
+// refuses to overwrite an existing name), handleAddCron stamps a fresh
+// created_at on every add, and removeCron leaves cron-state.json's last_fire
+// intact — so treating created_at as a candidate meant a prompt edit silently
+// re-phased the cron. Real incidents 2026-08-15: boss's check-approvals moved
+// 18:14/20:14Z -> 19:20/21:20Z, losing coverage of a window it had been
+// covering; infra's sweep moved 18:11Z -> 18:13Z unnoticed.
+//
+// Every assertion below is a hardcoded literal so it can witness the behaviour
+// rather than inherit it.
+// ---------------------------------------------------------------------------
+
+describe('computeReferenceMs — phase anchoring', () => {
+  const NOW = Date.parse('2026-08-15T18:00:00.000Z');
+  const ms = (iso: string) => Date.parse(iso);
+
+  it('falls back to now when nothing at all is known', () => {
+    expect(computeReferenceMs({}, NOW)).toBe(NOW);
+  });
+
+  it('anchors a NEVER-FIRED cron on created_at, not now (preserves 10e3011f)', () => {
+    expect(
+      computeReferenceMs({ createdAt: '2026-08-15T12:00:00.000Z' }, NOW),
+    ).toBe(ms('2026-08-15T12:00:00.000Z'));
+  });
+
+  it('ignores an unparseable created_at and falls back to now', () => {
+    expect(computeReferenceMs({ createdAt: 'not-a-date' }, NOW)).toBe(NOW);
+  });
+
+  it('takes the NEWEST fire record when several are present', () => {
+    expect(
+      computeReferenceMs(
+        {
+          createdAt: '2026-08-01T00:00:00.000Z',
+          lastFiredAt: '2026-08-15T16:00:00.000Z',
+          lastFireAttemptedAt: '2026-08-15T17:00:00.000Z',
+          stateFire: '2026-08-15T16:30:00.000Z',
+        },
+        NOW,
+      ),
+    ).toBe(ms('2026-08-15T17:00:00.000Z'));
+  });
+
+  // THE REGRESSION TEST. Under the old unconditional-max implementation this
+  // returned the fresh created_at (18:00) and the cron re-phased off the edit.
+  it('a FRESH created_at from a remove-then-add does NOT beat an existing fire record', () => {
+    expect(
+      computeReferenceMs(
+        {
+          createdAt: '2026-08-15T18:00:00.000Z', // stamped by handleAddCron during the edit
+          stateFire: '2026-08-15T16:14:00.000Z', // survives removeCron in cron-state.json
+        },
+        NOW,
+      ),
+    ).toBe(ms('2026-08-15T16:14:00.000Z'));
+  });
+
+  it('the re-phasing incident does not reproduce: a 2h cron keeps its :14 phase across a prompt edit', () => {
+    // boss's check-approvals: fired 16:14Z, prompt edited at 17:20Z (fresh
+    // created_at), schedule '2h'. The next fire must stay on :14.
+    const reference = computeReferenceMs(
+      { createdAt: '2026-08-15T17:20:00.000Z', stateFire: '2026-08-15T16:14:00.000Z' },
+      ms('2026-08-15T17:20:00.000Z'),
+    );
+    const next = computeNextFireAtFromInterval(reference, 2 * 60 * 60 * 1000);
+    expect(new Date(next).toISOString()).toBe('2026-08-15T18:14:00.000Z');
+  });
+
+  it('created_at still anchors when the ONLY other input is unparseable', () => {
+    expect(
+      computeReferenceMs(
+        { createdAt: '2026-08-15T12:00:00.000Z', stateFire: 'garbage' },
+        NOW,
+      ),
+    ).toBe(ms('2026-08-15T12:00:00.000Z'));
+  });
+});
+
+/** Local mirror of the interval branch of computeNextFireAt, kept literal. */
+function computeNextFireAtFromInterval(referenceMs: number, durationMs: number): number {
+  return referenceMs + durationMs;
+}

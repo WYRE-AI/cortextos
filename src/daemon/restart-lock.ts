@@ -92,6 +92,31 @@ export function tryAcquireRestartLock(stateDir: string, source: string): Restart
   }
 }
 
+/**
+ * Read-only peek: is a restart currently in flight for this agent?
+ *
+ * Non-mutating counterpart to tryAcquireRestartLock — used by
+ * injectMessageDetailed (agent-process.ts) to check the SAME lock the
+ * restart paths use, without acquiring/reclaiming it. Mirrors
+ * tryAcquireRestartLock's staleness logic exactly (a lock older than
+ * STALE_MS, or unreadable/malformed, is treated as NOT in flight — the
+ * governing fail-open principle above applies here too: a peek that can't
+ * confirm a restart is genuinely in flight must not block message
+ * injection on a hunch).
+ */
+export function isRestartInFlight(stateDir: string): boolean {
+  const path = lockPath(stateDir);
+  try {
+    const raw = readFileSync(path, 'utf-8');
+    const data = JSON.parse(raw) as LockFileData;
+    if (typeof data.at !== 'number' || typeof data.source !== 'string') return false;
+    return Date.now() - data.at < STALE_MS;
+  } catch {
+    // No lock file, or unreadable/malformed — not in flight (fail-open).
+    return false;
+  }
+}
+
 /** Release the restart-in-flight lock. Harmless no-op if already clear. */
 export function releaseRestartLock(stateDir: string): void {
   try {

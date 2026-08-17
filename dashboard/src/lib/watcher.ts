@@ -3,6 +3,7 @@
 
 import { EventEmitter } from 'events';
 import { watch, type FSWatcher } from 'chokidar';
+import fs from 'fs';
 import path from 'path';
 import { CTX_ROOT, getOrgs } from './config';
 import { syncFile, syncAll } from './sync';
@@ -26,25 +27,55 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // ---------------------------------------------------------------------------
-// Watch path builder
+// Watch roots
+//
+// These are LITERAL DIRECTORIES, never globs.
+//
+// This file previously passed glob patterns ('.../analytics/events/**/*.jsonl'
+// and four more). Chokidar removed glob support in v4; we are on v5. It treated
+// each pattern as a literal path, matched nothing, raised no error, reached
+// 'ready', and logged "Watching 8 patterns" — while watching ZERO entries and
+// emitting zero add/change events, permanently. Measured with the installed
+// chokidar 5.0.0: glob arm -> 0 watched entries / 0 events; literal-directory
+// arm on the identical tree -> 3 entries / change event fired.
+//
+// Do not reintroduce '*' or '**' here. getWatchRoots() is asserted glob-free by
+// the unit test, and the integration test drives the real chokidar end to end.
 // ---------------------------------------------------------------------------
 
-function getWatchPaths(): string[] {
-  const paths: string[] = [];
-  const orgs = getOrgs();
+export function getWatchRoots(): string[] {
+  const roots: string[] = [];
 
-  for (const org of orgs) {
+  for (const org of getOrgs()) {
     const orgBase = path.join(CTX_ROOT, 'orgs', org);
-    paths.push(path.join(orgBase, 'tasks', '**', '*.json'));
-    paths.push(path.join(orgBase, 'approvals', '**', '*.json'));
-    paths.push(path.join(orgBase, 'analytics', 'events', '**', '*.jsonl'));
+    roots.push(path.join(orgBase, 'tasks'));
+    roots.push(path.join(orgBase, 'approvals'));
+    roots.push(path.join(orgBase, 'analytics', 'events'));
   }
 
-  // Flat paths (not org-scoped)
-  paths.push(path.join(CTX_ROOT, 'state', '*', 'heartbeat.json'));
-  paths.push(path.join(CTX_ROOT, 'inbox', '**', '*.json'));
+  // Flat roots (not org-scoped)
+  roots.push(path.join(CTX_ROOT, 'state'));
+  roots.push(path.join(CTX_ROOT, 'inbox'));
 
-  return paths;
+  return roots;
+}
+
+// Directories that sit under a watch root, churn constantly, and hold nothing
+// we ingest. state/<agent>/claude-config alone is 22372 of the 22765 entries
+// under state/ — watching it would cost a recursive watch on the whole agent
+// config tree and fire handleFileChange on every Claude session write.
+const PRUNED_DIRS = new Set(['claude-config', 'node_modules', '.git']);
+
+export function isPruned(filePath: string): boolean {
+  return filePath.split(path.sep).some((seg) => PRUNED_DIRS.has(seg));
+}
+
+// Which files under a watch root are worth acting on. Mirrors the branches in
+// syncFile(), plus inbox/*.json, which is SSE-only (syncFile has no inbox case).
+export function isRelevant(filePath: string): boolean {
+  if (filePath.includes('/analytics/events/')) return filePath.endsWith('.jsonl');
+  if (filePath.includes('/state/')) return filePath.endsWith('heartbeat.json');
+  return filePath.endsWith('.json');
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +94,8 @@ function handleFileChange(
   filePath: string,
   changeType: 'change' | 'add' | 'remove',
 ): void {
+  if (!isRelevant(filePath)) return;
+
   console.log(`[watcher] ${changeType}: ${filePath}`);
 
   // Sync the changed file to SQLite (skip for deletions)
@@ -89,17 +122,34 @@ function handleFileChange(
 // ---------------------------------------------------------------------------
 
 function createWatcher(): FSWatcher {
-  const watchPaths = getWatchPaths();
+  const roots = getWatchRoots();
 
-  if (watchPaths.length === 0) {
-    console.warn(
-      '[watcher] No paths to watch - CTX_ROOT may not have any orgs yet',
+  // A watch root that does not exist is accepted silently by chokidar and
+  // ingests nothing forever. That silence is the whole bug this file had, so
+  // report it — but do not throw: a fresh install legitimately has no inbox/
+  // yet, and taking the dashboard down over one absent directory is worse than
+  // running degraded and saying so.
+  const present: string[] = [];
+  for (const root of roots) {
+    if (fs.existsSync(root)) {
+      present.push(root);
+    } else {
+      console.error(
+        `[watcher] watch root does not exist, nothing will be ingested from it: ${root}`,
+      );
+    }
+  }
+
+  if (present.length === 0) {
+    console.error(
+      `[watcher] NO watch roots exist under ${CTX_ROOT} — ingestion is dead on arrival`,
     );
   }
 
-  const watcher = watch(watchPaths, {
+  const watcher = watch(present, {
     ignoreInitial: true,
     persistent: true,
+    ignored: (p: string) => isPruned(p),
     awaitWriteFinish: {
       stabilityThreshold: 300,
       pollInterval: 100,
@@ -111,9 +161,28 @@ function createWatcher(): FSWatcher {
   watcher.on('unlink', (fp) => handleFileChange(fp, 'remove'));
   watcher.on('error', (error) => console.error('[watcher] Error:', error));
 
-  console.log(
-    `[watcher] Watching ${watchPaths.length} patterns under ${CTX_ROOT}`,
-  );
+  // Report what chokidar RESOLVED, not what we handed it.
+  //
+  // The old line logged "Watching 8 patterns" — a count of its own argument. It
+  // read healthy while chokidar had resolved those 8 patterns to nothing at
+  // all. A health signal derived from your own input can only tell you what you
+  // asked for, so count the watched set instead and shout when it is empty.
+  watcher.on('ready', () => {
+    const watched = watcher.getWatched();
+    const dirs = Object.keys(watched).length;
+    const entries = Object.values(watched).reduce((n, v) => n + v.length, 0);
+
+    if (entries === 0) {
+      console.error(
+        `[watcher] ready but watching ZERO entries under ${CTX_ROOT} — ingestion is dead`,
+      );
+    } else {
+      console.log(
+        `[watcher] ready — watching ${entries} entries across ${dirs} directories (${present.length} roots)`,
+      );
+    }
+  });
+
   return watcher;
 }
 
@@ -135,9 +204,21 @@ export function initWatcher(): FSWatcher {
 
   const watcher = createWatcher();
 
-  if (process.env.NODE_ENV !== 'production') {
-    globalForWatcher.__cortextos_watcher = watcher;
-  }
+  // Store the singleton UNCONDITIONALLY, production included.
+  //
+  // This was previously guarded by `NODE_ENV !== 'production'`, copying the
+  // hot-reload pattern used for the emitter above. That guard is correct for
+  // module-level state (the emitter is a module const, so production retains it
+  // anyway) but WRONG here: the watcher is function-local, so with nothing
+  // storing it the early-return guard never fired, every call built a new
+  // watcher and ran another full sync, and no reference outlived the request.
+  //
+  // initWatcher's only caller was the SSE route, so in production the dashboard
+  // ingested ONLY while a browser held an open SSE connection — it was not a
+  // monitoring system, it was a live view that recorded only while watched.
+  // Measured: the DB sat frozen for 37 hours while the process was online,
+  // serving, and green.
+  globalForWatcher.__cortextos_watcher = watcher;
 
   return watcher;
 }

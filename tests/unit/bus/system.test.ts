@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../../../src/bus/system';
-import type { BusPaths } from '../../../src/types';
+import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, postActivity } from '../../../src/bus/system';
+import type { BusPaths, Task } from '../../../src/types';
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
   return {
@@ -114,6 +114,31 @@ describe('Bus System', () => {
       const report = autoCommit(gitDir, true);
       expect(report.blocked.some(b => b.includes('config.json') && b.includes('credential'))).toBe(true);
       expect(report.staged).toContain('readme.md');
+    });
+
+    // 2026-07-15 (analyst root-cause): the pre-fix sk- branch was a bare
+    // substring match, so prose merely DOCUMENTING a token format (no real
+    // secret value) tripped it — e.g. CLAUDE.md's "Setup-tokens (sk-ant-oat01)
+    // lack the user:profile scope" blocked the daily auto-commit for a week.
+    it('does NOT false-positive on prose documenting a token FORMAT, not a real value (regression guard)', () => {
+      writeFileSync(
+        join(gitDir, 'CLAUDE.md'),
+        '- Setup-tokens (`sk-ant-oat01`) lack the `user:profile` scope, so preflight 403s with them.',
+      );
+
+      const report = autoCommit(gitDir, true);
+      expect(report.staged).toContain('CLAUDE.md');
+      expect(report.blocked.some(b => b.includes('CLAUDE.md'))).toBe(false);
+    });
+
+    it('STILL blocks a real sk- shaped token — the false-positive fix must not weaken real leak detection', () => {
+      writeFileSync(
+        join(gitDir, 'oops.json'),
+        '{"key":"sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-ABCDEF"}',
+      );
+
+      const report = autoCommit(gitDir, true);
+      expect(report.blocked.some(b => b.includes('oops.json') && b.includes('credential'))).toBe(true);
     });
 
     it('allows script files even with credential-like patterns', () => {
@@ -237,6 +262,47 @@ describe('Bus System', () => {
       expect(report.agents[0].stale).toBe(true);
     });
 
+    // goals.json actually writes the timestamp with a trailing "(by <agent>)"
+    // attribution suffix (e.g. "2026-07-28T12:03:06Z (by boss)") — Date()
+    // returns Invalid Date for that whole string, which previously fell
+    // through to 'parse_error'/stale=true fleet-wide even for goals updated
+    // minutes ago. Pins the fix: the suffix must be stripped before parsing.
+    it('parses a timestamp with the "(by <agent>)" attribution suffix goals.json writes (fresh)', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const recentDate = new Date().toISOString();
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${recentDate} (by boss)\n\nSome goal`);
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('fresh');
+      expect(report.agents[0].stale).toBe(false);
+    });
+
+    it('parses a timestamp with the "(by <agent>)" attribution suffix goals.json writes (stale)', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const oldDate = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${oldDate} (by boss)\n\nSome goal`);
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('stale');
+      expect(report.agents[0].stale).toBe(true);
+    });
+
+    it('still parses a bare ISO timestamp with no attribution suffix (no regression)', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const recentDate = new Date().toISOString();
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${recentDate}\n\nSome goal`);
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('fresh');
+      expect(report.agents[0].stale).toBe(false);
+    });
+
     it('returns empty report when no orgs directory', () => {
       const report = checkGoalStaleness(testDir);
       expect(report.summary.total).toBe(0);
@@ -244,9 +310,12 @@ describe('Bus System', () => {
     });
 
     it('scans multiple orgs and agents', () => {
-      // Create two orgs with agents
-      for (const org of ['org1', 'org2']) {
-        const agentDir = join(testDir, 'orgs', org, 'agents', 'bot');
+      // Create two orgs, each with a distinctly-named agent. Agent names are
+      // assumed unique fleet-wide (discoverAllAgents/list-agents key on bare
+      // name across orgs) — same-bare-name-in-different-orgs is a separate,
+      // pre-existing edge case, not what this test is exercising.
+      for (const [org, name] of [['org1', 'bot1'], ['org2', 'bot2']]) {
+        const agentDir = join(testDir, 'orgs', org, 'agents', name);
         mkdirSync(agentDir, { recursive: true });
         const date = new Date().toISOString();
         writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${date}\n`);
@@ -254,6 +323,21 @@ describe('Bus System', () => {
 
       const report = checkGoalStaleness(testDir);
       expect(report.summary.total).toBe(2);
+    });
+
+    it('covers namespaced personal agents, not just shared org agents', () => {
+      // task_1785723303692: the bug this whole fix closes — a personal agent
+      // under orgs/<org>/engineers/<eng>/agents/<name> used to be silently
+      // invisible to this scan entirely.
+      const agentDir = join(testDir, 'orgs', 'myorg', 'engineers', 'aaron', 'agents', 'sidekick');
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${new Date().toISOString()}\n`);
+
+      const report = checkGoalStaleness(testDir);
+      expect(report.summary.total).toBe(1);
+      expect(report.agents[0].agent).toBe('aaron/sidekick');
+      expect(report.agents[0].org).toBe('myorg');
+      expect(report.agents[0].stale).toBe(false);
     });
   });
 
@@ -284,6 +368,314 @@ describe('Bus System', () => {
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
+    });
+  });
+
+  describe('checkStaleBlockers', () => {
+    function writeTask(org: string, task: Partial<Task> & Pick<Task, 'id' | 'title' | 'status'>) {
+      const taskDir = join(testDir, 'orgs', org, 'tasks');
+      mkdirSync(taskDir, { recursive: true });
+      const full: Task = {
+        description: '',
+        type: 'agent',
+        needs_approval: false,
+        assigned_to: 'worker',
+        created_by: 'worker',
+        org,
+        priority: 'normal',
+        project: '',
+        kpi_key: null,
+        created_at: '2026-08-01T00:00:00Z',
+        updated_at: '2026-08-01T00:00:00Z',
+        completed_at: null,
+        due_date: null,
+        archived: false,
+        ...task,
+      };
+      writeFileSync(join(taskDir, `${task.id}.json`), JSON.stringify(full));
+    }
+
+    it('flags a blocked task whose blocked_by dependency is already completed', () => {
+      writeTask('myorg', { id: 'task_dep', title: 'dependency', status: 'completed' });
+      writeTask('myorg', {
+        id: 'task_blocked',
+        title: 'waiting on dep',
+        status: 'blocked',
+        blocked_by: ['task_dep'],
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.summary.scanned).toBe(1);
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0]).toMatchObject({
+        task_id: 'task_blocked',
+        org: 'myorg',
+        kind: 'resolved_dependency',
+      });
+    });
+
+    it('does not flag a blocked task whose dependency is still open', () => {
+      writeTask('myorg', { id: 'task_dep', title: 'dependency', status: 'in_progress' });
+      writeTask('myorg', {
+        id: 'task_blocked',
+        title: 'waiting on dep',
+        status: 'blocked',
+        blocked_by: ['task_dep'],
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('flags a blocked task mentioning a bare PR reference as unverified_external_ref', () => {
+      writeTask('myorg', {
+        id: 'task_pr',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'blocked on PR#67 merging',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0]).toMatchObject({
+        task_id: 'task_pr',
+        kind: 'unverified_external_ref',
+      });
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    // task_1786548092193 (analyst/forge, 2026-08-12 first live run): the
+    // sweep matched "PR #306" in "...same shape as the action1 precedent,
+    // PR #306..." as if it were the blocker, when it's a precedent-citation
+    // example — PR #306 predated the task by weeks and never touched the
+    // task's actual subject. This exact scenario, reproduced.
+    it('does not flag a PR mention that is a precedent-citation example, not a blocker', () => {
+      writeTask('myorg', {
+        id: 'task_precedent',
+        title: 'Gateway vendor-parity decision: mimecast + scalepad',
+        status: 'blocked',
+        description: 'Needs a business-scope call — same shape as the action1 precedent, PR #306.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('still flags a genuine blocking PR mention even when a precedent citation appears earlier in the same description', () => {
+      writeTask('myorg', {
+        id: 'task_mixed',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'Same shape as the action1 precedent, PR #306. This one is actually blocked on PR#67 merging.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+      expect(report.entries[0].detail).not.toContain('PR #306');
+    });
+
+    it('does not flag other precedent-citation phrasings ("see PR #NN for the pattern", "e.g.", "prior art")', () => {
+      writeTask('org-a', {
+        id: 'task_see_pattern',
+        title: 'wire the new vendor',
+        status: 'blocked',
+        description: 'Follow the existing rollout — see PR #12 for the pattern.',
+      });
+      writeTask('org-a', {
+        id: 'task_eg',
+        title: 'add the config flag',
+        status: 'blocked',
+        description: 'Gate it behind a flag (e.g. PR #45) rather than hardcoding.',
+      });
+      writeTask('org-a', {
+        id: 'task_prior_art',
+        title: 'draft the design doc',
+        status: 'blocked',
+        description: 'Prior art: PR #99 covers a similar migration.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('does not flag a blocked task with no dependency signal at all', () => {
+      writeTask('myorg', {
+        id: 'task_plain',
+        title: 'held for Aaron',
+        status: 'blocked',
+        description: 'waiting on a human decision',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('scans every org, not just one', () => {
+      writeTask('org-a', { id: 'task_dep_a', title: 'dep', status: 'completed' });
+      writeTask('org-a', {
+        id: 'task_blocked_a',
+        title: 'waiting',
+        status: 'blocked',
+        blocked_by: ['task_dep_a'],
+      });
+      writeTask('org-b', {
+        id: 'task_blocked_b',
+        title: 'waiting',
+        status: 'blocked',
+        description: 'blocked on PR #12',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.summary.scanned).toBe(2);
+      const orgs = report.entries.map(e => e.org).sort();
+      expect(orgs).toEqual(['org-a', 'org-b']);
+    });
+
+    it('returns an empty report when there are no orgs yet', () => {
+      const report = checkStaleBlockers(testDir);
+      expect(report.summary.scanned).toBe(0);
+      expect(report.entries).toHaveLength(0);
+    });
+  });
+
+  describe('checkDeployDrift', () => {
+    let fixtureDir: string;
+    let originDir: string;
+    let localDir: string;
+
+    function sh(cmd: string, cwd: string): string {
+      return execSync(cmd, { cwd, encoding: 'utf-8', stdio: 'pipe' }).trim();
+    }
+
+    function writeManifest(sha: string, dirty: boolean = false) {
+      writeFileSync(
+        join(localDir, 'dist', 'build-manifest.json'),
+        JSON.stringify({ gitSha: sha, dirty, builtAt: '2026-08-11T00:00:00.000Z' }),
+      );
+    }
+
+    beforeEach(() => {
+      fixtureDir = mkdtempSync(join(tmpdir(), 'cortextos-deploy-drift-'));
+      originDir = join(fixtureDir, 'origin');
+      localDir = join(fixtureDir, 'local');
+
+      mkdirSync(originDir, { recursive: true });
+      // -b main explicitly: the host's init.defaultBranch decides the bare
+      // repo's HEAD otherwise, and on a `master` default the clones below end
+      // up on an unborn `master` while these fixtures push/read `main`.
+      sh('git init --bare -q -b main .', originDir);
+
+      sh(`git clone -q ${originDir} local`, fixtureDir);
+      sh('git config user.email test@test.com', localDir);
+      sh('git config user.name Test', localDir);
+      writeFileSync(join(localDir, 'file.txt'), 'a');
+      sh('git add file.txt && git commit -q -m init', localDir);
+      sh('git push -q origin HEAD:main', localDir);
+      mkdirSync(join(localDir, 'dist'), { recursive: true });
+    });
+
+    afterEach(() => {
+      rmSync(fixtureDir, { recursive: true, force: true });
+    });
+
+    it('reports clean when local HEAD matches origin/main and dist/ matches HEAD', () => {
+      const head = sh('git rev-parse HEAD', localDir);
+      writeManifest(head);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('clean');
+      expect(report.pull_drift?.behind).toBe(false);
+      expect(report.build_drift?.stale).toBe(false);
+    });
+
+    it('reports pull drift when origin/main has commits local has not fetched', () => {
+      const head = sh('git rev-parse HEAD', localDir);
+      writeManifest(head);
+
+      // Simulate another agent merging a PR: a second clone pushes ahead.
+      const otherDir = join(fixtureDir, 'other');
+      sh(`git clone -q -b main ${originDir} other`, fixtureDir);
+      sh('git config user.email test@test.com', otherDir);
+      sh('git config user.name Other', otherDir);
+      writeFileSync(join(otherDir, 'file2.txt'), 'b');
+      sh('git add file2.txt && git commit -q -m second', otherDir);
+      sh('git push -q origin HEAD:main', otherDir);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.pull_drift?.behind).toBe(true);
+      expect(report.pull_drift?.commits_behind).toBe(1);
+      expect(report.pull_drift?.commit_summaries).toHaveLength(1);
+      expect(report.pull_drift?.commit_summaries[0]).toContain('second');
+      // build_drift stays clean — dist/ still matches the (unchanged) local HEAD.
+      expect(report.build_drift?.stale).toBe(false);
+    });
+
+    it('reports build drift when dist/build-manifest.json gitSha does not match local HEAD', () => {
+      writeManifest('0000000000000000000000000000000000dead');
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.pull_drift?.behind).toBe(false);
+      expect(report.build_drift?.stale).toBe(true);
+      expect(report.build_drift?.reason).toMatch(/different commit/);
+    });
+
+    // 2026-08-11 fleet-CLI incident: a build from a dirty tree stamps the
+    // same gitSha as a clean build at that commit — sha-match alone can't
+    // tell them apart, so `dirty` must be checked independently.
+    it('reports build drift when dist/ was built from a dirty tree, even though gitSha matches HEAD', () => {
+      const head = sh('git rev-parse HEAD', localDir);
+      writeManifest(head, true);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.pull_drift?.behind).toBe(false);
+      expect(report.build_drift?.stale).toBe(true);
+      expect(report.build_drift?.built_dirty).toBe(true);
+      expect(report.build_drift?.reason).toMatch(/dirty working tree/);
+    });
+
+    it('reports build drift when dist/build-manifest.json is missing', () => {
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.build_drift?.stale).toBe(true);
+      expect(report.build_drift?.built_sha).toBeNull();
+      expect(report.build_drift?.reason).toMatch(/not found/);
+    });
+
+    it('returns status error when the path is not a git repository', () => {
+      const nonGitDir = join(fixtureDir, 'not-a-repo');
+      mkdirSync(nonGitDir, { recursive: true });
+
+      const report = checkDeployDrift(nonGitDir);
+
+      expect(report.status).toBe('error');
+      expect(report.error).toMatch(/not a git repository/);
+    });
+
+    it('returns status error when there is no origin remote configured', () => {
+      sh('git remote remove origin', localDir);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('error');
+      expect(report.error).toMatch(/no origin remote/);
     });
   });
 });

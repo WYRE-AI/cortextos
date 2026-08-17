@@ -24,7 +24,7 @@ See AGENTS.md for the full 13-step session start checklist. Key steps:
 3. Read org knowledge base: `../../knowledge.md`
 4. Discover available skills: `cortextos bus list-skills --format text`
 5. Discover active agents: `cortextos bus list-agents`
-6. **Crons are daemon-managed.** External crons auto-load from `${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json` on daemon start; you do not need to restore them. Use `cortextos bus list-crons $CTX_AGENT_NAME` to confirm. Do NOT use `CronCreate` or `/loop` — those are session-only and won't survive restarts.
+6. **Crons are daemon-managed.** External crons auto-load from `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/crons.json` on daemon start; you do not need to restore them. Use `cortextos bus list-crons $CTX_AGENT_NAME` to confirm. Do NOT use `CronCreate` or `/loop` — those are session-only and won't survive restarts.
 7. Check today's memory file for in-progress work
 8. If resuming a task, query KB: `cortextos bus kb-query "<task topic>" --org $CTX_ORG`
 9. Check inbox: `cortextos bus check-inbox`
@@ -111,7 +111,7 @@ Always include `msg_id` as reply_to (auto-ACKs the original). Un-ACK'd messages 
 
 ## Crons
 
-External crons are daemon-managed and live in `${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json`. The daemon scheduler owns dispatch — you do not register or restore crons in-session.
+External crons are daemon-managed and live in `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/crons.json`. The daemon scheduler owns dispatch — you do not register or restore crons in-session.
 
 **View:** `cortextos bus list-crons $CTX_AGENT_NAME`
 **Add:** `cortextos bus add-cron $CTX_AGENT_NAME <name> <interval-or-cron-expr> <prompt>`
@@ -168,10 +168,27 @@ Sessions auto-restart with `--continue` every ~71 hours. On context exhaustion, 
 ### Logs
 | Log | Path |
 |-----|------|
-| Activity | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/activity.log` |
-| Fast-checker | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/fast-checker.log` |
-| Stdout | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/stdout.log` |
-| Stderr | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/stderr.log` |
+| Session output | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/stdout.log` |
+| Crashes | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/crashes.log` |
+| Restarts | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/restarts.log` |
+| Hooks | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/hooks.log` |
+| Telegram in/out | `~/.cortextos/$CTX_INSTANCE_ID/logs/$CTX_AGENT_NAME/{inbound,outbound}-messages.jsonl` |
+| Events (Activity feed) | `~/.cortextos/$CTX_INSTANCE_ID/orgs/$CTX_ORG/analytics/events/$CTX_AGENT_NAME/YYYY-MM-DD.jsonl` |
+| Daemon + fast-checker | `~/.pm2/logs/cortextos-daemon-out.log`, `-error.log` |
+
+**There is no `stderr.log`.** Agents run under a PTY, which merges stderr into
+stdout by design — one stream, one file. Likewise there is no `activity.log`
+(the Activity feed is the events JSONL above, org-scoped and one file per day)
+and no `fast-checker.log` (the fast-checker runs inside the daemon and has no
+log file of its own).
+
+`stdout.log` rotates to `stdout.log.1`. The Telegram JSONLs exist **only for
+Telegram-enabled agents** — a bus-only agent has neither, and their absence is
+not a fault.
+
+Verify a path exists before concluding anything from its silence: a `tail` or
+`grep --include` against a file that was never created returns empty, and an
+empty result is indistinguishable from a genuine "nothing to report".
 
 ### State
 | File | Purpose |

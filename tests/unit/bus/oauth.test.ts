@@ -45,6 +45,7 @@ const {
   checkUsageApi,
   refreshOAuthToken,
   rotateOAuth,
+  setActiveAccount,
   isSetupToken,
   checkSetupTokenLiveness,
   resolveClaudeBinary,
@@ -655,5 +656,68 @@ describe('alert thresholds', () => {
   });
   it('ALERT_7D is 0.70', () => {
     expect(ALERT_7D).toBe(0.70);
+  });
+});
+
+describe('disabled account flag — retired seats are never selected', () => {
+  const frameworkRoot = '/tmp/fw';
+
+  it('a disabled account is never selected even when it is the only alternative — and never reaches preflight', async () => {
+    const store = {
+      ...SAMPLE_STORE,
+      accounts: {
+        primary: { ...SAMPLE_STORE.accounts.primary, five_hour_utilization: 0.90 },
+        secondary: { ...SAMPLE_STORE.accounts.secondary, disabled: true },
+      },
+    };
+    writeStore(store);
+
+    const result = await rotateOAuth(tmpDir, frameworkRoot, 'acme');
+
+    expect(result.rotated).toBe(false);
+    expect(result.reason).toContain('No alternate accounts available');
+    // The disabled account must be filtered BEFORE preflight — a cancelled
+    // seat passes the liveness ping, so reaching preflight at all is the bug.
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(loadAccounts(tmpDir)!.active).toBe('primary');
+  });
+
+  it('a disabled account with the LOWEST utilization is skipped in favor of an enabled one', async () => {
+    const store = {
+      ...SAMPLE_STORE,
+      accounts: {
+        primary: { ...SAMPLE_STORE.accounts.primary, five_hour_utilization: 0.90 },
+        // Would sort FIRST (0.0 utilization) if the filter did not exclude it.
+        dead: { ...SAMPLE_STORE.accounts.secondary, label: 'Cancelled Seat', disabled: true, five_hour_utilization: 0.0, seven_day_utilization: 0.0 },
+        tertiary: { ...SAMPLE_STORE.accounts.secondary, label: 'Healthy Alt', five_hour_utilization: 0.2 },
+      },
+    };
+    writeStore(store);
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 0.2, seven_day_utilization: 0.05 }),
+    });
+
+    const result = await rotateOAuth(tmpDir, frameworkRoot, 'acme');
+
+    expect(result.rotated).toBe(true);
+    expect(result.to).toBe('tertiary');
+    expect(loadAccounts(tmpDir)!.active).toBe('tertiary');
+  });
+
+  it('setActiveAccount refuses to activate a disabled account', () => {
+    const store = {
+      ...SAMPLE_STORE,
+      accounts: {
+        primary: SAMPLE_STORE.accounts.primary,
+        secondary: { ...SAMPLE_STORE.accounts.secondary, disabled: true },
+      },
+    };
+    writeStore(store);
+
+    expect(() =>
+      setActiveAccount(tmpDir, 'secondary', { reason: 'operator switch', from: 'primary' }),
+    ).toThrow(/disabled/);
+    expect(loadAccounts(tmpDir)!.active).toBe('primary');
   });
 });

@@ -7,8 +7,10 @@ import {
   runExperiment,
   evaluateExperiment,
   listExperiments,
+  listAllExperiments,
   gatherContext,
   manageCycle,
+  validateExperimentBaseline,
 } from '../src/bus/experiment.js';
 
 describe('Sprint 3: Experiment Framework', () => {
@@ -40,7 +42,7 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(exp.metric).toBe('engagement_rate');
       expect(exp.hypothesis).toBe('Shorter posts get more likes');
       expect(exp.status).toBe('proposed');
-      expect(exp.baseline_value).toBe(0);
+      expect(exp.baseline_value).toBeNull();
       expect(exp.result_value).toBeNull();
       expect(exp.decision).toBeNull();
       expect(exp.direction).toBe('higher');
@@ -181,6 +183,32 @@ describe('Sprint 3: Experiment Framework', () => {
       const exp = JSON.parse(readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim());
       expect(exp.kind).toBe('snapshot');
     });
+
+    it('accepts an explicit baseline value', () => {
+      const id = createExperiment(testDir, 'testbot', 'engagement_rate', 'test', { baseline: 12.5 });
+      const exp = JSON.parse(readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim());
+      expect(exp.baseline_value).toBe(12.5);
+    });
+
+    it('defaults baseline to null (not 0) when --baseline is omitted', () => {
+      const id = createExperiment(testDir, 'testbot', 'engagement_rate', 'test');
+      const exp = JSON.parse(readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim());
+      expect(exp.baseline_value).toBeNull();
+    });
+  });
+
+  describe('validateExperimentBaseline (create-experiment CLI guard)', () => {
+    it('throws when --baseline was omitted (raw undefined)', () => {
+      expect(() => validateExperimentBaseline(undefined)).toThrow('no --baseline given');
+    });
+
+    it('accepts an explicit "0" so a genuine from-zero baseline is not mistaken for an omission', () => {
+      expect(() => validateExperimentBaseline('0')).not.toThrow();
+    });
+
+    it('accepts any other explicit numeric string', () => {
+      expect(() => validateExperimentBaseline('12.5')).not.toThrow();
+    });
   });
 
   describe('runExperiment', () => {
@@ -208,9 +236,16 @@ describe('Sprint 3: Experiment Framework', () => {
   });
 
   describe('evaluateExperiment', () => {
+    it('refuses to evaluate an experiment created without --baseline', () => {
+      const id = createExperiment(testDir, 'testbot', 'engagement', 'No baseline set');
+      runExperiment(testDir, id);
+      expect(() => evaluateExperiment(testDir, id, 42)).toThrow('no baseline_value');
+    });
+
     it('keeps when higher is better and measured > baseline', () => {
       const id = createExperiment(testDir, 'testbot', 'engagement', 'More emojis', {
         direction: 'higher',
+        baseline: 0,
       });
       runExperiment(testDir, id);
       const result = evaluateExperiment(testDir, id, 42, { learning: 'Emojis work' });
@@ -242,9 +277,9 @@ describe('Sprint 3: Experiment Framework', () => {
     });
 
     it('discards when measured < baseline (direction=higher)', () => {
-      const id = createExperiment(testDir, 'testbot', 'engagement', 'Remove images');
-      // Manually set a higher baseline by creating, running, evaluating once
-      // then creating a new experiment
+      const id = createExperiment(testDir, 'testbot', 'engagement', 'Remove images', {
+        baseline: 0,
+      });
       runExperiment(testDir, id);
 
       // Measured 0 vs baseline 0 should discard (not strictly greater)
@@ -256,6 +291,7 @@ describe('Sprint 3: Experiment Framework', () => {
     it('keeps when lower is better and measured < baseline', () => {
       const id = createExperiment(testDir, 'testbot', 'bounce_rate', 'Simplify nav', {
         direction: 'lower',
+        baseline: 0,
       });
       runExperiment(testDir, id);
       // baseline is 0, measured -5 is lower -> keep
@@ -266,6 +302,114 @@ describe('Sprint 3: Experiment Framework', () => {
     it('throws if experiment is not running', () => {
       const id = createExperiment(testDir, 'testbot', 'ctr', 'test');
       expect(() => evaluateExperiment(testDir, id, 10)).toThrow("expected 'running'");
+    });
+
+    describe('--score (qualitative metrics)', () => {
+      it('keeps result_value as the raw measuredValue passed, even when score is given (task_1786464752094)', () => {
+        const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {
+          direction: 'higher',
+          baseline: 5,
+        });
+        runExperiment(testDir, id);
+        // Placeholder measuredValue (0) + a real qualitative score (7).
+        const result = evaluateExperiment(testDir, id, 0, { score: 7 });
+
+        expect(result.result_value).toBe(0); // NOT overwritten by the score
+        expect(result.score).toBe(7); // independent field
+      });
+
+      it('decides keep/discard using score, not the placeholder measuredValue', () => {
+        const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {
+          direction: 'higher',
+          baseline: 5,
+        });
+        runExperiment(testDir, id);
+        // measuredValue (0) alone would discard (0 < 5); score (7) should keep (7 > 5).
+        const result = evaluateExperiment(testDir, id, 0, { score: 7 });
+
+        expect(result.decision).toBe('keep');
+        expect(result.baseline_value).toBe(7); // next eval's baseline is the score, not the placeholder
+      });
+
+      it('score is null when not given, on both a scored-metric and a plain-metric evaluation', () => {
+        const id = createExperiment(testDir, 'testbot', 'ctr', 'test', { baseline: 0 });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 42);
+
+        expect(result.score).toBeNull();
+        expect(result.result_value).toBe(42);
+      });
+
+      it('results.tsv records measured_value and score as independent columns, score TRAILING (not inserted mid-row)', () => {
+        const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {
+          direction: 'higher',
+          baseline: 5,
+        });
+        runExperiment(testDir, id);
+        evaluateExperiment(testDir, id, 0, { score: 7 });
+
+        const tsvPath = join(testDir, 'experiments', 'results.tsv');
+        const lines = readFileSync(tsvPath, 'utf-8').split('\n').filter(Boolean);
+        expect(lines[0]).toBe('experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\tscore');
+        const cols = lines[1].split('\t');
+        expect(cols[3]).toBe('0'); // measured_value: the raw placeholder
+        expect(cols[4]).toBe('7'); // baseline: the effective (score-driven) value on keep
+        expect(cols[8]).toBe('7'); // score: independent, trailing column
+      });
+
+      it('results.tsv leaves the score column empty for a plain (unscored) evaluation', () => {
+        const id = createExperiment(testDir, 'testbot', 'ctr', 'test', { baseline: 0 });
+        runExperiment(testDir, id);
+        evaluateExperiment(testDir, id, 42);
+
+        const tsvPath = join(testDir, 'experiments', 'results.tsv');
+        const lines = readFileSync(tsvPath, 'utf-8').split('\n').filter(Boolean);
+        const cols = lines[1].split('\t');
+        expect(cols[3]).toBe('42');
+        expect(cols[8]).toBe('');
+      });
+
+      it('a scored row appended to a PRE-EXISTING 8-column results.tsv stays aligned with the old header (cortextos#90 review finding)', () => {
+        const expDir = join(testDir, 'experiments');
+        const tsvPath = join(expDir, 'results.tsv');
+        // Seed a results.tsv exactly as it looked before `score` existed —
+        // 8 columns, no score column at all (e.g. walter's own live
+        // theta-wave file). A mid-row insert of `score` would shift every
+        // column after it out of alignment with this header.
+        writeFileSync(
+          tsvPath,
+          'experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\n' +
+            'exp_old_1\ttestbot\tctr\t10\t5\tkeep\told hypothesis\t2026-05-01T00:00:00.000Z\n',
+          'utf-8',
+        );
+
+        const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {
+          direction: 'higher',
+          baseline: 5,
+        });
+        runExperiment(testDir, id);
+        evaluateExperiment(testDir, id, 0, { score: 7 });
+
+        const lines = readFileSync(tsvPath, 'utf-8').split('\n').filter(Boolean);
+        expect(lines).toHaveLength(3); // header + pre-existing row + new row
+        expect(lines[0]).toBe(
+          'experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp',
+        ); // untouched — still the OLD 8-column header, never rewritten
+        expect(lines[1]).toBe(
+          'exp_old_1\ttestbot\tctr\t10\t5\tkeep\told hypothesis\t2026-05-01T00:00:00.000Z',
+        ); // untouched
+        const newCols = lines[2].split('\t');
+        // First 8 columns line up exactly with the old header's positions —
+        // score is a 9th, trailing column any positional reader of the old
+        // 8-column shape simply never sees.
+        expect(newCols).toHaveLength(9);
+        expect(newCols[0]).toBe(id);
+        expect(newCols[3]).toBe('0'); // measured_value
+        expect(newCols[4]).toBe('7'); // baseline (effective value on keep)
+        expect(newCols[5]).toBe('keep'); // decision
+        expect(newCols[6]).toBe('Warmer replies'); // hypothesis
+        expect(newCols[8]).toBe('7'); // score, trailing
+      });
     });
   });
 
@@ -323,15 +467,15 @@ describe('Sprint 3: Experiment Framework', () => {
   describe('gatherContext', () => {
     it('calculates keep rate from completed experiments', () => {
       // Create 3 experiments: 2 keep, 1 discard
-      const id1 = createExperiment(testDir, 'testbot', 'engagement', 'h1');
+      const id1 = createExperiment(testDir, 'testbot', 'engagement', 'h1', { baseline: 0 });
       runExperiment(testDir, id1);
       evaluateExperiment(testDir, id1, 10); // keep (10 > 0)
 
-      const id2 = createExperiment(testDir, 'testbot', 'engagement', 'h2');
+      const id2 = createExperiment(testDir, 'testbot', 'engagement', 'h2', { baseline: 0 });
       runExperiment(testDir, id2);
       evaluateExperiment(testDir, id2, 5); // keep (5 > 0)
 
-      const id3 = createExperiment(testDir, 'testbot', 'engagement', 'h3');
+      const id3 = createExperiment(testDir, 'testbot', 'engagement', 'h3', { baseline: 0 });
       runExperiment(testDir, id3);
       evaluateExperiment(testDir, id3, 0); // discard (0 not > 0)
 
@@ -451,6 +595,55 @@ describe('Sprint 3: Experiment Framework', () => {
 
     it('throws when creating without required fields', () => {
       expect(() => manageCycle(testDir, 'create', { name: 'x' })).toThrow('requires');
+    });
+  });
+
+  describe('listAllExperiments (task_1785723303692: fleet-wide, not caller-only)', () => {
+    // Own framework/ctx root, distinct from testDir's flat experiments/history
+    // fixture used by the single-agent tests above.
+    const frameworkRoot = join(tmpdir(), `cortextos-fleet-${Date.now()}`);
+
+    afterEach(() => {
+      try {
+        rmSync(frameworkRoot, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    it('aggregates experiments across every agent, including namespaced personal agents', () => {
+      const sharedDir = join(frameworkRoot, 'orgs', 'wyre', 'agents', 'boss');
+      const personalDir = join(frameworkRoot, 'orgs', 'wyre', 'engineers', 'aaron', 'agents', 'sidekick');
+      mkdirSync(sharedDir, { recursive: true });
+      mkdirSync(personalDir, { recursive: true });
+
+      createExperiment(sharedDir, 'boss', 'engagement_rate', 'Shorter posts get more likes');
+      createExperiment(personalDir, 'aaron/sidekick', 'response_time', 'Caching cuts latency');
+
+      // No ctxRoot / enabled-agents.json needed — pure directory scan.
+      const experiments = listAllExperiments(frameworkRoot, '');
+      expect(experiments).toHaveLength(2);
+      expect(experiments.map(e => e.agent).sort()).toEqual(['aaron/sidekick', 'boss']);
+    });
+
+    it('applies status/metric filters across the whole fleet, not per-agent', () => {
+      const agentA = join(frameworkRoot, 'orgs', 'wyre', 'agents', 'alpha');
+      const agentB = join(frameworkRoot, 'orgs', 'wyre', 'agents', 'beta');
+      mkdirSync(agentA, { recursive: true });
+      mkdirSync(agentB, { recursive: true });
+
+      const idA = createExperiment(agentA, 'alpha', 'ctr', 'hypothesis A');
+      createExperiment(agentB, 'beta', 'ctr', 'hypothesis B');
+      runExperiment(agentA, idA); // moves idA to 'running'; beta's stays 'proposed'
+
+      const running = listAllExperiments(frameworkRoot, '', { status: 'running' });
+      expect(running).toHaveLength(1);
+      expect(running[0].agent).toBe('alpha');
+    });
+
+    it('returns empty, not throws, when frameworkRoot has no orgs directory yet', () => {
+      const emptyRoot = join(tmpdir(), `cortextos-empty-${Date.now()}`);
+      expect(listAllExperiments(emptyRoot, '')).toEqual([]);
     });
   });
 });

@@ -41,7 +41,13 @@ function loadSecretsEnv(frameworkRoot: string, org: string): Record<string, stri
           if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
             val = val.slice(1, -1);
           }
-          vars[trimmed.slice(0, idx)] = val;
+          const key = trimmed.slice(0, idx);
+          // An empty value must never clobber a non-empty one from an earlier
+          // file: a placeholder `GEMINI_API_KEY=` line in the org's secrets.env
+          // silently wiped the real key loaded from the framework .env, killing
+          // every KB ingest fleet-wide. Non-empty values still override normally.
+          if (val === '' && vars[key]) continue;
+          vars[key] = val;
         }
       }
     }

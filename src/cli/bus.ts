@@ -1,25 +1,28 @@
 import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
-import { resolveAgentDir, parseQualifiedName } from '../utils/agent-dir.js';
-import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
+import { homedir } from 'os';
+import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
+import { sendMessage, checkInboxWithStatus, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
-import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
-import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
+import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus/heartbeat.js';
+import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity, broadcastActivityViaBus } from '../bus/system.js';
+import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
-import { nextFireFromCron } from '../daemon/cron-scheduler.js';
+import { nextFireFromCron, computeReferenceMs } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
-import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, setActiveAccount, writeTokenToAgents, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { mintInstallationToken, shouldRefuseInteractivePrint, redactForJson } from '../bus/github-app.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
@@ -42,8 +45,17 @@ function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org:
   let ctx: OrgContext;
   try {
     ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
-  } catch {
-    return null; // cannot read config — allow the transition
+  } catch (err) {
+    // Allowing the transition is defensible — blocking every task in an org on
+    // one corrupt file is worse.  Doing it silently is not: require_deliverables
+    // enforcement turns OFF org-wide with no observable other than the absence
+    // of an error nobody was expecting.
+    console.warn(
+      `[bus] org context ${contextPath} is unreadable or corrupt ` +
+      `(${err instanceof Error ? err.message : String(err)}) — require_deliverables ` +
+      `enforcement is SKIPPED for this transition.`
+    );
+    return null;
   }
 
   if (!ctx.require_deliverables) return null;
@@ -55,7 +67,13 @@ function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org:
   let task: Task;
   try {
     task = JSON.parse(readFileSync(taskFile, 'utf-8'));
-  } catch {
+  } catch (err) {
+    // Same fail-open direction, same reason to be loud about it.
+    console.warn(
+      `[bus] task file ${taskFile} is unreadable or corrupt ` +
+      `(${err instanceof Error ? err.message : String(err)}) — require_deliverables ` +
+      `check SKIPPED for ${taskId}.`
+    );
     return null;
   }
 
@@ -73,10 +91,11 @@ busCommand
   .command('send-message')
   .argument('<to>', 'Target agent')
   .argument('<priority>', 'Message priority (urgent, high, normal, low)')
-  .argument('<text>', 'Message text')
+  .argument('[text]', 'Message text. Omit to read the body from stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical.')
   .argument('[reply-to]', 'Reply to message ID (optional positional form)')
   .option('--reply-to <id>', 'Reply to message ID')
-  .action((to: string, priority: string, text: string, replyToArg: string | undefined, opts: { replyTo?: string }) => {
+  .option('--body-file <path>', 'Read the message body from a file instead of the shell argument or stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical')
+  .action((to: string, priority: string, text: string | undefined, replyToArg: string | undefined, opts: { replyTo?: string; bodyFile?: string }) => {
     // Accept reply-to as either positional arg or --reply-to flag (P2 fix #9)
     const effectiveReplyTo = opts.replyTo ?? replyToArg;
     const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
@@ -84,6 +103,21 @@ busCommand
       console.error(`Invalid priority '${priority}'. Must be one of: ${validPriorities.join(', ')}`);
       process.exit(1);
     }
+    // Fail-closed body resolution (2026-08-15 fleet incidents — see
+    // src/utils/resolve-message-body.ts): --body-file/stdin are the safe
+    // default path; an inline body containing a surviving backtick/$( is
+    // rejected loud rather than sent with silently-substituted holes in it.
+    let resolvedText: string;
+    try {
+      resolvedText = resolveMessageBody({ inlineText: text, bodyFile: opts.bodyFile });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
+    text = resolvedText;
     // Security (H9): Validate agent name (bare or qualified) before any filesystem access.
     // parseQualifiedName accepts both "boss" and "aaron/dev" forms, validating each segment.
     try {
@@ -130,8 +164,15 @@ busCommand
   .action(() => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const messages = checkInbox(paths);
+    const { messages, skipped } = checkInboxWithStatus(paths);
+    // stdout shape is unchanged on purpose — agents and scripts parse this
+    // array. The "we never looked" signal rides stderr + exit code so an
+    // empty result can no longer be mistaken for a verified-empty inbox.
     console.log(JSON.stringify(messages));
+    if (skipped) {
+      console.error('[bus] check-inbox: could not acquire the inbox lock — the inbox was NOT read. The empty result above is not evidence the inbox is empty (stale .lock.d?).');
+      process.exitCode = 1;
+    }
   });
 
 busCommand
@@ -151,18 +192,32 @@ busCommand
   .command('create-task')
   .argument('<title>', 'Task title')
   .option('--desc <description>', 'Task description')
+  .option('--desc-file <path>', 'Read the task description from a file instead of --desc — the safe way to include backticks, $(, or apostrophes byte-identical')
   .option('--assignee <agent>', 'Assigned agent')
   .option('--priority <p>', 'Priority (urgent, high, normal, low)', 'normal')
   .option('--project <name>', 'Project name')
   .option('--needs-approval', 'Require human approval before execution')
   .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
   .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
-  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+  .action((title: string, opts: { desc?: string; descFile?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+    // Fail-closed body resolution (2026-08-15) — same construction that
+    // corrupts a send-message body corrupts --desc: a description is
+    // free text through the identical double-quoted shell argument.
+    let resolvedDesc: string | undefined;
+    try {
+      resolvedDesc = resolveOptionalTextField({ inlineText: opts.desc, bodyFile: opts.descFile, fileFlagName: '--desc-file' });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
     const taskId = createTask(paths, env.agentName, env.org, title, {
-      description: opts.desc,
+      description: resolvedDesc,
       assignee: opts.assignee,
       priority: opts.priority as Priority,
       project: opts.project,
@@ -183,12 +238,20 @@ busCommand
 busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
-  .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
-    const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
-    if (!validStatuses.includes(status as TaskStatus)) {
-      console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
+  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project is given')
+  .option('--assignee <name>', 'Reroute the task to a different agent')
+  .option('--project <name>', 'Change the task\'s project')
+  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string }) => {
+    if (status === undefined && opts.assignee === undefined && opts.project === undefined) {
+      console.error('Nothing to update — pass a status, --assignee, and/or --project');
       process.exit(1);
+    }
+    if (status !== undefined) {
+      const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
+      if (!validStatuses.includes(status as TaskStatus)) {
+        console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
+        process.exit(1);
+      }
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
@@ -205,8 +268,19 @@ busCommand
     }
 
     try {
-      updateTask(paths, id, status as TaskStatus);
-      console.log(`Updated ${id} -> ${status}`);
+      updateTask(paths, id, status as TaskStatus | undefined, { assignee: opts.assignee, project: opts.project });
+      if (status !== undefined && opts.assignee === undefined && opts.project === undefined) {
+        // Preserve the original status-only message verbatim — scripts/
+        // dashboards may already parse it.
+        console.log(`Updated ${id} -> ${status}`);
+      } else {
+        const changes = [
+          status !== undefined ? `status -> ${status}` : null,
+          opts.assignee !== undefined ? `assignee -> ${opts.assignee}` : null,
+          opts.project !== undefined ? `project -> ${opts.project}` : null,
+        ].filter(Boolean);
+        console.log(`Updated ${id}: ${changes.join(', ')}`);
+      }
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
@@ -243,8 +317,14 @@ busCommand
   .action((id: string) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const open = checkTaskDependencies(paths, id);
+    const { open, unresolved } = checkTaskDependenciesWithStatus(paths, id);
     if (open.length === 0) {
+      if (unresolved) {
+        // Do not print "ready to work" off a scan that never completed.
+        console.log(`${id}: dependency state UNKNOWN — a task directory could not be read, so this is NOT an all-clear`);
+        process.exitCode = 1;
+        return;
+      }
       console.log(`${id}: no open dependencies — ready to work`);
       return;
     }
@@ -305,9 +385,23 @@ busCommand
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
   .option('--result <text>', 'Completion result')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string }) => {
+  .option('--result-file <path>', 'Read the completion result from a file instead of the argument/--result — the safe way to include backticks, $(, or apostrophes byte-identical')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; resultFile?: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
-    const effectiveResult = opts.result ?? resultArg;
+    const inlineResult = opts.result ?? resultArg;
+    // Fail-closed body resolution (2026-08-15) — same construction that
+    // corrupts a send-message body corrupts a completion result: free
+    // text through the identical double-quoted shell argument.
+    let effectiveResult: string | undefined;
+    try {
+      effectiveResult = resolveOptionalTextField({ inlineText: inlineResult, bodyFile: opts.resultFile, fileFlagName: '--result-file' });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
@@ -389,7 +483,11 @@ busCommand
     const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
 
     console.log(`\n  Tasks (${tasks.length})\n`);
-    const header = '  Status  Pri  ID                        Assignee         Title';
+    // ID column is 28 chars (current format max: task_<13>_<8> = 27 + 1 headroom);
+    // never substring the id — display must preserve identifier precision so
+    // copy-paste from the table cannot produce a non-existent ID. Same principle
+    // applied to assignee — pad-to-min-width, never truncate.
+    const header = '  Status  Pri  ID                          Assignee         Title';
     const separator = '  ' + '-'.repeat(header.length - 2);
     console.log(header);
     console.log(separator);
@@ -397,8 +495,8 @@ busCommand
     for (const t of tasks) {
       const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
       const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
-      const id = t.id.substring(0, 26).padEnd(26);
-      const assignee = (t.assigned_to || '-').substring(0, 16).padEnd(17);
+      const id = t.id.padEnd(28);
+      const assignee = (t.assigned_to || '-').padEnd(17);
       const title = t.title.substring(0, 50);
       console.log(`  ${statusIcon}${priIcon}${id}${assignee}${title}`);
     }
@@ -496,29 +594,93 @@ busCommand
 
 busCommand
   .command('read-all-heartbeats')
-  .description('Read heartbeat files for all agents in the system')
+  // Scope stated exactly: this reads ONE instance unless --all-instances is passed.
+  // The previous wording, "all agents in the system", overclaimed — `~/.cortextos/`
+  // holds several instances and this saw only the caller's.
+  .description("Fleet heartbeat report for the caller's instance (roster UNION state/ scan). Use --all-instances to sweep every instance.")
   .option('--format <fmt>', 'Output format: json or text', 'text')
-  .action((opts: { format?: string }) => {
+  .option('--all-instances', 'Sweep every instance under ~/.cortextos that has a roster')
+  .action((opts: { format?: string; allInstances?: boolean }) => {
     const env = resolveEnv();
-    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const heartbeats = readAllHeartbeats(paths);
+
+    const instances: string[] = opts.allInstances
+      ? (() => {
+          const base = join(homedir(), '.cortextos');
+          try {
+            return readdirSync(base, { withFileTypes: true })
+              .filter(d => d.isDirectory() && existsSync(join(base, d.name, 'config', 'enabled-agents.json')))
+              .map(d => d.name)
+              .sort();
+          } catch {
+            return [env.instanceId];
+          }
+        })()
+      : [env.instanceId];
+
+    // Each instance's orgs come from ITS OWN roster. Inheriting the caller's org (or
+    // passing none, which scans every org) mixes one instance's agents into another's
+    // report — they surface as "NEVER BEATEN" rows for agents that are not its at all.
+    const orgsOf = (instanceId: string): string[] | undefined => {
+      if (instanceId === env.instanceId && env.org) return [env.org];
+      try {
+        const roster = JSON.parse(readFileSync(
+          join(homedir(), '.cortextos', instanceId, 'config', 'enabled-agents.json'), 'utf-8',
+        )) as Record<string, { org?: string }>;
+        const found = [...new Set(Object.values(roster).map(e => e.org).filter(Boolean))] as string[];
+        return found.length > 0 ? found : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+
+    const report = instances.map(instanceId => ({
+      instance: instanceId,
+      rows: readAllHeartbeatRows(
+        resolvePaths(env.agentName, instanceId, env.org),
+        orgsOf(instanceId),
+      ),
+    }));
 
     if (opts.format === 'json') {
-      console.log(JSON.stringify(heartbeats, null, 2));
+      console.log(JSON.stringify(opts.allInstances ? report : report[0].rows, null, 2));
       return;
     }
 
-    if (heartbeats.length === 0) {
-      console.log('No agents found.');
-      return;
-    }
+    const STALE_MS = 2 * 60 * 60 * 1000;
+    for (const { instance, rows } of report) {
+      if (opts.allInstances) console.log(`\n=== instance: ${instance} ===`);
+      if (rows.length === 0) {
+        console.log('No agents found.');
+        continue;
+      }
 
-    for (const hb of heartbeats) {
-      const stale = new Date(hb.last_heartbeat) < new Date(Date.now() - 2 * 60 * 60 * 1000);
-      const staleFlag = stale ? ' [STALE]' : '';
-      const label = hb.display_name ? `${hb.display_name} (${hb.agent})` : hb.agent;
-      console.log(`${label} (${hb.org}) — ${hb.status}${staleFlag} — last seen ${hb.last_heartbeat}`);
-      if (hb.current_task) console.log(`  task: ${hb.current_task}`);
+      for (const row of rows) {
+        const hb = row.heartbeat;
+        const name = hb?.display_name ? `${hb.display_name} (${row.agent})` : row.agent;
+        const org = row.org ?? '?';
+
+        // The three conditions the old single-axis output could not tell apart.
+        if (row.source === 'roster-only') {
+          console.log(`${name} (${org}) — NEVER BEATEN — no heartbeat file${row.enabled === false ? ' [DISABLED]' : ''}`);
+          continue;
+        }
+        if (row.source === 'state-only') {
+          console.log(`${name} (${org}) — ORPHAN STATE DIR — heartbeat present but no roster entry; not a running agent`);
+          if (row.nameMismatch) console.log(`  ⚠ file claims agent="${row.nameMismatch}" but lives in state/${row.agent}/`);
+          continue;
+        }
+        if (row.unreadable || !hb) {
+          console.log(`${name} (${org}) — UNREADABLE heartbeat.json (this is NOT a pass)`);
+          continue;
+        }
+
+        const stale = new Date(hb.last_heartbeat) < new Date(Date.now() - STALE_MS);
+        // A disabled agent is stale BY DESIGN — never label it as though it died.
+        const flag = row.enabled === false ? ' [DISABLED]' : stale ? ' [STALE]' : '';
+        console.log(`${name} (${org}) — ${hb.status}${flag} — last seen ${hb.last_heartbeat}`);
+        if (row.nameMismatch) console.log(`  ⚠ file claims agent="${row.nameMismatch}" but lives in state/${row.agent}/`);
+        if (hb.current_task) console.log(`  task: ${hb.current_task}`);
+      }
     }
   });
 
@@ -693,13 +855,74 @@ busCommand
   .action((opts: { threshold: string }) => {
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
-    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10));
+    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10), env.ctxRoot);
     console.log(JSON.stringify(report, null, 2));
   });
 
 busCommand
+  .command('check-stale-blockers')
+  .description('Detect blocked tasks whose dependency (task or referenced PR) has already resolved')
+  .option('--format <fmt>', 'Output format: json|text', 'json')
+  .action((opts: { format?: string }) => {
+    const env = resolveEnv();
+    const report = checkStaleBlockers(env.ctxRoot);
+    if (opts.format === 'text') {
+      if (report.entries.length === 0) {
+        console.log(`No stale blockers found (${report.summary.scanned} blocked tasks scanned).`);
+        return;
+      }
+      for (const e of report.entries) {
+        console.log(`[${e.kind}] ${e.task_id} (${e.org}, assigned: ${e.assigned_to})`);
+        console.log(`  ${e.title}`);
+        console.log(`  ${e.detail}`);
+        console.log('');
+      }
+      console.log(
+        `Total: ${report.entries.length} flagged (${report.summary.resolved_dependency} resolved-dependency, ` +
+        `${report.summary.unverified_external_ref} needs-manual-check) out of ${report.summary.scanned} blocked tasks scanned.`,
+      );
+    } else {
+      console.log(JSON.stringify(report, null, 2));
+    }
+  });
+
+busCommand
+  .command('check-deploy-drift')
+  .description('Detect fleet CLI drift: unpulled origin/main commits, or dist/ built from a stale commit')
+  .option('--format <fmt>', 'Output format: json|text', 'json')
+  .action((opts: { format?: string }) => {
+    const env = resolveEnv();
+    const frameworkRoot = env.frameworkRoot || env.projectRoot || process.cwd();
+    const report = checkDeployDrift(frameworkRoot);
+    if (opts.format === 'text') {
+      if (report.status === 'error') {
+        console.log(`ERROR: ${report.error}${report.hint ? ` (${report.hint})` : ''}`);
+      } else if (report.status === 'clean') {
+        console.log(`Clean — local HEAD ${report.pull_drift!.local_head.slice(0, 8)} matches origin/main and dist/.`);
+      } else {
+        if (report.pull_drift!.behind) {
+          console.log(
+            `PULL DRIFT: local is ${report.pull_drift!.commits_behind} commit(s) behind origin/main ` +
+            `(${report.pull_drift!.local_head.slice(0, 8)} -> ${report.pull_drift!.origin_head.slice(0, 8)}).`,
+          );
+          for (const line of report.pull_drift!.commit_summaries) console.log(`  ${line}`);
+          if (report.pull_drift!.truncated) console.log(`  ...(${report.pull_drift!.commits_behind - COMMIT_LOG_LIMIT} more)`);
+        }
+        if (report.build_drift!.stale) {
+          console.log(`BUILD DRIFT: ${report.build_drift!.reason}`);
+        }
+      }
+    } else {
+      console.log(JSON.stringify(report, null, 2));
+    }
+    if (report.status !== 'clean') {
+      process.exitCode = 1;
+    }
+  });
+
+busCommand
   .command('post-activity')
-  .description('Post a message to the org Telegram activity channel')
+  .description('Post a message to the org activity channel (Telegram if configured, bus broadcast otherwise)')
   .argument('<message>', 'Message to post')
   .action(async (message: string) => {
     const env = resolveEnv();
@@ -707,8 +930,24 @@ busCommand
     const success = await postActivity(orgDir, env.ctxRoot, env.org, message);
     if (success) {
       console.log('Activity posted');
+      return;
+    }
+    // No Telegram activity channel (activity-channel.env absent or incomplete):
+    // fall back to a bus-native broadcast so fleet-wide activity never depends
+    // on a Telegram chat id — bus-only agents must be able to broadcast too.
+    const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
+    const result = broadcastActivityViaBus(projectRoot, env.ctxRoot, env.instanceId, env.org, env.agentName, message);
+    try {
+      const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+      logEvent(paths, env.agentName, env.org, 'agent_activity', 'activity_broadcast', 'info',
+        JSON.stringify({ via: 'bus', delivered: result.delivered.length, skipped: result.skipped.length }));
+    } catch { /* non-fatal */ }
+    if (result.delivered.length > 0) {
+      const skippedNote = result.skipped.length > 0 ? ` (${result.skipped.length} skipped)` : '';
+      console.log(`No Telegram activity channel configured — broadcast over the bus to ${result.delivered.length} agent(s)${skippedNote}`);
     } else {
-      console.error('Failed to post activity. Check that ACTIVITY_CHAT_ID is set in your org secrets.env or .env file.');
+      console.error('Failed to post activity: no Telegram activity channel and no reachable bus recipients. For the Telegram channel, create orgs/<org>/activity-channel.env with ACTIVITY_BOT_TOKEN and ACTIVITY_CHAT_ID.');
+      process.exit(1);
     }
   });
 
@@ -721,7 +960,9 @@ busCommand
   .option('--direction <dir>', 'Direction: higher or lower', 'higher')
   .option('--window <dur>', 'Measurement window', '24h')
   .option('--kind <kind>', 'intervention or snapshot', 'intervention')
-  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string }) => {
+  .option('--baseline <n>', 'Baseline value to compare the measured result against (required before evaluate-experiment will accept this experiment)')
+  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string; baseline?: string }) => {
+    try { validateExperimentBaseline(opts.baseline); } catch (err) { console.error(String(err)); process.exit(1); }
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     const id = createExperiment(agentDir, env.agentName, metric, hypothesis, {
@@ -729,6 +970,7 @@ busCommand
       direction: opts.direction as 'higher' | 'lower',
       window: opts.window,
       kind: opts.kind as 'intervention' | 'snapshot',
+      baseline: opts.baseline !== undefined ? parseFloat(opts.baseline) : undefined,
     });
     console.log(id);
 
@@ -773,7 +1015,7 @@ busCommand
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     const experiment = evaluateExperiment(agentDir, id, parseFloat(value), {
-      score: opts.score ? parseInt(opts.score, 10) : undefined,
+      score: opts.score ? parseFloat(opts.score) : undefined,
       justification: opts.justification,
     });
     console.log(JSON.stringify(experiment, null, 2));
@@ -781,18 +1023,39 @@ busCommand
 
 busCommand
   .command('list-experiments')
-  .description('List experiments with optional filters')
+  .description('List experiments with optional filters. With no --agent, scans fleet-wide across every agent (like read-all-heartbeats) rather than just the caller.')
   .option('--agent <name>', 'Filter by agent')
   .option('--status <s>', 'Filter by status')
   .option('--metric <m>', 'Filter by metric')
   .option('--json', 'Output as JSON')
   .action((opts: { agent?: string; status?: string; metric?: string; json?: boolean }) => {
     const env = resolveEnv();
-    const agentDir = opts.agent && env.frameworkRoot
-      ? resolveAgentDir(env.frameworkRoot, env.org, opts.agent)
-      : (env.agentDir || process.cwd());
-    const experiments = listExperiments(agentDir, {
-      agent: opts.agent,
+
+    if (opts.agent) {
+      const agentDir = env.frameworkRoot
+        ? resolveAgentDir(env.frameworkRoot, env.org, opts.agent)
+        : (env.agentDir || process.cwd());
+      const experiments = listExperiments(agentDir, {
+        agent: opts.agent,
+        status: opts.status,
+        metric: opts.metric,
+      });
+      console.log(JSON.stringify(experiments, null, 2));
+      return;
+    }
+
+    // task_1785723303692: no --agent given — silently scoping to the caller's
+    // own agentDir here (as this used to) means a "list every experiment"
+    // scan silently returns a subset with no error. Iterate the whole fleet
+    // instead, same discovery source list-agents/checkGoalStaleness use.
+    if (!env.frameworkRoot) {
+      console.log(JSON.stringify(
+        listExperiments(env.agentDir || process.cwd(), { status: opts.status, metric: opts.metric }),
+        null, 2,
+      ));
+      return;
+    }
+    const experiments = listAllExperiments(env.frameworkRoot, env.ctxRoot, {
       status: opts.status,
       metric: opts.metric,
     });
@@ -985,11 +1248,25 @@ busCommand
   .command('send-telegram')
   .description('Send a message to a Telegram chat')
   .argument('<chat-id>', 'Telegram chat ID')
-  .argument('<message>', 'Message text (supports Telegram Markdown unless --plain-text is set)')
+  .argument('[message]', 'Message text (supports Telegram Markdown unless --plain-text is set). Omit to read the body from stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical.')
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
+  .option('--body-file <path>', 'Read the message body from a file instead of the shell argument or stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical')
+  .action(async (chatId: string, message: string | undefined, opts: { image?: string; file?: string; plainText?: boolean; bodyFile?: string }) => {
+    // Fail-closed body resolution (2026-08-15 fleet incidents — see
+    // src/utils/resolve-message-body.ts): --body-file/stdin are the safe
+    // default path; an inline body containing a surviving backtick/$( is
+    // rejected loud rather than sent with silently-substituted holes in it.
+    try {
+      message = resolveMessageBody({ inlineText: message, bodyFile: opts.bodyFile });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
@@ -1413,43 +1690,11 @@ busCommand
     const ctxRoot = require('path').join(require('os').homedir(), '.cortextos', env.instanceId);
     const frameworkRoot = env.frameworkRoot || process.cwd();
 
-    // Collect agents from enabled-agents.json + filesystem scan
-    const enabledFile = join(ctxRoot, 'config', 'enabled-agents.json');
+    // Collect agents from enabled-agents.json + filesystem scan (shared with
+    // any other fleet-wide scan — see discoverAllAgents's docblock).
     const agentMap: Record<string, { org: string; enabled: boolean }> = {};
-
-    if (existsSync(enabledFile)) {
-      try {
-        const data = JSON.parse(readFileSync(enabledFile, 'utf-8'));
-        for (const [name, cfg] of Object.entries(data as Record<string, any>)) {
-          agentMap[name] = { org: cfg.org ?? '', enabled: cfg.enabled !== false };
-        }
-      } catch { /* skip corrupt */ }
-    }
-
-    // Also scan org agent directories (shared and namespaced)
-    const orgsDir = join(frameworkRoot, 'orgs');
-    if (existsSync(orgsDir)) {
-      for (const org of readdirSync(orgsDir)) {
-        // Shared agents: orgs/<org>/agents/<name>
-        const agentsDir = join(orgsDir, org, 'agents');
-        if (existsSync(agentsDir)) {
-          for (const name of readdirSync(agentsDir)) {
-            if (!agentMap[name]) agentMap[name] = { org, enabled: true };
-          }
-        }
-        // Namespaced agents: orgs/<org>/engineers/<eng>/agents/<name>
-        const engineersDir = join(orgsDir, org, 'engineers');
-        if (existsSync(engineersDir)) {
-          for (const engineer of readdirSync(engineersDir)) {
-            const nsAgentsDir = join(engineersDir, engineer, 'agents');
-            if (!existsSync(nsAgentsDir)) continue;
-            for (const name of readdirSync(nsAgentsDir)) {
-              const qualified = `${engineer}/${name}`;
-              if (!agentMap[qualified]) agentMap[qualified] = { org, enabled: true };
-            }
-          }
-        }
-      }
+    for (const a of discoverAllAgents(frameworkRoot, ctxRoot)) {
+      agentMap[a.name] = { org: a.org, enabled: a.enabled };
     }
 
     // Determine running agents via IPC daemon.
@@ -1765,49 +2010,122 @@ busCommand
 // list-approvals — was missing from CLI, only available via dashboard
 // ---------------------------------------------------------------------------
 
+const APPROVAL_STATUSES = ['pending', 'approved', 'rejected'] as const;
+
+/** Every org directory under CTX_ROOT — mirrors dashboard syncAll() behaviour. */
+function listOrgDirs(instanceId: string): string[] {
+  const { readdirSync, existsSync } = require('fs');
+  const { join } = require('path');
+  const { homedir } = require('os');
+  const orgsDir = join(homedir(), '.cortextos', instanceId, 'orgs');
+  return existsSync(orgsDir)
+    ? readdirSync(orgsDir, { withFileTypes: true })
+        .filter((d: { isDirectory(): boolean }) => d.isDirectory())
+        .map((d: { name: string }) => d.name)
+    : [];
+}
+
 busCommand
   .command('list-approvals')
-  .description('List pending approval requests')
+  .description('List pending approval requests (--status/--all also reach resolved ones)')
   .option('--format <fmt>', 'Output format: json|text', 'json')
+  .option('--status <status>', `Filter by status: ${APPROVAL_STATUSES.join('|')}`)
+  .option('--all', 'Include resolved approvals, not just pending', false)
   .option('--all-orgs', 'Scan all orgs under CTX_ROOT (matches dashboard view)', false)
-  .action((opts: { format?: string; allOrgs?: boolean }) => {
-    const { listPendingApprovals } = require('../bus/approval.js');
-    const { readdirSync, existsSync } = require('fs');
-    const { join, homedir: _homedir } = require('path');
-    const { homedir } = require('os');
+  .action((opts: { format?: string; status?: string; all?: boolean; allOrgs?: boolean }) => {
+    const { listApprovals, resolveListStatus } = require('../bus/approval.js');
     const env = resolveEnv();
+
+    // Reject an unknown status loudly. Silently returning [] would be
+    // indistinguishable from "no approvals have that status" — the same
+    // false-absence this command was fixed to stop producing.
+    if (opts.status && !(APPROVAL_STATUSES as readonly string[]).includes(opts.status)) {
+      console.error(
+        `Unknown status '${opts.status}'. Valid: ${APPROVAL_STATUSES.join(', ')}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    const effectiveStatus = resolveListStatus(opts.status, opts.all);
 
     let approvals: unknown[] = [];
 
     if (opts.allOrgs) {
-      // Scan every org directory under CTX_ROOT — mirrors dashboard syncAll() behaviour
-      const ctxRoot = join(homedir(), '.cortextos', env.instanceId);
-      const orgsDir = join(ctxRoot, 'orgs');
-      const orgs: string[] = existsSync(orgsDir)
-        ? readdirSync(orgsDir, { withFileTypes: true })
-            .filter((d: { isDirectory(): boolean }) => d.isDirectory())
-            .map((d: { name: string }) => d.name)
-        : [];
-      for (const org of orgs) {
+      for (const org of listOrgDirs(env.instanceId)) {
         const orgPaths = resolvePaths(env.agentName, env.instanceId, org);
-        approvals = approvals.concat(listPendingApprovals(orgPaths));
+        approvals = approvals.concat(listApprovals(orgPaths, effectiveStatus));
       }
     } else {
       const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-      approvals = listPendingApprovals(paths);
+      approvals = listApprovals(paths, effectiveStatus);
     }
 
     if (opts.format === 'text') {
-      if (approvals.length === 0) { console.log('No pending approvals'); return; }
-      for (const a of approvals as Array<{ id: string; title: string; category: string; requesting_agent: string; created_at: string; description?: string; org?: string }>) {
+      const label = effectiveStatus ? `${effectiveStatus} ` : '';
+      if (approvals.length === 0) { console.log(`No ${label}approvals`); return; }
+      for (const a of approvals as Array<{ id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string }>) {
         console.log(`[${a.id}] ${a.title}`);
-        console.log(`  Category: ${a.category} | Agent: ${a.requesting_agent} | Org: ${a.org ?? env.org} | Created: ${a.created_at}`);
+        console.log(`  Status: ${a.status} | Category: ${a.category} | Agent: ${a.requesting_agent} | Org: ${a.org ?? env.org} | Created: ${a.created_at}`);
+        if (a.resolved_at) console.log(`  Resolved: ${a.resolved_at}${a.resolved_by ? ` — ${a.resolved_by}` : ''}`);
         if (a.description) console.log(`  Context: ${a.description}`);
         console.log('');
       }
-      console.log(`Total: ${approvals.length} pending`);
+      console.log(`Total: ${approvals.length} ${label}approval(s)`);
     } else {
       console.log(JSON.stringify(approvals, null, 2));
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// get-approval — point lookup across pending/ AND resolved/.
+//
+// The recovery path for "what happened to the approval I filed?". updateApproval
+// notifies the requesting agent by inbox exactly once; an agent that restarts
+// past that message previously had no way to retrieve the decision, because
+// every CLI read path looked only at pending/ and a decided approval has moved
+// to resolved/. An agent knows its own approval id, so a point lookup — not a
+// list — is what actually closes that hole.
+// ---------------------------------------------------------------------------
+
+busCommand
+  .command('get-approval')
+  .argument('<approval-id>', 'Approval id (e.g. approval_1786668730_wllgx)')
+  .description('Show one approval and its decision, searching pending and resolved')
+  .option('--format <fmt>', 'Output format: json|text', 'json')
+  .option('--all-orgs', 'Search all orgs under CTX_ROOT', false)
+  .action((approvalId: string, opts: { format?: string; allOrgs?: boolean }) => {
+    const { getApproval } = require('../bus/approval.js');
+    const env = resolveEnv();
+
+    const orgs = opts.allOrgs ? listOrgDirs(env.instanceId) : [env.org];
+    let found: { id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; updated_at?: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string } | null = null;
+    for (const org of orgs) {
+      found = getApproval(resolvePaths(env.agentName, env.instanceId, org), approvalId);
+      if (found) break;
+    }
+
+    // Absent from BOTH buckets is the only real "does not exist". Say so on
+    // stderr and exit non-zero so a caller cannot mistake it for a result.
+    if (!found) {
+      console.error(
+        `Approval ${approvalId} not found in pending or resolved` +
+        (opts.allOrgs ? ' (searched all orgs)' : ` for org '${env.org}' — retry with --all-orgs`),
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    if (opts.format === 'text') {
+      console.log(`[${found.id}] ${found.title}`);
+      console.log(`  Status: ${found.status}`);
+      console.log(`  Category: ${found.category} | Agent: ${found.requesting_agent} | Org: ${found.org ?? env.org}`);
+      console.log(`  Created: ${found.created_at}`);
+      if (found.resolved_at) console.log(`  Resolved: ${found.resolved_at}`);
+      if (found.resolved_by) console.log(`  Decision note: ${found.resolved_by}`);
+      if (found.description) console.log(`  Context: ${found.description}`);
+    } else {
+      console.log(JSON.stringify(found, null, 2));
     }
   });
 
@@ -1930,6 +2248,23 @@ function validateSchedule(raw: string): string {
 }
 
 /**
+ * Validate an IANA timezone string (e.g. "America/New_York"). Returns the
+ * string unchanged on success, or throws an Error with a human-readable
+ * message on failure. Delegates to Intl.DateTimeFormat, which throws
+ * RangeError on any string it doesn't recognise as a real IANA zone.
+ */
+function validateTimezone(raw: string): string {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: raw });
+  } catch {
+    throw new Error(
+      `Invalid timezone '${raw}'. Expected an IANA timezone name (e.g. "America/New_York", "UTC", "Asia/Tokyo").`
+    );
+  }
+  return raw;
+}
+
+/**
  * Check whether an agent exists in the current framework root.
  * Returns false if the framework root is unknown (graceful degradation).
  */
@@ -1975,7 +2310,8 @@ busCommand
   .argument('<interval>', 'Schedule: interval ("6h", "30m", "1d") or 5-field cron expr ("0 8 * * *")')
   .argument('<prompt...>', 'Prompt text injected when the cron fires (all remaining words joined)')
   .option('--desc <description>', 'Human-readable description (optional)')
-  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string }) => {
+  .option('--timezone <tz>', 'IANA timezone for a cron-expression schedule (default: UTC). No effect on interval schedules.')
+  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string; timezone?: string }) => {
     // Validate agent name format
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
@@ -1991,6 +2327,12 @@ busCommand
     let schedule: string;
     try { schedule = validateSchedule(interval); } catch (err) { console.error(String(err)); process.exit(1); }
 
+    // Validate timezone (optional)
+    let timezone: string | undefined;
+    if (opts.timezone !== undefined) {
+      try { timezone = validateTimezone(opts.timezone); } catch (err) { console.error(String(err)); process.exit(1); }
+    }
+
     const prompt = promptWords.join(' ');
     const cron: CronDefinition = {
       name,
@@ -1999,6 +2341,7 @@ busCommand
       enabled: true,
       created_at: new Date().toISOString(),
       ...(opts.desc ? { description: opts.desc } : {}),
+      ...(timezone ? { timezone } : {}),
     };
 
     try {
@@ -2072,17 +2415,26 @@ busCommand
       return;
     }
 
-    // Compute next_fire_at for each cron so the table is informative
+    // Compute next_fire_at for each cron so the table is informative. Uses
+    // the same shared candidate-max reference computation (computeReferenceMs)
+    // the live scheduler's loadCrons() uses — see its docblock — so a
+    // never-fired cron anchors on created_at instead of showing a misleading
+    // recomputed-every-query "now+interval" (task_1785589264937).
     const now = Date.now();
     const rows = crons.map(c => {
       const lastFire = mostRecent(c.last_fired_at, fireByName.get(c.name));
       let nextFire = '-';
+      const refMs = computeReferenceMs({
+        createdAt: c.created_at,
+        lastFiredAt: c.last_fired_at,
+        lastFireAttemptedAt: c.last_fire_attempted_at,
+        stateFire: fireByName.get(c.name),
+      }, now);
       const dms = parseDurationMs(c.schedule);
       if (!isNaN(dms)) {
-        const refMs = lastFire ? new Date(lastFire).getTime() : now;
         nextFire = fmtTs(new Date(refMs + dms).toISOString());
       } else {
-        const nf = nextFireFromCron(c.schedule, now);
+        const nf = nextFireFromCron(c.schedule, refMs, c.timezone);
         if (!isNaN(nf)) nextFire = fmtTs(new Date(nf).toISOString());
       }
       const promptPreview = c.prompt.length > 60 ? c.prompt.slice(0, 57) + '...' : c.prompt;
@@ -2125,12 +2477,13 @@ busCommand
   .option('--prompt <p>', 'New prompt text')
   .option('--enabled <bool>', 'Enable (true) or disable (false) the cron')
   .option('--desc <d>', 'New description')
-  .action(async (agent: string, name: string, opts: { interval?: string; cronExpr?: string; prompt?: string; enabled?: string; desc?: string }) => {
+  .option('--timezone <tz>', 'IANA timezone for a cron-expression schedule (default: UTC)')
+  .action(async (agent: string, name: string, opts: { interval?: string; cronExpr?: string; prompt?: string; enabled?: string; desc?: string; timezone?: string }) => {
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
     const rawSchedule = opts.interval ?? opts.cronExpr;
-    if (!rawSchedule && opts.prompt === undefined && opts.enabled === undefined && opts.desc === undefined) {
-      console.error('Error: at least one of --interval, --cron-expr, --prompt, --enabled, or --desc is required.');
+    if (!rawSchedule && opts.prompt === undefined && opts.enabled === undefined && opts.desc === undefined && opts.timezone === undefined) {
+      console.error('Error: at least one of --interval, --cron-expr, --prompt, --enabled, --desc, or --timezone is required.');
       process.exit(1);
     }
 
@@ -2152,8 +2505,20 @@ busCommand
     if (opts.desc !== undefined) {
       patch.description = opts.desc;
     }
+    if (opts.timezone !== undefined) {
+      try { patch.timezone = validateTimezone(opts.timezone); } catch (err) { console.error(String(err)); process.exit(1); }
+    }
 
-    const ok = updateCronDef(agent, name, patch);
+    let ok: boolean;
+    try {
+      ok = updateCronDef(agent, name, patch);
+    } catch (err) {
+      // updateCron rejects an empty prompt. Report it the way every other
+      // validation failure in this command reports — one line, exit 1 — rather
+      // than an unhandled stack trace.
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
     if (!ok) {
       console.error(`Error: cron '${name}' not found for agent '${agent}'.`);
       process.exit(1);
@@ -2509,6 +2874,16 @@ busCommand
   .description('PreToolUse hook: detects and blocks repeated tool loops (same-args repetition + ping-pong alternation)')
   .action(() => runHook('hook-loop-detector'));
 
+busCommand
+  .command('hook-activity-beat')
+  .description('PreToolUse hook: writes last_activity.flag on every tool call — mid-turn liveness proof for hang-detector class 3')
+  .action(() => runHook('hook-activity-beat'));
+
+busCommand
+  .command('hook-subagent-priming')
+  .description('PreToolUse hook (matcher: Agent): appends the benign-date-notice priming line to every subagent prompt via updatedInput')
+  .action(() => runHook('hook-subagent-priming'));
+
 // --- OAuth token rotation commands ---
 
 busCommand
@@ -2589,6 +2964,84 @@ busCommand
   });
 
 busCommand
+  .command('set-oauth-account <name>')
+  .description('Switch to a SPECIFIC OAuth account and propagate its token to agent .env files. Unlike rotate-oauth (which picks the first candidate that passes preflight), this goes exactly where you tell it — use it when an account is known-dead and you have chosen the replacement yourself.')
+  .option('--agent <name>', 'Only update this agent\'s .env (default: all agents in org)')
+  .option('--reason <text>', 'Reason for the switch (logged to rotation_log)')
+  .option('--json', 'Output as JSON')
+  .action(async (name: string, opts: { agent?: string; reason?: string; json?: boolean }) => {
+    const env = resolveEnv();
+    if (!env.frameworkRoot) {
+      console.error('CTX_FRAMEWORK_ROOT is required for set-oauth-account');
+      process.exit(1);
+    }
+    try {
+      const store = loadAccounts(env.ctxRoot);
+      if (!store) throw new Error('No accounts.json found');
+      const from = store.active;
+
+      // No preflight by design: the operator has named the target explicitly,
+      // and the only signal available for setup-tokens is a one-word inference
+      // ping that passes even on accounts with no usable capacity.
+      setActiveAccount(env.ctxRoot, name, {
+        reason: opts.reason || `manual switch to ${name}`,
+        from,
+      });
+
+      // Re-read rather than reuse `store`: the daemon's rotation manager may
+      // have refreshed this account's token between our load and the flip, and
+      // propagating a stale token to every agent .env fails silently. Mirrors
+      // rotateOAuth's `finalStore` read for the same reason.
+      const token = loadAccounts(env.ctxRoot)!.accounts[name].access_token;
+      writeTokenToAgents(env.frameworkRoot, env.org, token, opts.agent);
+
+      const result = { switched: true, from, to: name, agent: opts.agent ?? 'all' };
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`Active OAuth account: ${from} → ${name}`);
+        console.log(`Token written to: ${opts.agent ?? `all agents in org "${env.org}"`}`);
+      }
+    } catch (err) {
+      console.error(`Error: ${err}`);
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('gh-app-token')
+  .description('Mint a fresh ~1h GitHub App installation token (replaces the shared personal PAT for gh CLI calls). Requires GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY in env (e.g. via cortex-secret run --context conduit).')
+  .option('--org <login>', 'Org the App is installed on', 'wyre-technology')
+  .option('--json', 'Output token metadata (expires_at/org/installation_id) as JSON — the token itself is never included, since --json output is commonly captured into logs/CI')
+  .option('--force', 'Print the token even when stdout is an interactive terminal')
+  .action(async (opts: { org: string; json?: boolean; force?: boolean }) => {
+    const appId = process.env.GITHUB_APP_ID;
+    const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
+    if (!appId || !privateKey) {
+      console.error('GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY must be set (e.g. cortex-secret run --context conduit -- cortextos bus gh-app-token)');
+      process.exit(1);
+    }
+    if (shouldRefuseInteractivePrint(Boolean(process.stdout.isTTY), Boolean(opts.force))) {
+      console.error('Refusing to print the token to an interactive terminal (it would land in your visible session/scrollback).');
+      console.error('Capture it instead: GH_TOKEN=$(cortextos bus gh-app-token) — or pass --force to print anyway.');
+      process.exit(1);
+    }
+    try {
+      const result = await mintInstallationToken(appId, privateKey, opts.org);
+      if (opts.json) {
+        console.log(JSON.stringify(redactForJson(result), null, 2));
+      } else {
+        // Token only on stdout so `GH_TOKEN=$(cortextos bus gh-app-token)` just works.
+        console.log(result.token);
+        console.error(`Expires: ${result.expires_at} (org: ${result.org}, installation: ${result.installation_id})`);
+      }
+    } catch (err) {
+      console.error(`Error: ${err}`);
+      process.exit(1);
+    }
+  });
+
+busCommand
   .command('list-oauth-accounts')
   .description('List all OAuth accounts and their utilization')
   .action((opts: Record<string, unknown>) => {
@@ -2600,10 +3053,11 @@ busCommand
     }
     for (const [name, acct] of Object.entries(store.accounts)) {
       const active = name === store.active ? ' (active)' : '';
+      const disabled = acct.disabled ? ' (disabled)' : '';
       const expiry = new Date(acct.expires_at).toISOString();
       const warn5h = acct.five_hour_utilization >= ALERT_5H ? ' ⚠️' : '';
       const warn7d = acct.seven_day_utilization >= ALERT_7D ? ' ⚠️' : '';
-      console.log(`${name}${active}`);
+      console.log(`${name}${active}${disabled}`);
       console.log(`  5h: ${pct(acct.five_hour_utilization)}${warn5h}  7d: ${pct(acct.seven_day_utilization)}${warn7d}  expires: ${expiry}`);
     }
   });
