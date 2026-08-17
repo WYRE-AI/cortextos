@@ -175,11 +175,53 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
 
 - **WHEN AN ARTIFACT IS UNOBSERVABLE, READ THE CODE THAT CONSTRUCTS IT.** `ps eww` returns nothing
   readable on darwin, so "does the daemon inject `CLAUDE_CONFIG_DIR`?" looked unanswerable. It is settled
-  in one read: `agent-pty.ts:368 getBaseEnv()` is an **explicit `keepVars` allowlist** that does *not*
-  spread `process.env`, and the var is not in it — so the daemon **cannot** inject it even if it carried
-  it. **Construction RULES OUT cases; observation only FAILS TO FIND them.** Same shape as the detector
-  bug one level up: `T` was measured on `last_fire_attempted_at`, an axis the failure cannot touch, so it
-  stayed fresh while everything real froze — **the signal was measured on the wrong side of the event.**
+  in one read: `agent-pty.ts:399 getBaseEnv()` is an **explicit `keepVars` allowlist** (`:402`) that does
+  *not* spread `process.env`, and the var is not in it — so the daemon **cannot inherit it from its own
+  environment.** **Construction RULES OUT cases; observation only FAILS TO FIND them.** Same shape as the
+  detector bug one level up: `T` was measured on `last_fire_attempted_at`, an axis the failure cannot
+  touch, so it stayed fresh while everything real froze — **the signal was measured on the wrong side of
+  the event.**
+
+  ### 🔴 CORRECTED 2026-08-17 17:0xZ — THE SENTENCE ABOVE IS TRUE AND IT WAS READ AS A BLOCKER IT IS NOT
+  **"The daemon cannot inherit it" is NOT "the agent cannot receive it."** The agent's `.env` is a
+  **separate, unfiltered path**: `agent-pty.ts:133-144` reads it line-by-line and writes **every** key into
+  `ptyEnv` at **`:141`** with no allowlist, and `ptyEnv` is handed to node-pty at **`:184`**. ⟹ **Setting
+  `CLAUDE_CONFIG_DIR` in an agent's `.env` DOES reach the child — that is how every agent which has it is
+  configured.**
+  ✅ **PROOF THAT NEEDS NO CODE READ (`infra`'s): ten agents have POPULATED private config dirs. Only a
+  `claude` that RECEIVED the var could have written them, and the var is not in `keepVars` — so it arrived
+  via `.env`.** *(Confirmed live the same day: `adoption`'s `.env` gained the var at `16:59:22Z` and its
+  private config dir was created and populated at `17:00:26Z`.)*
+  ⚠️ **THAT CANARY WAS REVERTED AT ~17:02Z AND `adoption` DOES NOT CARRY THE VAR TODAY — do not go looking
+  for it as evidence.** **The arrival proof is unaffected** (the dir could only have been written by a
+  `claude` that received the var) **but the rollout was halted for a different, deterministic reason: a
+  fresh `CLAUDE_CONFIG_DIR` has NO session history, the daemon boots with `--continue`, and
+  `No conversation found to continue` exits 1 — five crashes in ninety seconds.** ⟹ **The fix is a DAEMON
+  change (force `mode='fresh'` on the first boot after the var appears), NOT an `.env` edit.**
+  🔑 **AND THE COMPOUND THAT MAKES IT WORSE THAN A FAILED CHANGE: four of the five target agents have no
+  Telegram, so rolling it would have halted four agents that cannot say they halted.** **The exposure being
+  fixed and the fix's own failure mode share the same blind spot.**
+  📌 **Seeding `hasTrustDialogAccepted` is NECESSARY AND NOT SUFFICIENT — measured: the flag was present and
+  correct and the trust dialog fired anyway.** *(The 2026-07-14 entry above reads as though seeding solves
+  it. It does not.)*
+  ⚠️ **`07-14 keychain-beats-CLAUDE_CODE_OAUTH_TOKEN` is NARROWED, NOT CLOSED: the var arrives and the
+  private dir is used, but the canary crash-looped, so the token-serving question is confounded. Nobody
+  should record it as verified.**
+  ⚠️ **COST OF THE ORIGINAL WORDING: it was quoted to halt a five-agent remediation that was in fact
+  sound.** The entry is in **this file, which is LOADED into every agent's context at boot** — so the false
+  blocker **regenerated on demand** for two days rather than being read once.
+  🔑 **THE LESSON THAT SURVIVES, AND IT SHARPENS THE HEADLINE ABOVE RATHER THAN RETIRING IT: CONSTRUCTION
+  RULES OUT THE CASE YOU CONSTRUCTED, AND NOTHING ELSE.** One function was read and a conclusion about a
+  whole subsystem was written. **The rigour was real and the scope was one function wide — which is exactly
+  why it stood for two days.**
+  🔑 **AND THE RETRIEVAL-SIDE TWIN: A STORED FINDING CARRIES THE FRAME IT WAS WRITTEN IN, AND THE READER
+  SUPPLIES A NEW ONE WITHOUT NOTICING THE SWAP.** This sentence answered *"does the daemon inject it on its
+  own?"* (no) and was read as answering *"will adding it to `.env` reach the agent?"* (yes). **Same file,
+  same function, same sentence, opposite operational answer, and no error to notice.** ⟹ **Write the
+  QUESTION into a finding, not just the answer.**
+  📌 **`:368` was also wrong** — a coordinate carried from this entry into a live instruction. **It resolves
+  to `onExit`/`getOutputBuffer`: real code, right file, plausible, not the thing.** Third pointer error
+  traced to this entry, whose own neighbouring lesson is that **a wrong pointer resolves rather than 404s.**
 
 - **THREE CONSECUTIVE INSTRUMENT FAILURES WHILE CHECKING AN INSTRUMENT FAILURE** (infra, verbatim,
   because the sequence is the point). Task: does `list-approvals --status` exist? TOOLS.md documented
