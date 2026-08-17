@@ -426,7 +426,8 @@ busCommand
   .option('--project <name>', 'Change the task\'s project')
   .option('--priority <level>', 'Change the task\'s priority (urgent, high, normal, low)')
   .option('--append-desc <text>', 'Append text to the description with a timestamp — does NOT overwrite the original (a description cannot be edited in place; this keeps a correction visible next to the claim it corrects)')
-  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string; priority?: string; appendDesc?: string }) => {
+  .option('--agent <name>', 'Agent performing the update, recorded in the audit log (defaults to CTX_AGENT_NAME)')
+  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string; priority?: string; appendDesc?: string; agent?: string }) => {
     if (status === undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined && opts.appendDesc === undefined) {
       console.error('Nothing to update — pass a status, --assignee, --project, --priority, and/or --append-desc');
       process.exit(1);
@@ -447,6 +448,16 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
+    // Mirrors claim-task: explicit override, env fallback, hard failure when
+    // neither is present. The abort is load-bearing — an empty agent value
+    // widens rather than narrows elsewhere in this CLI, and defaulting here
+    // would write a borrowed or empty identity into an append-only audit log
+    // as though it were an observation.
+    const actor = opts.agent || env.agentName;
+    if (!actor) {
+      console.error('ERROR: --agent or CTX_AGENT_NAME required');
+      process.exit(1);
+    }
 
     // Guard: block review/completion when deliverables are required but missing.
     // Checks both ready_for_review (approval workflow) and completed (vanilla upstream)
@@ -465,6 +476,7 @@ busCommand
         project: opts.project,
         priority: opts.priority as Priority | undefined,
         appendDesc: opts.appendDesc,
+        actor,
       });
       if (
         status !== undefined &&

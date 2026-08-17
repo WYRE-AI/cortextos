@@ -137,14 +137,22 @@ describe('Task Management', () => {
 
     it('records the reassign in the task audit log', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Test task', { assignee: 'boss' });
-      updateTask(paths, taskId, undefined, { assignee: 'dev' });
+      updateTask(paths, taskId, undefined, { assignee: 'dev', actor: 'paul' });
 
       const log = readTaskAudit(paths, taskId);
       const reassignEntry = log[log.length - 1];
       expect(reassignEntry.note).toContain('assignee: boss -> dev');
-      // The actor is 'paul' (the caller); 'boss' is merely the PRE-mutation
-      // assignee. Attributing the entry to 'boss' names the wrong agent.
+      // This fixture is the discriminating case: actor 'paul' is neither the
+      // prior assignee ('boss') nor the new one ('dev'), so nothing here can
+      // be right by coincidence.
+      //
+      // Both assertions ship deliberately. The negative form is the one that
+      // COMPILES AND FAILS on main — updateTask had no actor parameter there,
+      // so the positive form could not be written until the fix existed, and
+      // a fail-first test asserting what the code must STOP doing is the only
+      // form the ordering permits. The positive form then pins the contract.
       expect(reassignEntry.agent).not.toBe('boss');
+      expect(reassignEntry.agent).toBe('paul');
     });
 
     it('changes priority without a status argument', () => {
@@ -697,19 +705,36 @@ describe('Task audit log (append-only JSONL)', () => {
     expect(log[2].note).toBe('shipped');
   });
 
-  it('updateTask audit captures from->to transition with assignee as agent', () => {
+  // Renamed from 'updateTask audit captures from->to transition with assignee
+  // as agent'. The old name asserted the defect as the contract: it passed only
+  // because this fixture is a SELF-transition (alice is both creator and
+  // assignee), so the pre-mutation assignee and the actor coincide. Renamed
+  // alongside the fix so the diff reads as a deliberate contract change rather
+  // than a regression.
+  it('updateTask audit captures from->to transition and names the acting agent', () => {
     const id = createTask(paths, 'alice', 'acme', 'Updatable', { assignee: 'alice' });
-    updateTask(paths, id, 'blocked');
-    updateTask(paths, id, 'pending');
+    updateTask(paths, id, 'blocked', { actor: 'alice' });
+    updateTask(paths, id, 'pending', { actor: 'alice' });
 
     const log = readTaskAudit(paths, id);
     expect(log.length).toBe(3); // create + 2 updates
     expect(log[1].event).toBe('update');
     expect(log[1].from).toBe('pending');
     expect(log[1].to).toBe('blocked');
-    expect(log[1].agent).toBe('alice');
+    expect(log[1].agent).toBe('alice'); // the ACTOR — here it coincides with the assignee
     expect(log[2].from).toBe('blocked');
     expect(log[2].to).toBe('pending');
+  });
+
+  it('updateTask audits as unknown rather than borrowing an identity when no actor is given', () => {
+    const id = createTask(paths, 'alice', 'acme', 'Unattributed', { assignee: 'alice' });
+    updateTask(paths, id, 'blocked');
+
+    const log = readTaskAudit(paths, id);
+    // Follows the existing `|| 'unknown'` precedent. The point is the NEGATIVE:
+    // an omitted actor must never silently inherit the assignee's name.
+    expect(log[1].agent).toBe('unknown');
+    expect(log[1].agent).not.toBe('alice');
   });
 
   it('audit log is append-only — existing entries are never overwritten', () => {
