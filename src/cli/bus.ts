@@ -459,13 +459,15 @@ busCommand
   .option('--status <s>', 'Filter by status')
   .option('--format <fmt>', 'Output format: json or text', 'text')
   .option('--respect-deps', 'Sort DAG-aware: unblocked tasks first, blocked tasks last')
-  .action((opts: { agent?: string; status?: string; format?: string; respectDeps?: boolean }) => {
+  .option('--include-archived', 'Also include compact-tasks archive entries (reconstructed summaries — see readCompactedTasks)')
+  .action((opts: { agent?: string; status?: string; format?: string; respectDeps?: boolean; includeArchived?: boolean }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const tasks = listTasks(paths, {
       agent: opts.agent,
       status: opts.status as TaskStatus,
       respectDeps: opts.respectDeps ?? false,
+      includeArchived: opts.includeArchived ?? false,
     });
 
     if (opts.format === 'json') {
