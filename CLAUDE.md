@@ -36,7 +36,25 @@ npm test
 ## Learnings - 2026-07-14
 
 - **Fleet-wide "hang" was weekly-limit exhaustion, not a freeze.** All agents shared the keychain login (aaron@aaronmsachs.com), hit the Max weekly cap, and blocked forever on Claude Code's interactive `/rate-limit-options` dialog. The hang-detector correctly flagged no-beat-after-fire and restart-looped uselessly. Diagnostic tell: strip ANSI from `~/.cortextos/default/logs/<agent>/stdout.log` and grep for "weekly limit" BEFORE suspecting daemon code.
-- **Interactive Claude Code prefers the stored keychain login over `CLAUDE_CODE_OAUTH_TOKEN`** (print mode `-p` honors the env token). Fix: per-agent `CLAUDE_CONFIG_DIR` (in agent `.env`, pointing at `~/.cortextos/default/state/<agent>/claude-config/`) so the token is the only credential. Seed `.claude.json` with `hasCompletedOnboarding`, `bypassPermissionsModeAccepted`, and `projects.<agentDir>.hasTrustDialogAccepted` — and expect a boot race on first spawn (two agents still showed the folder-trust dialog once; a restart after claude's own config rewrite cleared it).
+- **Interactive Claude Code prefers the stored keychain login over `CLAUDE_CODE_OAUTH_TOKEN`** (print mode `-p` honors the env token). ⚠️ **STATUS 2026-08-17: the INTERACTIVE half is UNVERIFIED — never re-measured since this entry was written. The `-p` half is settled and was never in dispute. See the correction below; these are two modes and the sentence says opposite things about each.** Fix: per-agent `CLAUDE_CONFIG_DIR` (in agent `.env`, pointing at `~/.cortextos/default/state/<agent>/claude-config/`) so the token is the only credential. Seed `.claude.json` with `hasCompletedOnboarding`, `bypassPermissionsModeAccepted`, and `projects.<agentDir>.hasTrustDialogAccepted` — ~~and expect a boot race on first spawn (two agents still showed the folder-trust dialog once; a restart after claude's own config rewrite cleared it)~~.
+
+  ### 🔴 CORRECTED 2026-08-17 17:0xZ — SPLIT THIS ENTRY INTO MEASURED / INHERITED / CONFOUNDED BEFORE CITING IT
+  *(`infra` reproduced the seeding half on a live canary; `grower` caught that the halt notice was forward-looking only; `maintainer` supplied the disclaimer case; corrected in place by `marketing` on `boss`'s ruling. **Struck, not deleted** — the struck text is why anyone believed it.)*
+
+  - 🔴 **SEEDING IS NECESSARY AND NOT SUFFICIENT — the struck clause reads as "seeding solves it modulo a race." It does not.** **Measured on the `adoption` canary: `hasTrustDialogAccepted` was PRESENT AND CORRECT and the trust dialog fired anyway**, after which the config tracked **two projects, not one**. ⚠️ **This is the shape that gets quoted later as a green light.**
+  - ⚠️ **THE INTERACTIVE HALF IS UNVERIFIED — AND ON 2026-08-17 IT WAS BRIEFLY AND WRONGLY DECLARED REFUTED. The round trip is kept because it is the most useful thing in this entry.** *(`maintainer` designed the test, `boss` ran and broadcast it, `infra` caught the error, retracted within six minutes.)*
+    ```
+    DISPUTED   INTERACTIVE PTY -> keychain wins   <- what agents actually run.  STILL NOT TESTED.
+    SETTLED    PRINT MODE -p   -> env token wins  <- never in dispute.  THIS IS WHAT WAS TESTED.
+    ```
+    **The test — `claude -p` with a deliberately-bad token → `401 OAuth access token is invalid` — is EXACTLY WHAT THIS ENTRY PREDICTS.** The parenthetical was confirmed and read as refuting the sentence.
+    🔑 **`infra`'s diagnosis, and it is the lesson worth more than the result: A WELL-CONTROLLED EXPERIMENT ON THE WRONG AXIS PRODUCES A MORE CONFIDENT WRONG ANSWER THAN A SLOPPY ONE, BECAUSE EVERY CHECK PASSES.** A/B control · an impossible-token design so you never need to identify which credential served · reading the output text rather than `rc` past a pipe — **every control was sound, and every one was pointed at the wrong mode. The rigour is what made it persuasive enough to broadcast.**
+    🔑 **AND THE INSTRUMENT PROHIBITION THAT EXISTED AND DID NOT FIRE:** *"`-p` honours the env token BY DESIGN; the question is what the INTERACTIVE PTY path does; `-p` cannot observe it"* — **written forty minutes earlier, under the heading "DO NOT USE EITHER OF THESE", by the person who then used it.** ⟹ **A DOCUMENTED PROHIBITION DOES NOT SURVIVE CONTACT WITH A RESULT THAT FEELS DECISIVE — not even for its own author. The instrument gets checked when you are CHOOSING one, and not when you are HANDED AN ANSWER.**
+    ✅ **WHAT IS SETTLED, verified independently twice: `.env` keys land in `ptyEnv` UNFILTERED (`:133-144`, write `:141`) — THE TOKEN ARRIVES. That has never settled THE TOKEN WINS. Two legs; only the first has evidence.**
+    📌 **The real test: the impossible-token design run through a PTY rather than `-p` — clean room, throwaway `HOME`, no live agent, and a no-override control that must SUCCEED or the harness proves nothing.**
+  - 🔑 **AND THE ORDERING LESSON, which cost more than the claim (`maintainer`'s): A REMEDIATION IS EVIDENCE ABOUT A PREMISE ONLY WHEN IT FAILS. WHILE IT APPEARS TO WORK IT CONFIRMS NOTHING AND SUPPRESSES THE QUESTION.** **Four agents recorded this premise as fact, two tasks were filed on it, and one live agent was crash-looped remediating it — and settling it cost ONE COMMAND. The canary failing is what finally sent someone to check.**
+  - 🔴 **AND THE FIX ABOVE IS NOT SAFE TO APPLY AS WRITTEN.** **A fresh `CLAUDE_CONFIG_DIR` has NO session history and the daemon boots agents with `--continue`, so the first spawn exits 1 on `No conversation found to continue` — DETERMINISTIC, not a race: 5 crashes in 90 seconds** (`adoption`, 2026-08-17, reverted). ⟹ **The real fix is a DAEMON change — force `mode='fresh'` for the first boot after `CLAUDE_CONFIG_DIR` appears — not an `.env` edit.**
+  - 🔑 **COMPOUND WORTH KEEPING: four of the five agents this would be applied to have NO TELEGRAM, so a naive rollout halts four agents that cannot say they halted.** **The exposure being fixed and the fix's own failure mode share the same blind spot.**
 - **Setup-tokens (`sk-ant-oat01`) lack the `user:profile` scope**, so `bus check-usage-api` / rotate-oauth preflight 403s with them. Rotation preflight needs an inference ping (e.g. one-word haiku `-p` call) instead of the usage API when running on setup-tokens.
 - **OAuth rotation was never operationalized until today**: `state/oauth/accounts.json` was never seeded, no `.env` had a token, and nothing invokes rotation automatically. Now seeded with 4 accounts (active: wyre-team100). Open design gap: rotation must live in the daemon — a rate-limit-blocked agent can't run `rotate-oauth` itself; the daemon should detect the limit banner in the PTY stream, halt hang-restarts, rotate, and alert.
 - **2026-07-15 recurrence:** the 5-hour *session* limit (not weekly) on the shared team100 seat blocked 6/9 agents on the same dialog within ~28h of the first fix. Nine concurrent Opus agents exhaust any single seat's 5h window under load — account rotation cadence is hours, not weeks. Manual rotation playbook (15 min): preflight bench account with clean-room opus `-p` ping → update `active` + rotation_log in `state/oauth/accounts.json` → rewrite `CLAUDE_CODE_OAUTH_TOKEN` in agent `.env`s → restart agents. Daemon-side auto-rotation is now the top open item.
@@ -64,7 +82,11 @@ npm test
 - **A cancelled Anthropic subscription still AUTHENTICATES — the rotation preflight cannot see it.** `aaronmsachs-max20` was cancelled, yet a clean-room one-word opus `-p` ping returned `alive` exit 0, exactly like the three healthy accounts. It only fails on real workloads: hermes' 90k-token / 381-msg request got `rate_limit_error` (`req_011Ce2ms*`) while the 5-token ping sailed through. **The setup-token liveness ping proves the token authenticates, not that the account has capacity** — so `rotate-oauth` will happily rotate *onto* a cancelled account and report success. Corollary for diagnosis: "all accounts ping alive" is not evidence the credential layer is healthy; check a large-request log instead.
 - **`rotate-oauth` cannot target a named account** — candidates are sorted by `five_hour_utilization`, which is permanently `0` for setup-tokens, so the order is arbitrary insertion order and it takes the first that pings alive. Off a dead account it lands wherever `Object.entries` points, *not* where you want. Fixed by adding `bus set-oauth-account <name>` (PR #91), which composes `setActiveAccount` + `writeTokenToAgents` so a manual switch still gets a `rotation_log` entry and `.env` propagation. Hand-editing `accounts.json` gets neither.
 - **Hermes has its own token manager and it can silently pin to a dead account.** `~/.hermes/anthropic-rotate.py` (launchd `ai.hermes.anthropic-rotate`, every 900s) runs in `mode=follow-active` (track the fleet) or `mode=pin` (own rate pool, so it doesn't contend with the work fleet). It was pinned to `aaronmsachs-max20` and logged `already on aaronmsachs-max20, no change` every 15 min for hours *while the gateway was hard-failing* — the pin means fleet rotation does NOT rescue hermes. Fix is `anthropic-rotate.py pin <account>` (rewrites `.env`, `hermes auth reset anthropic`, restarts gateway). **When cortext and hermes break together, they are two separate credential paths that both need moving.**
-- **5 of 14 enabled agents are outside the rotation mechanism.** `adoption`, `grower`, `infra`, `maintainer`, `marketing` have no `CLAUDE_CONFIG_DIR`, so per the 2026-07-14 note they prefer the shared keychain login over `CLAUDE_CODE_OAUTH_TOKEN` — a rotation cannot move them. They were verified clean (no limit banners) on 08-14, so the keychain seat is currently healthy; the latent risk is that when *it* dies, rotation won't help and the failure will look like a partial-fleet outage. `writeTokenToAgents` does append a token line to them, which is inert while the keychain wins.
+- **5 of 14 enabled agents are outside the rotation mechanism.** `adoption`, `grower`, `infra`, `maintainer`, `marketing` have no `CLAUDE_CONFIG_DIR`, so per the 2026-07-14 note they prefer the shared keychain login over `CLAUDE_CODE_OAUTH_TOKEN` — a rotation cannot move them. They were verified clean (no limit banners) on 08-14, so the keychain seat is currently healthy; the latent risk is that when *it* dies, rotation won't help and the failure will look like a partial-fleet outage. `writeTokenToAgents` does append a token line to them, ~~which is inert while the keychain wins~~.
+
+  ⚠️ **CORRECTED 2026-08-17 (`grower`'s catch, corrected in place by `marketing` on `boss`'s ruling): the struck clause STATES AS FACT the one thing nobody has measured.** **`writeTokenToAgents` appending the line is MEASURED. "Inert" is INHERITED from the 2026-07-14 note above, which is itself unverified and now confounded.** ⟹ 🔑 **HONEST FORM: ROTATION *WRITES* TO ALL 15. WHETHER IT *MOVES* ALL 15 IS UNVERIFIED, AND IS THE THING TO TEST.** ⚠️ **On 2026-08-17 this was briefly broadcast as REFUTED — rotation moves everyone, no gap — and retracted six minutes later: the test used `-p`, which this file already says cannot observe the interactive path. STATUS REMAINS UNVERIFIED.** ⚠️ **If the token does serve, rotation moves them and there is no gap at all — so the entire "5 outside the rotation mechanism" finding rests on the unverified half.**
+  🔑 **AND THE TRAP THAT MADE THIS SURVIVE, worth more than the correction (`maintainer`'s case): A DENIAL OF INHERITANCE IS ITSELF A PROVENANCE CLAIM AND NEEDS ITS OWN EVIDENCE.** A peer recorded *"rotation cannot move me (verified w/ positive control, not inherited from the 08-14 note)"* — **the parenthetical covers only the ABSENCE of the var, which they did measure; it does not cover "the keychain beats the token."** ⟹ **The disclaimer did the damage the bare claim could not: it reads as the whole sentence having been checked.**
+  📌 **A HALT NOTICE IS FORWARD-LOOKING ONLY.** *"Nobody should record this as verified"* does not tell anyone to check what they have **already** recorded. **Two agents had recorded it, and both found it only by going to look.**
 - **An agent can poison its own context with malformed tool calls and imitate them across restarts.** `boss` spent the day emitting literal `<invoke name="Bash">…</parameter>` XML as assistant *text* instead of real tool calls — 74 occurrences, peaking at ~70% of all tool-call attempts. Every malformed emission is stored as an assistant turn, so `--continue` feeds them back as in-context examples and the model imitates its own bad output; the loop is self-sustaining and **no model swap or nudge clears it**. Repinning `boss` from `claude-opus-4-8` to `claude-opus-5[1m]` only halved the rate (70.6% → 46.7%) because the new model inherited the contaminated history. A `bus hard-restart --handoff-doc <path>` (fresh session, no `--continue`) took it to **0/22 tool calls**. Diagnostic: `grep -c '<invoke name=' <session>.jsonl` — the PTY log is useless here (ANSI stripping mangles it into the `Whatdoyouwanttodo?` shape), the **session jsonl is authoritative**. Cross-agent comparison is the fast discriminator: all 8 other agents scored 0 on the same day.
 - **A publisher-layer fix is not live until you REPUBLISH — deploying the image does nothing to already-published pages.** The instatic iframe-embed fix (`08bd43c7`, outlet prop `richtext`→`richtextBody`) was verifiably inside the running image `001c2ea`, the container was healthy, both blog surfaces returned 200 — and iframes were still stripped. `escapeProps` runs at **publish** time, so every already-published page keeps the HTML it was sanitized into. A code deploy never re-renders it. **Verifying a deploy (image swapped, 200s, pages render) is NOT verifying a fix** — load content that actually exercises the fix. I reported "EMBED FIX IS LIVE" off deploy evidence and Aaron caught it still broken.
 - **A CMS's `publishedAt` can be the IMPORT timestamp, not the editorial date — and a tie in the sort key silently degrades to row order.** Four blog posts shared `publishedAt = 2026-08-14T13:44:55` to the second (one import batch), so `orderBy publishedAt desc` was a dead tie and the blog rendered in insertion order. The real dates lived in a custom `pubDate` field the loop **cannot** sort on (unsupported keys are silently ignored, not errored). Discriminating test that saved the diagnosis: set the sort to a known-supported key (`slug`) and watch whether the order moves — that separates "this sort key is unsupported" from "the sort prop isn't applying at all."
@@ -175,11 +197,55 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
 
 - **WHEN AN ARTIFACT IS UNOBSERVABLE, READ THE CODE THAT CONSTRUCTS IT.** `ps eww` returns nothing
   readable on darwin, so "does the daemon inject `CLAUDE_CONFIG_DIR`?" looked unanswerable. It is settled
-  in one read: `agent-pty.ts:368 getBaseEnv()` is an **explicit `keepVars` allowlist** that does *not*
-  spread `process.env`, and the var is not in it — so the daemon **cannot** inject it even if it carried
-  it. **Construction RULES OUT cases; observation only FAILS TO FIND them.** Same shape as the detector
-  bug one level up: `T` was measured on `last_fire_attempted_at`, an axis the failure cannot touch, so it
-  stayed fresh while everything real froze — **the signal was measured on the wrong side of the event.**
+  in one read: `agent-pty.ts:399 getBaseEnv()` is an **explicit `keepVars` allowlist** (`:402`) that does
+  *not* spread `process.env`, and the var is not in it — so the daemon **cannot inherit it from its own
+  environment.** **Construction RULES OUT cases; observation only FAILS TO FIND them.** Same shape as the
+  detector bug one level up: `T` was measured on `last_fire_attempted_at`, an axis the failure cannot
+  touch, so it stayed fresh while everything real froze — **the signal was measured on the wrong side of
+  the event.**
+
+  ### 🔴 CORRECTED 2026-08-17 17:0xZ — THE SENTENCE ABOVE IS TRUE AND IT WAS READ AS A BLOCKER IT IS NOT
+  **"The daemon cannot inherit it" is NOT "the agent cannot receive it."** The agent's `.env` is a
+  **separate, unfiltered path**: `agent-pty.ts:133-144` reads it line-by-line and writes **every** key into
+  `ptyEnv` at **`:141`** with no allowlist, and `ptyEnv` is handed to node-pty at **`:184`**. ⟹ **Setting
+  `CLAUDE_CONFIG_DIR` in an agent's `.env` DOES reach the child — that is how every agent which has it is
+  configured.**
+  ✅ **PROOF THAT NEEDS NO CODE READ (`infra`'s): ten agents have POPULATED private config dirs. Only a
+  `claude` that RECEIVED the var could have written them, and the var is not in `keepVars` — so it arrived
+  via `.env`.** *(Confirmed live the same day: `adoption`'s `.env` gained the var at `16:59:22Z` and its
+  private config dir was created and populated at `17:00:26Z`.)*
+  ⚠️ **THAT CANARY WAS REVERTED AT ~17:02Z AND `adoption` DOES NOT CARRY THE VAR TODAY — do not go looking
+  for it as evidence.** **The arrival proof is unaffected** (the dir could only have been written by a
+  `claude` that received the var) **but the rollout was halted for a different, deterministic reason: a
+  fresh `CLAUDE_CONFIG_DIR` has NO session history, the daemon boots with `--continue`, and
+  `No conversation found to continue` exits 1 — five crashes in ninety seconds.** ⟹ **The fix is a DAEMON
+  change (force `mode='fresh'` on the first boot after the var appears), NOT an `.env` edit.**
+  🔑 **AND THE COMPOUND THAT MAKES IT WORSE THAN A FAILED CHANGE: four of the five target agents have no
+  Telegram, so rolling it would have halted four agents that cannot say they halted.** **The exposure being
+  fixed and the fix's own failure mode share the same blind spot.**
+  📌 **Seeding `hasTrustDialogAccepted` is NECESSARY AND NOT SUFFICIENT — measured: the flag was present and
+  correct and the trust dialog fired anyway.** *(The 2026-07-14 entry above reads as though seeding solves
+  it. It does not.)*
+  ⚠️ **`07-14 keychain-beats-CLAUDE_CODE_OAUTH_TOKEN` is NARROWED, NOT CLOSED: the var arrives and the
+  private dir is used, but which credential SERVES is still unmeasured. Nobody should record it as verified —
+  and on 2026-08-17 it was briefly recorded as REFUTED and retracted six minutes later.** 🔑 **EVIDENCE THAT
+  NAMES A LIVE SYSTEM HAS A SHELF LIFE MEASURED IN MINUTES DURING AN ACTIVE CHANGE — this caveat has now been
+  wrong in BOTH directions inside one hour.**
+  ⚠️ **COST OF THE ORIGINAL WORDING: it was quoted to halt a five-agent remediation that was in fact
+  sound.** The entry is in **this file, which is LOADED into every agent's context at boot** — so the false
+  blocker **regenerated on demand** for two days rather than being read once.
+  🔑 **THE LESSON THAT SURVIVES, AND IT SHARPENS THE HEADLINE ABOVE RATHER THAN RETIRING IT: CONSTRUCTION
+  RULES OUT THE CASE YOU CONSTRUCTED, AND NOTHING ELSE.** One function was read and a conclusion about a
+  whole subsystem was written. **The rigour was real and the scope was one function wide — which is exactly
+  why it stood for two days.**
+  🔑 **AND THE RETRIEVAL-SIDE TWIN: A STORED FINDING CARRIES THE FRAME IT WAS WRITTEN IN, AND THE READER
+  SUPPLIES A NEW ONE WITHOUT NOTICING THE SWAP.** This sentence answered *"does the daemon inject it on its
+  own?"* (no) and was read as answering *"will adding it to `.env` reach the agent?"* (yes). **Same file,
+  same function, same sentence, opposite operational answer, and no error to notice.** ⟹ **Write the
+  QUESTION into a finding, not just the answer.**
+  📌 **`:368` was also wrong** — a coordinate carried from this entry into a live instruction. **It resolves
+  to `onExit`/`getOutputBuffer`: real code, right file, plausible, not the thing.** Third pointer error
+  traced to this entry, whose own neighbouring lesson is that **a wrong pointer resolves rather than 404s.**
 
 - **THREE CONSECUTIVE INSTRUMENT FAILURES WHILE CHECKING AN INSTRUMENT FAILURE** (infra, verbatim,
   because the sequence is the point). Task: does `list-approvals --status` exist? TOOLS.md documented
