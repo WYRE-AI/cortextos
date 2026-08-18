@@ -41,9 +41,9 @@ cortextos bus kb-ingest /path/to/docs \
 ```
 
 Ingest after:
-- Completing substantive research (always ingest your findings)
-- Writing or updating MEMORY.md
-- Learning important facts about the org, users, or systems
+- Completing substantive research worth sharing with the whole org — **`--scope shared`** (always ingest your findings)
+- Writing or updating your own MEMORY.md, daily memory, or handoff docs — **`--scope private --agent $CTX_AGENT_NAME`**, always, even when the entry documents fleet-wide findings. A daily memory file mixes personal log with research; ingesting the whole file to `shared` (2026-08-17 incident: a ~6,000-line daily memory file landed in `shared-wyre`, became 60% of that collection, and dominated retrieval for every agent) buries genuine shared findings under bulk personal content instead of surfacing them. If a memory entry contains something the whole org should find by search, extract just that finding into its own doc and ingest THAT to `shared` — don't ingest the memory file itself there.
+- Learning important facts about the org, users, or systems that are not yet written down anywhere — **`--scope shared`** if the fact belongs in shared org knowledge, **`--scope private`** if it's personal working context
 
 ---
 
