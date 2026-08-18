@@ -361,10 +361,7 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     // from prior external messages). Sanitize each so none can escape the fence
     // or forge a containment header. Unfenced context fields (reply/history) are
     // the weakest surface — they sit raw in [Replying to: "..."] / [Recent ...].
-    let replyCx = '';
-    if (replyToText) {
-      replyCx = `[Replying to: "${sanitizeForPtyInjection(replyToText.slice(0, 500))}"]\n`;
-    }
+    const replyCx = FastChecker.formatReplyContext(replyToText);
 
     let lastSentCtx = '';
     if (lastSentText) {
@@ -460,9 +457,10 @@ Reply using: cortextos slack send ${channel} '<your reply>' --as ${agentName}
     chatId: string | number,
     caption: string,
     imagePath: string,
+    replyToText?: string,
   ): string {
     return `=== TELEGRAM PHOTO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-caption:
+${FastChecker.formatReplyContext(replyToText)}caption:
 ${wrapFenceSafe(caption)}
 local_file: ${imagePath}
 Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
@@ -480,9 +478,10 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     caption: string,
     filePath: string,
     fileName: string,
+    replyToText?: string,
   ): string {
     return `=== TELEGRAM DOCUMENT from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-caption:
+${FastChecker.formatReplyContext(replyToText)}caption:
 ${wrapFenceSafe(caption)}
 local_file: ${filePath}
 file_name: ${sanitizeForPtyInjection(fileName)}
@@ -506,13 +505,14 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     filePath: string,
     duration: number | undefined,
     transcript?: string,
+    replyToText?: string,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     const transcriptBlock = transcript && transcript.trim()
       ? `transcript:\n${wrapFenceSafe(transcript.trim())}\n`
       : '';
     return `=== TELEGRAM VOICE from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-duration: ${dur}s
+${FastChecker.formatReplyContext(replyToText)}duration: ${dur}s
 local_file: ${filePath}
 ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
@@ -530,10 +530,11 @@ ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your repl
     filePath: string,
     fileName: string,
     duration: number | undefined,
+    replyToText?: string,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     return `=== TELEGRAM VIDEO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
-caption:
+${FastChecker.formatReplyContext(replyToText)}caption:
 ${wrapFenceSafe(caption)}
 duration: ${dur}s
 local_file: ${filePath}
@@ -541,6 +542,12 @@ file_name: ${sanitizeForPtyInjection(fileName)}
 Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
 `;
+  }
+
+  private static formatReplyContext(replyToText?: string): string {
+    return replyToText
+      ? `[Replying to: "${sanitizeForPtyInjection(replyToText.slice(0, 500))}"]\n`
+      : '';
   }
 
   /**

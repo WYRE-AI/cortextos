@@ -22,7 +22,7 @@ npm test
 - `src/` — TypeScript source (bus, cli, daemon, hooks, types, utils)
 - `bus/` — Shell wrapper scripts (delegate to `dist/cli.js bus`)
 - `dashboard/` — Next.js 14 web dashboard
-- `templates/` — Agent templates (agent, orchestrator, analyst)
+- `templates/` — Agent templates (agent, orchestrator, analyst, agent-codex, agent-opencode)
 - `community/` — Community skills and agent catalog
 - `tests/` — Unit, integration, and E2E tests
 
@@ -64,6 +64,26 @@ npm test
 - **Limit-rotation shipped and live-verified.** Full chain (PTY banner → limit-detector → rotation-manager → opus-ping preflight → accounts.json flip → .env rewrite → targeted restart → Telegram alert → cooldown guard) exercised end-to-end via a PATH-shimmed fake `claude` on warden that printed a real banner. Agent `.env` PATH lines override the daemon base env — useful for per-agent binary shims in future verifies.
 - **Weekly limits are rolling windows:** aaronmsachs-max20 was hard-blocked Tuesday but had usable capacity again by Thursday, two days before its stated "resets Jul 20" — a "dead" account can't be assumed dead for a live verify, hence the shim approach.
 - **PTY banner text has cursor-positioning escapes BETWEEN words** — after ANSI-stripping, text reads `Whatdoyouwanttodo?`. Any matching against agent PTY output must normalize whitespace away first.
+
+## Learnings - 2026-07-28
+
+- Upstream (grandamenium/cortextos) rewrote its published history for the
+  SEC-1 operator-metadata purge, so this fork's merge-base is pinned at the
+  initial release forever. Every upstream sync re-conflicts on shared files,
+  mostly "echo conflicts" (identical cherry-picked changes under different
+  SHAs). Scope syncs with `git merge-tree --write-tree` first, and after
+  resolving, grep for silently double-applied blocks outside conflict
+  markers — `tsc` caught duplicated methods in agent-manager.ts and
+  agent-pty.ts during the 2026-07-27 sync (merge 975a1e8c).
+- `.gitignore` blanket-ignores `docs/` (upstream SEC-1 posture). Curated
+  docs are deliberately force-added past it (`git add -f`), matching the
+  existing tracked runbooks. Run `.github/scripts/leak-guard.sh <files>` on
+  anything force-added; the `--tree HEAD` form is slow (minutes).
+- Known environment-flaky tests on the primary dev Mac (fail under load at
+  ANY commit, verified at pre-merge HEAD in a clean worktree): the four
+  fast-checker "heartbeat watchdog" fake-timer tests, phase4-performance p95
+  assertions, and phase5-performance SC-2. They pass on a quiet machine —
+  not regressions.
 
 ## Learnings - 2026-08-04
 

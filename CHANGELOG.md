@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### Fixed — fenced injection bodies capped at 16KB (tail-truncated)
+
+Every fenced PTY-injection path — inbox message bodies, Telegram/Slack text,
+media captions, voice transcripts, the urgent signal — flows through
+`wrapFenceSafe`, and none of them had a size limit: one oversized
+`--body-file` bus send could eat most of the recipient's context window in a
+single poll cycle. `wrapFenceSafe` now tail-truncates bodies over
+`MAX_FENCED_BODY_BYTES` (16 KB, ~4k tokens — generous enough that real
+traffic including pasted code blocks passes byte-exact) at a UTF-8-safe
+boundary, appending an in-fence marker naming the original size. Fence
+sizing still runs on the final body, so the unescapable-wrapper property is
+preserved. Unit tests cover the boundary, multibyte safety, fence sizing on
+truncated content, and the override parameter.
+
+### Changed — merged upstream `grandamenium/cortextos` main (2026-07-27)
+
+Second upstream sync since the fork (247 upstream commits; upstream had
+rewritten history for its SEC-1 operator-metadata purge, so most overlap
+arrived as echo conflicts). Notable upstream features integrated: opencode
+runtime (native `OpencodePTY` adapter, `agent-opencode` template, CLI
+scaffolding), context-handoff lifecycle refinements including the
+runtime-aware handoff grace window, codex-app-server mid-turn steering
+(`turn/steer`) and current-window token accounting, Telegram reply-target
+context threading and command-registration retry, CRM-assistant
+connect+verify setup, and the non-clobbering pre-push hook installer.
+Fork-side work preserved over upstream's older equivalents: the
+consecutive-restart context circuit breaker, rate-limit-aware
+hang restart with OAuth rotation, dual-source liveness + cross-path
+restart locks, agent-pidfile orphan reaping, per-engineer namespaces,
+media-route XSS hardening, and the name-free leak-guard port with this
+fork's operator identity.
 ### Fixed — `bus update-cron --prompt ""` wiped the prompt and reported success
 
 The CLI passed `--prompt` straight through whenever it was defined, and an empty
