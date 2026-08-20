@@ -3075,7 +3075,10 @@ busCommand
     }
     const orphaned = Object.keys(rotState.exhausted).filter(n => !(n in store.accounts));
     if (orphaned.length) {
-      console.log(`  WARN: exhaustion marks for accounts no longer in accounts.json (should self-prune on next rotation attempt): ${orphaned.join(', ')}`);
+      // No leading indent, unlike the per-account lines above — this is a
+      // fleet-level note, not an attribute of whichever account happened to
+      // print last (murph's review, PR #138).
+      console.log(`WARN: exhaustion marks for accounts no longer in accounts.json (should self-prune on next rotation attempt): ${orphaned.join(', ')}`);
     }
     const blockedAgents = Object.keys(rotState.limitBlocked);
     if (blockedAgents.length || rotState.alertedHalt) {
