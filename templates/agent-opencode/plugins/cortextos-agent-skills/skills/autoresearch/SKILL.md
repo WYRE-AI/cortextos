@@ -42,6 +42,16 @@ cortextos bus evaluate-experiment <experiment_id> <measured_value> --justificati
 ```
 For qualitative metrics, use `--score <1-10>` with a written justification.
 
+**Before hypothesizing anything new (added 2026-08-20, task_1787177605390): check for an orphaned approved proposal.** Approvals resolve asynchronously — the approval for an experiment you proposed last cycle may have been granted after your session already ended, and nothing else brings you back to run it. Check your own proposed experiments first:
+```bash
+cortextos bus list-experiments --agent $CTX_AGENT_NAME --status proposed --json
+```
+For any result with no matching entry in `experiments/active.json`, check whether its "Run experiment: ..." approval was resolved:
+```bash
+cortextos bus list-approvals --all --format json | jq '[.[] | select(.title | startswith("Run experiment:"))]'
+```
+Match by metric name / hypothesis text (titles are agent-authored free text, not a clean foreign key — use judgment). If an approved match exists, **resume at Step 5 for that experiment now** — do not hypothesize a new one while an approved-but-unrun proposal is sitting there; that is exactly how proposals silently pile up instead of running. If the match is still pending, leave it (don't nag) but also don't create a duplicate proposal for the same question this cycle — note it in Step 6 instead.
+
 ### Step 3: Hypothesize
 Based on accumulated learnings:
 - Review what worked (keeps) and what failed (discards)
