@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { RotationManager, isLimitBlocked } from '../../src/daemon/rotation-manager.js';
+import { RotationManager, isLimitBlocked, loadRotationState } from '../../src/daemon/rotation-manager.js';
 import type { LimitEvent } from '../../src/daemon/limit-detector.js';
 
 const EV: LimitEvent = { kind: 'session', resetAt: null, matchedText: "You'vehityoursessionlimit" };
@@ -266,5 +266,96 @@ describe('disabled accounts on the daemon rotation path (#93 warden finding)', (
     expect(store.active).toBe('c');
     expect(preflight).toHaveBeenCalledWith('tok-b');
     expect(preflight).toHaveBeenCalledWith('tok-c');
+  });
+});
+
+describe('exhaustion observations (2026-08-20 fix)', () => {
+  let ctxRoot: string, frameworkRoot: string;
+  let t: number;
+  let preflight: ReturnType<typeof vi.fn>;
+  let restartAgent: ReturnType<typeof vi.fn>;
+  let sendAlert: ReturnType<typeof vi.fn>;
+  let rm: RotationManager;
+
+  beforeEach(() => {
+    ctxRoot = mkdtempSync(join(tmpdir(), 'ctx-'));
+    frameworkRoot = mkdtempSync(join(tmpdir(), 'fw-'));
+    seedAccounts(ctxRoot);
+    makeAgentEnvs(frameworkRoot, 'wyre', ['boss', 'dev']);
+    t = T0;
+    preflight = vi.fn().mockResolvedValue('ok');
+    restartAgent = vi.fn().mockResolvedValue(undefined);
+    sendAlert = vi.fn();
+    rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {},
+    });
+  });
+
+  it('an orphaned exhaustion mark (account removed from accounts.json) never poisons the derived retryAt', async () => {
+    // Reproduces the live 2026-08-20 bug exactly: a retired/removed account's
+    // mark is never cleared by the normal path (that only fires on rotating
+    // INTO the account), so an ancient timestamp sits in `exhausted` forever
+    // and Math.min() picks it every time — retryAt gets stuck in the past,
+    // permanently, regardless of what the REAL candidates' resets are.
+    mkdirSync(join(ctxRoot, 'state', 'oauth'), { recursive: true });
+    writeFileSync(join(ctxRoot, 'state', 'oauth', 'rotation-state.json'), JSON.stringify({
+      limitBlocked: {}, exhausted: { ghost: 12345 }, // bare-number legacy shape; 'ghost' is not in accounts.json
+      lastRotationAt: 0, retryAt: null, lastPreflightAt: 0, alertedHalt: false,
+      consecutiveInfraTicks: 0, lastInfraAlertAt: 0,
+    }));
+
+    preflight.mockResolvedValue('limit'); // every real candidate dry -> halt path
+    await rm.onLimitEvent('boss', EV);
+    const state = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/rotation-state.json'), 'utf-8'));
+    // Same value the existing "falls back to synthetic-expiry" test asserts —
+    // proves the ghost's ancient 12345 was excluded, not just "some future time".
+    expect(state.retryAt).toBe(t + 35 * 60_000);
+    expect(state.exhausted.ghost).toBeUndefined(); // pruned, not just ignored
+  });
+
+  it('records observedAt and source alongside resetAt, not a bare derived number', async () => {
+    preflight.mockResolvedValue('limit');
+    await rm.onLimitEvent('boss', EV);
+    const state = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/rotation-state.json'), 'utf-8'));
+    expect(state.exhausted.b).toEqual({ observedAt: t, resetAt: t + 30 * 60_000, source: 'candidate-preflight' });
+  });
+
+  it('re-observing an already-exhausted account updates observedAt but preserves its existing resetAt', async () => {
+    // The observation ("we saw this at T") must stay fresh even when the
+    // derived resetAt guess doesn't change — otherwise "account X exhausted"
+    // goes stale exactly like a bare verdict would. Uses the all-dry/halt
+    // path deliberately: the success path reloads state from disk mid-call
+    // (see its own "Reload: preflights are slow" comment) and would discard
+    // this same call's in-memory update before ever saving it, which would
+    // make this assertion pass for the wrong reason.
+    mkdirSync(join(ctxRoot, 'state', 'oauth'), { recursive: true });
+    // Must be <= t (already "expired") or the candidates filter (rec.resetAt >
+    // t) skips b as not-yet-eligible and it never gets re-tried at all —
+    // distinctive just means "not equal to any value this run would compute".
+    const distinctiveResetAt = t - 12_345_678;
+    writeFileSync(join(ctxRoot, 'state', 'oauth', 'rotation-state.json'), JSON.stringify({
+      limitBlocked: {},
+      exhausted: { b: { observedAt: t - 60_000, resetAt: distinctiveResetAt, source: 'limit-banner' } },
+      lastRotationAt: 0, retryAt: null, lastPreflightAt: 0, alertedHalt: false,
+      consecutiveInfraTicks: 0, lastInfraAlertAt: 0,
+    }));
+    preflight.mockResolvedValue('limit'); // b re-confirmed dry, c dry too -> halt, no reload
+    await rm.onLimitEvent('boss', EV);
+    const state = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/rotation-state.json'), 'utf-8'));
+    expect(state.exhausted.b.resetAt).toBe(distinctiveResetAt); // preserved, not overwritten by a fresh fallback
+    expect(state.exhausted.b.observedAt).toBe(t); // but freshly re-confirmed
+    expect(state.exhausted.b.source).toBe('limit-banner'); // source of the ORIGINAL observation kept too
+  });
+
+  it('migrates a legacy bare-number exhausted entry to the observation shape on load', () => {
+    mkdirSync(join(ctxRoot, 'state', 'oauth'), { recursive: true });
+    writeFileSync(join(ctxRoot, 'state', 'oauth', 'rotation-state.json'), JSON.stringify({
+      limitBlocked: {}, exhausted: { b: 1784718000000 },
+      lastRotationAt: 0, retryAt: null, lastPreflightAt: 0, alertedHalt: false,
+      consecutiveInfraTicks: 0, lastInfraAlertAt: 0,
+    }));
+    const state = loadRotationState(ctxRoot);
+    expect(state.exhausted.b).toEqual({ observedAt: 0, resetAt: 1784718000000, source: 'legacy-migrated' });
   });
 });

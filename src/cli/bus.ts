@@ -22,6 +22,7 @@ import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByN
 import { nextFireFromCron, computeReferenceMs } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, setActiveAccount, writeTokenToAgents, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { loadRotationState } from '../daemon/rotation-manager.js';
 import { mintInstallationToken, shouldRefuseInteractivePrint, redactForJson } from '../bus/github-app.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
@@ -3053,6 +3054,7 @@ busCommand
       console.log('No accounts.json found at state/oauth/accounts.json');
       return;
     }
+    const rotState = loadRotationState(env.ctxRoot);
     for (const [name, acct] of Object.entries(store.accounts)) {
       const active = name === store.active ? ' (active)' : '';
       const disabled = acct.disabled ? ' (disabled)' : '';
@@ -3061,6 +3063,24 @@ busCommand
       const warn7d = acct.seven_day_utilization >= ALERT_7D ? ' ⚠️' : '';
       console.log(`${name}${active}${disabled}`);
       console.log(`  5h: ${pct(acct.five_hour_utilization)}${warn5h}  7d: ${pct(acct.seven_day_utilization)}${warn7d}  expires: ${expiry}`);
+      // Surfaces the daemon's own rotation-manager state — previously only
+      // readable by hand-catting state/oauth/rotation-state.json. An
+      // observation, not just a verdict: WHEN it was seen and HOW, so it's
+      // auditable rather than a bare "exhausted" boolean going stale silently.
+      const exh = rotState.exhausted[name];
+      if (exh) {
+        console.log(`  EXHAUSTED: observed ${new Date(exh.observedAt).toISOString()} (via ${exh.source}), `
+          + `retry-eligible ${new Date(exh.resetAt).toISOString()}`);
+      }
+    }
+    const orphaned = Object.keys(rotState.exhausted).filter(n => !(n in store.accounts));
+    if (orphaned.length) {
+      console.log(`  WARN: exhaustion marks for accounts no longer in accounts.json (should self-prune on next rotation attempt): ${orphaned.join(', ')}`);
+    }
+    const blockedAgents = Object.keys(rotState.limitBlocked);
+    if (blockedAgents.length || rotState.alertedHalt) {
+      console.log(`fleet: blocked=[${blockedAgents.join(', ')}] alertedHalt=${rotState.alertedHalt} `
+        + `retryAt=${rotState.retryAt ? new Date(rotState.retryAt).toISOString() : 'none'}`);
     }
   });
 

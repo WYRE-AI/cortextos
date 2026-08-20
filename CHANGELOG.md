@@ -33,6 +33,41 @@ hang restart with OAuth rotation, dual-source liveness + cross-path
 restart locks, agent-pidfile orphan reaping, per-engineer namespaces,
 media-route XSS hardening, and the name-free leak-guard port with this
 fork's operator identity.
+
+### Fixed — a retired account's exhaustion mark permanently poisoned rotation's retry timer
+
+`rotation-manager.ts` derived its ALL-EXHAUSTED retry timestamp as
+`Math.min(...Object.values(state.exhausted)) + 5min`, taking the earliest
+known reset time across every account ever marked exhausted. Nothing ever
+pruned an entry once its account was retired — the only clearing path fires
+on a successful rotation *into* that account, which can never happen for one
+that's gone. So a retired account's mark from weeks earlier sat in
+`exhausted` forever, and `Math.min()` picked it every single time.
+
+Reproduced live: `aaronmsachs-max20` was retired 2026-08-14 (moved out of
+`accounts.json`'s `accounts` into its `retired` bucket). Its exhaustion mark —
+`2026-07-22T11:00:00Z` — was still on disk in `rotation-state.json` on
+2026-08-20, and every rotation attempt since had derived `retryAt` from it
+instead of from the real, currently-exhausted accounts. The daemon logged
+`ALL OAuth accounts exhausted... Auto-retry at 2026-07-22T11:05:00.000Z` on
+every pass, the same stale timestamp, unchanged for a month.
+
+Fixed two ways: `pruneOrphanedExhaustion` drops marks for accounts no longer
+in `store.accounts` on every rotation attempt, and the `retryAt` computation
+itself now filters `state.exhausted` to live accounts as a second, independent
+guard — belt-and-braces, so a future caller of the derived value can't
+reintroduce the same class of bug by skipping the prune.
+
+Also: `exhausted` now stores an *observation* per account — `{observedAt,
+resetAt, source}` — instead of a bare derived `resetAt` number. A stored
+verdict (`ALL_EXHAUSTED: true`, or a single number with no timestamp) goes
+stale exactly like this bug did; recording *what was observed and when*
+means the observation itself stays true even after the derived guess is
+wrong. `list-oauth-accounts` now surfaces both the per-account observation
+and the fleet-wide `limitBlocked`/`alertedHalt`/`retryAt` state, previously
+only readable by hand-catting `rotation-state.json`. Old bare-number state
+files migrate transparently on load (`source: 'legacy-migrated'`).
+
 ### Fixed — `bus update-cron --prompt ""` wiped the prompt and reported success
 
 The CLI passed `--prompt` straight through whenever it was defined, and an empty
