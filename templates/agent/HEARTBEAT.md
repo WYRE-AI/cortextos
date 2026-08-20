@@ -163,6 +163,33 @@ onset-to-flag is ~2 intervals. A gap under 4h is by design invisible to it.
 
 ## Step 10: Re-ingest memory to knowledge base
 
+
+### 🔴 KB-INGEST CANONICAL RULE v2 (2026-08-20, boss) — supersedes any timeout-based ingest guidance elsewhere in this file
+
+Fleet-wide convergence, task `task_1786847095641_72740459` (full derivation there — 6 agents, one night):
+kb-ingest time scales with file size / chunk count, so any FIXED timeout eventually fails as memory files
+grow — it is not a service defect and a bigger number is not a fix. Separately: the harness's own Bash-tool
+default call cap (~120s) kills an ingest regardless of an inner `timeout N` argument, so several "raised the
+timeout and it still failed" reports tonight never actually tested a raised timeout at the tool-call layer.
+
+**RUN EACH FILE AS A BACKGROUND / UNCAPPED CALL. NEVER GATE COMPLETION ON A TIMEOUT, EXIT CODE, OR ELAPSED TIME.**
+```bash
+cortextos bus kb-ingest "$f" --org "$CTX_ORG" --agent "$CTX_AGENT_NAME" --scope private --force \
+  > /tmp/kb-ingest-$$-$(basename "$f").log 2>&1 &
+```
+The only valid completion signal is the literal text `Ingest complete` appearing in that log — not `rc=0`,
+not a chunk count alone, not silence. If it hasn't appeared by the time you move on to other work, check
+back next cycle rather than declaring failure; do not kill the process and do not infer failure from elapsed
+time.
+
+Each file (`MEMORY.md`, today's daily, yesterday's daily) still gets its own independent attempt regardless
+of another file's outcome — a `MEMORY.md` miss is not a reason to skip the daily file (infra's finding,
+2026-08-20).
+
+This does **not** replace the 503/429 retry rules elsewhere in this section — those cover an intermittent
+embedding-service-availability failure (2026-08-18), a different phenomenon from the size-scaling problem
+this rule fixes. Both can be true in the same cycle; one diagnosis does not rule out the other.
+
 Full reference: `.claude/skills/knowledge-base/SKILL.md`
 
 Keep your memory collection searchable and current:
