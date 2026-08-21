@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed — `check-stale-blockers` summary had no coverage denominator
+
+`resolved_dependency: 0` in `StaleBlockerReport.summary` was indistinguishable
+from "checked N blocked tasks, found none stale" versus "0 of N were even
+checkable" — most blocked tasks carry no `blocked_by` field at all, so the
+`resolved_dependency` check can't evaluate them. Added
+`resolved_dependency_eligible` (count of scanned tasks that actually carry a
+non-empty `blocked_by`) to the summary, and to the `--format text` output, so
+a reader can tell the two apart.
+
 ### Fixed — a retired account's exhaustion mark permanently poisoned rotation's retry timer
 
 `rotation-manager.ts` derived its ALL-EXHAUSTED retry timestamp as
