@@ -24,9 +24,23 @@ export interface RotationDeps {
   log: (msg: string) => void;
 }
 
-interface RotationState {
+/**
+ * A raw OBSERVATION ("account X returned exhausted at T, via Y"), not a bare
+ * derived verdict. A bare resetAt number (the old shape) can only ever go
+ * stale silently — exactly like a stored ALL_EXHAUSTED boolean or a hand-set
+ * expiry, it stops being re-derived the moment it's written. Recording
+ * observedAt + source means the observation itself stays true forever, even
+ * once resetAt's guess is wrong.
+ */
+export interface ExhaustionObservation {
+  observedAt: number; // epoch ms — when this observation was made
+  resetAt: number; // derived: earliest time a retry might succeed (best current guess)
+  source: 'limit-banner' | 'proactive-preflight' | 'candidate-preflight' | 'active-recheck' | 'legacy-migrated';
+}
+
+export interface RotationState {
   limitBlocked: Record<string, { detectedAt: number; kind: string; resetAt: number | null }>;
-  exhausted: Record<string, number>; // account name -> known resetAt (epoch ms)
+  exhausted: Record<string, ExhaustionObservation>;
   lastRotationAt: number;
   retryAt: number | null;
   lastPreflightAt: number;
@@ -59,13 +73,60 @@ function statePath(ctxRoot: string): string {
   return join(ctxRoot, 'state', 'oauth', 'rotation-state.json');
 }
 
+/**
+ * Pre-migration state carried a bare resetAt number per account. Convert on
+ * read so every caller only ever sees the observation shape — observedAt 0
+ * marks "migrated, true observation time unknown" rather than fabricating one.
+ */
+function migrateExhausted(raw: unknown): Record<string, ExhaustionObservation> {
+  const out: Record<string, ExhaustionObservation> = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === 'number') {
+      out[name] = { observedAt: 0, resetAt: value, source: 'legacy-migrated' };
+    } else if (value && typeof value === 'object' && typeof (value as ExhaustionObservation).resetAt === 'number') {
+      out[name] = value as ExhaustionObservation;
+    }
+  }
+  return out;
+}
+
 function loadState(ctxRoot: string): RotationState {
   try {
     if (!existsSync(statePath(ctxRoot))) return { ...EMPTY_STATE, limitBlocked: {}, exhausted: {} };
-    return { ...EMPTY_STATE, ...JSON.parse(readFileSync(statePath(ctxRoot), 'utf-8')) };
+    const parsed = JSON.parse(readFileSync(statePath(ctxRoot), 'utf-8'));
+    return { ...EMPTY_STATE, ...parsed, exhausted: migrateExhausted(parsed.exhausted) };
   } catch {
     return { ...EMPTY_STATE, limitBlocked: {}, exhausted: {} };
   }
+}
+
+/** Read-only accessor for callers outside the manager (e.g. list-oauth-accounts) — same migration, no side effects. */
+export function loadRotationState(ctxRoot: string): RotationState {
+  return loadState(ctxRoot);
+}
+
+/**
+ * Drop exhaustion marks for accounts no longer in accounts.json (retired or
+ * removed). BUG FOUND 2026-08-20: a retired account's mark is never cleared
+ * by the normal path (that only fires on a successful rotation INTO the
+ * account, which can't happen for a retired one), so it sits in `exhausted`
+ * forever. Math.min() over knownResets then picks the oldest one it can find
+ * — an account retired weeks ago poisons the derived retryAt to a timestamp
+ * already in the past, permanently, on every single computation. Reproduced
+ * live: aaronmsachs-max20 retired 2026-08-14, its exhausted mark from
+ * 2026-07-22T11:00Z was still driving retryAt on 2026-08-20 — the exact
+ * "105 occurrences, retryAt reprinted unchanged" symptom.
+ */
+function pruneOrphanedExhaustion(state: RotationState, liveAccounts: Record<string, unknown>): boolean {
+  let changed = false;
+  for (const name of Object.keys(state.exhausted)) {
+    if (!(name in liveAccounts)) {
+      delete state.exhausted[name];
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 /** FastChecker consult: is this agent's recovery owned by the rotation manager? */
@@ -106,7 +167,9 @@ export class RotationManager {
     // (fallback expiry when no hint) — the mark also tells doRotation's
     // active-recovery recheck "don't waste a ping, the banner is fresh proof".
     const active = loadAccounts(this.deps.ctxRoot)?.active;
-    if (active) state.exhausted[active] = ev.resetAt ?? t + RETRY_FALLBACK_MS;
+    if (active) {
+      state.exhausted[active] = { observedAt: t, resetAt: ev.resetAt ?? t + RETRY_FALLBACK_MS, source: 'limit-banner' };
+    }
     this.save(state);
     this.deps.log(`[rotation] ${agent} limit-blocked (${ev.kind}, reset ${ev.resetAt ? new Date(ev.resetAt).toISOString() : 'unknown'})`);
     await this.attemptRotation('limit banner on ' + agent);
@@ -130,7 +193,8 @@ export class RotationManager {
       if (result === 'limit') {
         this.deps.log(`[rotation] proactive preflight: active account "${store.active}" exhausted — rotating ahead of the fleet`);
         const s2 = loadState(this.deps.ctxRoot);
-        s2.exhausted[store.active] = t + RETRY_FALLBACK_MS; // no hint from a ping; conservative
+        // no hint from a ping; conservative fallback
+        s2.exhausted[store.active] = { observedAt: t, resetAt: t + RETRY_FALLBACK_MS, source: 'proactive-preflight' };
         s2.consecutiveInfraTicks = 0; // a real 'limit' proves the mechanism works
         this.save(s2);
         await this.attemptRotation('proactive preflight found active account exhausted');
@@ -187,6 +251,11 @@ export class RotationManager {
     const store = loadAccounts(this.deps.ctxRoot);
     if (!store) { this.deps.log('[rotation] no accounts.json — cannot rotate'); return; }
 
+    // A retired/removed account's exhaustion mark can never be cleared by the
+    // normal path (that only fires on rotating INTO it) — prune it here, on
+    // every rotation attempt, so it can't sit forever poisoning retryAt below.
+    if (pruneOrphanedExhaustion(state, store.accounts)) this.save(state);
+
     const candidates = Object.keys(store.accounts).filter(name => {
       if (name === store.active) return false;
       // Operator-retired seats are never candidates: a cancelled subscription
@@ -194,8 +263,8 @@ export class RotationManager {
       // no capacity), so this filter is the only protection on the daemon's
       // unattended rotation path — same rule as the bus rotate-oauth builder.
       if (store.accounts[name].disabled) return false;
-      const resetAt = state.exhausted[name];
-      return !(resetAt && resetAt > t);
+      const rec = state.exhausted[name];
+      return !(rec && rec.resetAt > t);
     });
 
     let attempted = 0;
@@ -241,7 +310,16 @@ export class RotationManager {
       }
       if (result === 'limit') {
         sawNonError = true;
-        state.exhausted[name] = state.exhausted[name] ?? t + RETRY_FALLBACK_MS;
+        // Keep an existing resetAt guess (don't push a real hint out with a
+        // fresh fallback), but observedAt always advances — we just
+        // re-confirmed this a moment ago, and that observation matters even
+        // when the derived retry time doesn't change.
+        const existing = state.exhausted[name];
+        state.exhausted[name] = {
+          observedAt: t,
+          resetAt: existing?.resetAt ?? t + RETRY_FALLBACK_MS,
+          source: existing?.source ?? 'candidate-preflight',
+        };
         this.deps.log(`[rotation] candidate "${name}" exhausted`);
       } else {
         this.deps.log(`[rotation] candidate "${name}" preflight error — skipped, not marked exhausted`);
@@ -251,7 +329,7 @@ export class RotationManager {
     // Bench dry — the ACTIVE account may itself have recovered (5h windows reset
     // on their own). Recheck it unless a still-fresh exhausted mark says otherwise;
     // on recovery, restart blocked agents onto it — no account flip needed.
-    const activeExhaustedUntil = state.exhausted[store.active] ?? 0;
+    const activeExhaustedUntil = state.exhausted[store.active]?.resetAt ?? 0;
     if (activeExhaustedUntil <= t) {
       const activeResult = await this.deps.preflight(store.accounts[store.active].access_token);
       attempted += 1;
@@ -279,7 +357,7 @@ export class RotationManager {
       }
       if (activeResult === 'limit') sawNonError = true;
       const s3 = loadState(this.deps.ctxRoot);
-      s3.exhausted[store.active] = t + RETRY_FALLBACK_MS;
+      s3.exhausted[store.active] = { observedAt: t, resetAt: t + RETRY_FALLBACK_MS, source: 'active-recheck' };
       state.exhausted[store.active] = s3.exhausted[store.active];
       this.save(s3);
     }
@@ -297,8 +375,14 @@ export class RotationManager {
     }
 
     // All dry: halt, single alert, schedule retry at earliest known reset.
+    // BUG FIX: exclude accounts no longer in store.accounts (retired/removed)
+    // — pruneOrphanedExhaustion already drops these going forward, but this
+    // filter is the load-bearing guard against Math.min() ever picking an
+    // ancient orphaned mark again, belt-and-braces with the prune above.
     const knownResets = [
-      ...Object.values(state.exhausted),
+      ...Object.entries(state.exhausted)
+        .filter(([name]) => name in store.accounts)
+        .map(([, rec]) => rec.resetAt),
       ...Object.values(state.limitBlocked).map(b => b.resetAt).filter((x): x is number => x !== null),
     ];
     state.retryAt = knownResets.length ? Math.min(...knownResets) + 5 * 60_000 : t + RETRY_FALLBACK_MS;
