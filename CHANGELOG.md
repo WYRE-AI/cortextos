@@ -36,6 +36,21 @@ and the fleet-wide `limitBlocked`/`alertedHalt`/`retryAt` state, previously
 only readable by hand-catting `rotation-state.json`. Old bare-number state
 files migrate transparently on load (`source: 'legacy-migrated'`).
 
+### Fixed — hang-detector said "delivered" in its reason string while reading an ATTEMPTED field
+
+`evaluateHang`'s fail-safe reason string and the (now-dead, kept for tests only)
+`mostRecentDeliveredFireMs` helper both said "delivered" while reading
+`last_fire_attempted_at` — a field that advances whether or not the agent
+actually consumed the fire. This is not cosmetic: the misnomer produced a
+false root cause during the 2026-08-15 11h maintainer outage investigation
+(three agents, one misleading identifier, one wasted cycle refuting it).
+Renamed the helper to `mostRecentAttemptedFireMs`, changed the reason string
+to `'no fire attempt recorded — fail-safe'`, and added a comment at the
+`T === null` branch naming the two conditions that actually produce null
+(no attempt ever recorded, or every attempt is still within `graceMs`).
+No behavior change — `evaluateHang`'s live anchor is unaffected
+(`mostRecentAnswerableFireMs`, added in #121, was already correctly named).
+
 ### Fixed — fenced injection bodies capped at 16KB (tail-truncated)
 
 Every fenced PTY-injection path — inbox message bodies, Telegram/Slack text,

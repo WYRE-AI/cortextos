@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateHang, evaluateBootstrapHang, mostRecentDeliveredFireMs, mostRecentAnswerableFireMs, hasBeatSinceRestart } from '../../../src/daemon/hang-detector.js';
+import { evaluateHang, evaluateBootstrapHang, mostRecentAttemptedFireMs, mostRecentAnswerableFireMs, hasBeatSinceRestart } from '../../../src/daemon/hang-detector.js';
 
 const MIN = 60_000;
 const GRACE = 15 * MIN;
@@ -215,28 +215,28 @@ describe('hang-detector — evaluateBootstrapHang (#19b: restart is an expected-
   });
 });
 
-describe('hang-detector — mostRecentDeliveredFireMs (batching-aware)', () => {
+describe('hang-detector — mostRecentAttemptedFireMs (batching-aware)', () => {
   it('picks the MOST-RECENT fire across crons (batching: one beat after the latest fire)', () => {
     const crons = [
       { last_fire_attempted_at: iso(NOW - 40 * MIN) },
       { last_fire_attempted_at: iso(NOW - 10 * MIN) }, // most recent
       { last_fire_attempted_at: iso(NOW - 25 * MIN) },
     ];
-    expect(mostRecentDeliveredFireMs(crons)).toBe(NOW - 10 * MIN);
+    expect(mostRecentAttemptedFireMs(crons)).toBe(NOW - 10 * MIN);
   });
 
   it('returns null when no cron has a parseable last_fire_attempted_at', () => {
-    expect(mostRecentDeliveredFireMs([{ last_fire_attempted_at: null }, {}, { last_fire_attempted_at: 'not-a-date' }])).toBeNull();
+    expect(mostRecentAttemptedFireMs([{ last_fire_attempted_at: null }, {}, { last_fire_attempted_at: 'not-a-date' }])).toBeNull();
   });
 
   it('ignores unparseable timestamps but keeps valid ones', () => {
     const crons = [{ last_fire_attempted_at: 'garbage' }, { last_fire_attempted_at: iso(NOW - 12 * MIN) }];
-    expect(mostRecentDeliveredFireMs(crons)).toBe(NOW - 12 * MIN);
+    expect(mostRecentAttemptedFireMs(crons)).toBe(NOW - 12 * MIN);
   });
 
   it('feeds the sensor end-to-end: latest fire past grace + stale session beat = HUNG', () => {
     const crons = [{ last_fire_attempted_at: iso(NOW - 30 * MIN) }, { last_fire_attempted_at: iso(NOW - 18 * MIN) }];
-    const T = mostRecentDeliveredFireMs(crons)!;
+    const T = mostRecentAttemptedFireMs(crons)!;
     const S = NOW - 40 * MIN; // last session beat older than the latest fire
     expect(evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: T, lastSessionHeartbeat: S }).hung).toBe(true);
   });
@@ -323,7 +323,7 @@ describe('hang-detector — a frequent cron must not blind the sensor (self-refr
     const crons = firesSince(onset, NOW);
     const S = onset;
 
-    const stale = mostRecentDeliveredFireMs(crons)!; // newest ATTEMPT — always fresh
+    const stale = mostRecentAttemptedFireMs(crons)!; // newest ATTEMPT — always fresh
     expect(NOW - stale).toBeLessThanOrEqual(GRACE);  // hence permanently "within grace"
     expect(evaluateHang({ now: NOW, graceMs: GRACE, deliveredFireAt: stale, lastSessionHeartbeat: S }).hung).toBe(false);
 
@@ -345,7 +345,7 @@ describe('hang-detector — a frequent cron must not blind the sensor (self-refr
     const T4 = NOW - 20 * MIN; // a 4h cron that fired 20min ago
     const crons = [{ last_fire_attempted_at: iso(T4) }];
     expect(mostRecentAnswerableFireMs(crons, NOW, GRACE)).toBe(T4);
-    expect(mostRecentDeliveredFireMs(crons)).toBe(T4); // identical to the old anchor
+    expect(mostRecentAttemptedFireMs(crons)).toBe(T4); // identical to the old anchor
   });
 
   it('no fire is old enough yet — returns null, and null is fail-safe', () => {
