@@ -9,7 +9,7 @@ import { stopCommand } from './stop.js';
 import { restartCommand } from './restart.js';
 import { statusCommand } from './status.js';
 import { doctorCommand } from './doctor.js';
-import { busCommand } from './bus.js';
+import { busCommand, shieldKbQueryLeadingDash } from './bus.js';
 import { listAgentsCommand } from './list-agents.js';
 import { notifyAgentCommand } from './notify-agent.js';
 import { listSkillsCommand } from './list-skills.js';
@@ -75,4 +75,7 @@ const crashAlertCommand = new Command('crash-alert')
   });
 program.addCommand(crashAlertCommand);
 
-program.parse();
+// See shieldKbQueryLeadingDash's own comment (src/cli/bus.ts) — must run before
+// parse(), since commander rejects a leading-dash positional during parsing
+// itself, ahead of any action handler.
+program.parse(shieldKbQueryLeadingDash(process.argv));

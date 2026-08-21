@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Fixed — `bus kb-query` rejected any question starting with `-`
+
+Commander parsed `kb-query`'s positional `<question>` argument as an
+unrecognized option whenever it began with `-` — `kb-query '- some fact'`
+failed with `error: unknown option '- some fact'` at exit code 1, with the
+error on stderr and **nothing on stdout**. A caller that only checks stdout
+(as the KB freshness-sweep probes do) cannot tell that apart from a genuine
+no-match, so it silently scores a false MISS instead of surfacing an error.
+Measured impact: probes drawn from markdown bullet lines — which routinely
+start with `-` — scored 7.1% and then 0.0% freshness across two instrument
+revisions of `kb_ingest_fleet_freshness`, entirely from this, not from stale
+content.
+
+Passing `--` doesn't help as a workaround: once commander sees it, *every*
+later token becomes positional too, so a caller's `--org`/`--agent`/`--scope`
+flags get swept up right along with the question and the command fails with
+"too many arguments" instead.
+
+Fixed at the CLI entry point rather than pushing the burden onto every
+caller: `shieldKbQueryLeadingDash()` inspects `process.argv` before
+`program.parse()` and, only when the token immediately after `kb-query`
+starts with `-` and isn't one of `kb-query`'s own registered flags (checked
+against the command's live `.options`, not a hand-maintained list, so this
+can't drift out of sync with them), prefixes it with a sentinel so commander
+accepts it as the positional value. The action handler strips the sentinel
+back off before the question ever reaches `queryKnowledgeBase`.
+
 ### Fixed — `check-stale-blockers` summary had no coverage denominator
 
 `resolved_dependency: 0` in `StaleBlockerReport.summary` was indistinguishable
