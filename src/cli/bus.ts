@@ -881,7 +881,8 @@ busCommand
         console.log('');
       }
       console.log(
-        `Total: ${report.entries.length} flagged (${report.summary.resolved_dependency} resolved-dependency, ` +
+        `Total: ${report.entries.length} flagged (${report.summary.resolved_dependency} resolved-dependency ` +
+        `of ${report.summary.resolved_dependency_eligible} eligible (has blocked_by), ` +
         `${report.summary.unverified_external_ref} needs-manual-check) out of ${report.summary.scanned} blocked tasks scanned.`,
       );
     } else {

@@ -407,6 +407,7 @@ describe('Bus System', () => {
       const report = checkStaleBlockers(testDir);
 
       expect(report.summary.scanned).toBe(1);
+      expect(report.summary.resolved_dependency_eligible).toBe(1);
       expect(report.entries).toHaveLength(1);
       expect(report.entries[0]).toMatchObject({
         task_id: 'task_blocked',
@@ -415,7 +416,7 @@ describe('Bus System', () => {
       });
     });
 
-    it('does not flag a blocked task whose dependency is still open', () => {
+    it('does not flag a blocked task whose dependency is still open, but still counts it as eligible', () => {
       writeTask('myorg', { id: 'task_dep', title: 'dependency', status: 'in_progress' });
       writeTask('myorg', {
         id: 'task_blocked',
@@ -427,6 +428,11 @@ describe('Bus System', () => {
       const report = checkStaleBlockers(testDir);
 
       expect(report.entries).toHaveLength(0);
+      // Eligible (it carries blocked_by and WAS checked) but not resolved
+      // (dependency still open) — a real "checked, found none" case, not a
+      // "could not check" one.
+      expect(report.summary.resolved_dependency_eligible).toBe(1);
+      expect(report.summary.resolved_dependency).toBe(0);
     });
 
     it('flags a blocked task mentioning a bare PR reference as unverified_external_ref', () => {
@@ -506,7 +512,7 @@ describe('Bus System', () => {
       expect(report.entries).toHaveLength(0);
     });
 
-    it('does not flag a blocked task with no dependency signal at all', () => {
+    it('does not flag a blocked task with no dependency signal at all, and does not count it as eligible', () => {
       writeTask('myorg', {
         id: 'task_plain',
         title: 'held for Aaron',
@@ -517,6 +523,35 @@ describe('Bus System', () => {
       const report = checkStaleBlockers(testDir);
 
       expect(report.entries).toHaveLength(0);
+      expect(report.summary.resolved_dependency_eligible).toBe(0);
+    });
+
+    // task_1786777242641: the motivating scenario — resolved_dependency: 0
+    // must be distinguishable from "0 of N were even checkable" rather than
+    // "checked N, found none stale". Only one of these two tasks carries a
+    // blocked_by field at all.
+    it('distinguishes "checked, found none" from "could not check" via resolved_dependency_eligible', () => {
+      writeTask('myorg', { id: 'task_dep', title: 'dependency', status: 'in_progress' });
+      writeTask('myorg', {
+        id: 'task_checkable',
+        title: 'has a structured blocker, still open',
+        status: 'blocked',
+        blocked_by: ['task_dep'],
+      });
+      writeTask('myorg', {
+        id: 'task_unstructured',
+        title: 'held for Aaron',
+        status: 'blocked',
+        description: 'waiting on a human decision, no structured blocker field',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.summary.scanned).toBe(2);
+      expect(report.summary.resolved_dependency).toBe(0);
+      // Without this field, "resolved_dependency: 0" alone can't tell you
+      // that only 1 of the 2 scanned tasks was actually checkable.
+      expect(report.summary.resolved_dependency_eligible).toBe(1);
     });
 
     it('scans every org, not just one', () => {
@@ -537,6 +572,9 @@ describe('Bus System', () => {
       const report = checkStaleBlockers(testDir);
 
       expect(report.summary.scanned).toBe(2);
+      // Only org-a's task carries blocked_by; org-b's is a freeform PR
+      // mention with no structured field.
+      expect(report.summary.resolved_dependency_eligible).toBe(1);
       const orgs = report.entries.map(e => e.org).sort();
       expect(orgs).toEqual(['org-a', 'org-b']);
     });
@@ -544,6 +582,7 @@ describe('Bus System', () => {
     it('returns an empty report when there are no orgs yet', () => {
       const report = checkStaleBlockers(testDir);
       expect(report.summary.scanned).toBe(0);
+      expect(report.summary.resolved_dependency_eligible).toBe(0);
       expect(report.entries).toHaveLength(0);
     });
   });

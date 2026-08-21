@@ -376,6 +376,13 @@ export interface StaleBlockerReport {
   summary: {
     scanned: number;
     resolved_dependency: number;
+    // task_1786777242641: count of scanned tasks that actually carry a
+    // non-empty blocked_by — the only ones the resolved_dependency check can
+    // evaluate. Without this, "resolved_dependency: 0" is indistinguishable
+    // from "checked N tasks, found none stale" vs "0 of N were even
+    // checkable" — a partially-measurable instrument that can now return
+    // plausible non-zero values is more misleading than a wholly blind one.
+    resolved_dependency_eligible: number;
     unverified_external_ref: number;
   };
   entries: StaleBlockerEntry[];
@@ -471,6 +478,7 @@ function isPrecedentCitation(
 export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
   const entries: StaleBlockerEntry[] = [];
   let scanned = 0;
+  let resolvedDependencyEligible = 0;
 
   const orgsDir = join(ctxRoot, 'orgs');
   const orgs = existsSync(orgsDir)
@@ -501,6 +509,7 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
 
     for (const task of blocked) {
       if ((task.blocked_by?.length ?? 0) > 0) {
+        resolvedDependencyEligible++;
         const { open: openDeps, unresolved } = checkTaskDependenciesWithStatus(paths, task.id);
         // An incomplete scan cannot support "blocked_by are all completed" —
         // that detail string names the deps as a fact. Skip rather than assert.
@@ -553,6 +562,7 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
     summary: {
       scanned,
       resolved_dependency: resolvedCount,
+      resolved_dependency_eligible: resolvedDependencyEligible,
       unverified_external_ref: unverifiedCount,
     },
     entries,
