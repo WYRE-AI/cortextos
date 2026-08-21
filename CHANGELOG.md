@@ -63,6 +63,21 @@ Added `--priority <level>` to `update-task`, validated against the same
 already were (independently settable, recorded in the task audit log as
 `priority: <old> -> <new>`, no status argument required).
 
+### Fixed — `update-task` had no way to record a blocker discovered after creation
+
+`blocked_by` was only settable at `create-task` time; `update-task` accepted
+only `--assignee`/`--project`, so a task moved to `blocked` status after the
+fact (the normal case — a gate usually emerges once work is already
+underway) had no structured way to record what was blocking it, beyond an
+unstructured event-meta note the tooling can't read. `check-stale-blockers`
+was scanning 100+ blocked tasks a night and finding almost none of them
+checkable for exactly this reason. Added `--blocked-by <ids>` to
+`update-task` (and a matching `blockedBy` option on `updateTask`): additive
+(never replaces the existing list), deduped, cycle-checked the same way
+`create-task` is (rejecting before any write, so a rejected cycle leaves
+zero partial state), and it writes the same symmetric `blocks` edge on the
+peer task that `create-task` does.
+
 ### Fixed — `check-stale-blockers` summary had no coverage denominator
 
 `resolved_dependency: 0` in `StaleBlockerReport.summary` was indistinguishable

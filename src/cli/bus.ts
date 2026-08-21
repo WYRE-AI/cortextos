@@ -239,14 +239,17 @@ busCommand
 busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
-  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project/--priority/--append-desc is given')
+  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project/--priority/--append-desc/--blocked-by is given')
   .option('--assignee <name>', 'Reroute the task to a different agent')
   .option('--project <name>', 'Change the task\'s project')
   .option('--priority <level>', 'Change the task\'s priority (urgent, high, normal, low)')
   .option('--append-desc <text>', 'Append text to the description with a timestamp — does NOT overwrite the original (a description cannot be edited in place; this keeps a correction visible next to the claim it corrects)')
-  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string; priority?: string; appendDesc?: string }) => {
-    if (status === undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined && opts.appendDesc === undefined) {
-      console.error('Nothing to update — pass a status, --assignee, --project, --priority, and/or --append-desc');
+  .option('--blocked-by <ids>', 'Add one or more blocker task IDs (comma-separated) — ADDS to the existing blocked_by list, never replaces it; cycle-checked the same way create-task is')
+  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string; priority?: string; appendDesc?: string; blockedBy?: string }) => {
+    const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
+    const blockedBy = parseList(opts.blockedBy);
+    if (status === undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined && opts.appendDesc === undefined && blockedBy.length === 0) {
+      console.error('Nothing to update — pass a status, --assignee, --project, --priority, --append-desc, and/or --blocked-by');
       process.exit(1);
     }
     if (status !== undefined) {
@@ -283,13 +286,15 @@ busCommand
         project: opts.project,
         priority: opts.priority as Priority | undefined,
         appendDesc: opts.appendDesc,
+        blockedBy,
       });
       if (
         status !== undefined &&
         opts.assignee === undefined &&
         opts.project === undefined &&
         opts.priority === undefined &&
-        opts.appendDesc === undefined
+        opts.appendDesc === undefined &&
+        blockedBy.length === 0
       ) {
         // Preserve the original status-only message verbatim — scripts/
         // dashboards may already parse it.
@@ -301,6 +306,7 @@ busCommand
           opts.project !== undefined ? `project -> ${opts.project}` : null,
           opts.priority !== undefined ? `priority -> ${opts.priority}` : null,
           opts.appendDesc !== undefined ? 'description appended' : null,
+          blockedBy.length > 0 ? `blocked_by +[${blockedBy.join(', ')}]` : null,
         ].filter(Boolean);
         console.log(`Updated ${id}: ${changes.join(', ')}`);
       }
