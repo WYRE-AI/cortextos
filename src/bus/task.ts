@@ -407,21 +407,33 @@ function findTaskFileByPrefix(
  * `status` is optional so a caller can reassign/re-project/re-prioritize a task
  * without restating (and risking accidentally churning) its current status —
  * create-task is the only place assignee/project/priority are otherwise settable.
- * At least one of status/assignee/project/priority must be given.
+ * At least one of status/assignee/project/priority/appendDesc must be given.
+ *
+ * `appendDesc` deliberately APPENDS rather than replaces: a task description
+ * cannot otherwise be corrected after creation, which twice in one hour drove
+ * agents to invent lossy workarounds (cancel-and-refile churning the task ID,
+ * or parking the correction in daily memory where a task reader never sees
+ * it) — see task_1786776657887_48026218. Keeping the original text visible
+ * alongside the addition matters specifically when the addition is a
+ * correction: a retraction next to the false claim it retracts is legible in
+ * a way that a silent overwrite is not.
  */
 export function updateTask(
   paths: BusPaths,
   taskId: string,
   status?: TaskStatus,
-  opts: { assignee?: string; project?: string; priority?: Priority } = {},
+  opts: { assignee?: string; project?: string; priority?: Priority; appendDesc?: string } = {},
 ): void {
   if (
     status === undefined &&
     opts.assignee === undefined &&
     opts.project === undefined &&
-    opts.priority === undefined
+    opts.priority === undefined &&
+    opts.appendDesc === undefined
   ) {
-    throw new Error('updateTask requires at least one of: status, assignee, project, priority');
+    throw new Error(
+      'updateTask requires at least one of: status, assignee, project, priority, appendDesc',
+    );
   }
   if (opts.priority !== undefined) validatePriority(opts.priority);
   const filePath = findTaskFile(paths, taskId);
@@ -450,6 +462,12 @@ export function updateTask(
     if (opts.priority !== undefined && opts.priority !== task.priority) {
       noteParts.push(`priority: ${task.priority} -> ${opts.priority}`);
       task.priority = opts.priority;
+    }
+    if (opts.appendDesc !== undefined) {
+      const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      const marker = `\n\n--- APPENDED ${stamp} ---\n${opts.appendDesc}`;
+      task.description = (task.description ?? '') + marker;
+      noteParts.push(`description: appended ${opts.appendDesc.length} chars`);
     }
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));

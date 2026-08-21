@@ -128,10 +128,10 @@ describe('Task Management', () => {
       expect(after >= before).toBe(true);
     });
 
-    it('throws when neither status, assignee, project, nor priority is given', () => {
+    it('throws when neither status, assignee, project, priority, nor appendDesc is given', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Test task');
       expect(() => updateTask(paths, taskId)).toThrow(
-        'updateTask requires at least one of: status, assignee, project, priority',
+        'updateTask requires at least one of: status, assignee, project, priority, appendDesc',
       );
     });
 
@@ -167,6 +167,45 @@ describe('Task Management', () => {
       const log = readTaskAudit(paths, taskId);
       const entry = log[log.length - 1];
       expect(entry.note).toContain('priority: normal -> low');
+    });
+
+    it('appends to the description rather than overwriting it', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task', {
+        description: 'Original claim: the mechanism is X.',
+      });
+      updateTask(paths, taskId, undefined, { appendDesc: 'Correction: the mechanism is actually Y.' });
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.description).toContain('Original claim: the mechanism is X.');
+      expect(content.description).toContain('Correction: the mechanism is actually Y.');
+      expect(content.description).toMatch(/--- APPENDED \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z ---/);
+    });
+
+    it('appendDesc works standalone, without a status/assignee/project change', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      expect(() => updateTask(paths, taskId, undefined, { appendDesc: 'A note.' })).not.toThrow();
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.status).toBe('pending'); // untouched
+      expect(content.description).toContain('A note.');
+    });
+
+    it('appendDesc combines with a status change in one call', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      updateTask(paths, taskId, 'blocked', { appendDesc: 'Blocked on the human task.' });
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.status).toBe('blocked');
+      expect(content.description).toContain('Blocked on the human task.');
+    });
+
+    it('records the appendDesc in the task audit log without dumping the full text', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      updateTask(paths, taskId, undefined, { appendDesc: 'A fairly short note.' });
+
+      const log = readTaskAudit(paths, taskId);
+      const entry = log[log.length - 1];
+      expect(entry.note).toContain('description: appended 20 chars');
     });
   });
 

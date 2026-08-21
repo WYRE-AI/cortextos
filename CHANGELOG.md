@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added — `bus update-task --append-desc` — a task description can now be corrected without churning its ID
+
+A task description had no edit path after creation: `update-task` only
+accepted `status`, `--assignee`, and `--project`. When a description turned
+out to be wrong, the only options were to cancel-and-refile under a new task
+ID (breaking every existing reference to the old one) or to park the
+correction in daily memory, where a reader of the task never sees it. Both
+workarounds were observed independently within one hour on 2026-08-15.
+
+Added `--append-desc <text>`, deliberately an append rather than a
+`--desc` replace: it adds a `--- APPENDED <UTC timestamp> ---` block to the
+existing description rather than overwriting it, so a correction sits next
+to the claim it corrects instead of erasing it. Works standalone or combined
+with a status/assignee/project change in the same call; the audit log
+records that a description was appended (and its length) without dumping
+the full text into the audit trail.
+
+Closes task_1786776657887_48026218.
+
 ### Fixed — `bus kb-query` rejected any question starting with `-`
 
 Commander parsed `kb-query`'s positional `<question>` argument as an
