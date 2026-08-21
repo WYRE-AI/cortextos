@@ -143,11 +143,17 @@ function toMs(iso: string | null | undefined): number | null {
 }
 
 /**
- * Most-recent delivered fire across the agent's crons (batching-aware: after a
+ * Most-recent ATTEMPTED fire across the agent's crons (batching-aware: after a
  * catch-up burst we require one session beat after the MOST-RECENT fire, not one per
  * fire). Returns null when no cron has a parseable last_fire_attempted_at.
+ *
+ * Named "Attempted", not "Delivered": it reads last_fire_attempted_at, which
+ * advances whether or not the agent actually consumed the fire (task_1786916855802
+ * — the misnomer generated a false root cause during the 2026-08-15 outage).
+ * Superseded as evaluateHang's live anchor by {@link mostRecentAnswerableFireMs};
+ * kept here (and in tests) only as the pre-#121 anchor for comparison.
  */
-export function mostRecentDeliveredFireMs(crons: Cronish[]): number | null {
+export function mostRecentAttemptedFireMs(crons: Cronish[]): number | null {
   let max: number | null = null;
   for (const c of crons) {
     const t = toMs(c.last_fire_attempted_at);
@@ -159,7 +165,7 @@ export function mostRecentDeliveredFireMs(crons: Cronish[]): number | null {
 /**
  * Most-recent fire the agent has ALREADY HAD `graceMs` to answer.
  *
- * Why this exists rather than {@link mostRecentDeliveredFireMs}: the field is
+ * Why this exists rather than {@link mostRecentAttemptedFireMs}: the field is
  * `last_fire_attempted_at` — ATTEMPTED, not consumed — so it keeps advancing
  * whether or not the agent is alive to receive the fire. Anchoring on the
  * newest attempt means that for any agent whose tightest cron interval is
@@ -197,20 +203,23 @@ export function mostRecentAnswerableFireMs(
 
 /**
  * The trigger condition. HUNG iff (positive assertion on every input):
- *   1. a delivered fire T is recorded, AND
+ *   1. an answerable fire T is recorded, AND
  *   2. now - T > grace N, AND
  *   3. a session heartbeat S is recorded AND S < T (no session beat since the fire).
  * Any missing/ambiguous input returns hung:false (fail-safe toward not-restarting).
  *
  * Note the idle-exit case is handled BY CONSTRUCTION: an idle-exited session that
  * resumes on its next fire writes a Part-A session beat (S >= T), so it never trips —
- * we key on delivered-fire-without-beat, not on last-seen age.
+ * we key on fire-without-beat, not on last-seen age.
  */
 export function evaluateHang(input: HangEvalInput): HangEvalResult {
   const { now, graceMs, deliveredFireAt: T, lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt } = input;
   const S = maxBeat(lastSessionHeartbeat, lastIdleFlagAt, lastActivityBeatAt);
 
-  if (T === null) return { hung: false, reason: 'no delivered fire recorded — fail-safe' };
+  // T is null under exactly two conditions: no cron has ever recorded a fire
+  // attempt at all, OR (post-#121's mostRecentAnswerableFireMs anchor) every
+  // recorded attempt is still within graceMs and hasn't ripened yet.
+  if (T === null) return { hung: false, reason: 'no fire attempt recorded — fail-safe' };
   if (now - T <= graceMs) {
     return { hung: false, reason: `within grace (${Math.round((now - T) / 60_000)}m <= ${Math.round(graceMs / 60_000)}m)` };
   }
