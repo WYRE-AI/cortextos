@@ -399,7 +399,9 @@ function findTaskFileByPrefix(
 }
 
 /**
- * Update a task's status, and/or reroute it to a new assignee/project/priority.
+ * Update a task's status, and/or reroute it to a new
+ * assignee/project/priority, and/or append to its description, and/or append
+ * blocker edges.
  * Matches bash update-task.sh behavior for the status-only case, with the
  * cross-org fallback from findTaskFile so an assignee in one org can drive
  * the lifecycle of a task filed by an orchestrator in a sibling org.
@@ -407,7 +409,8 @@ function findTaskFileByPrefix(
  * `status` is optional so a caller can reassign/re-project/re-prioritize a task
  * without restating (and risking accidentally churning) its current status —
  * create-task is the only place assignee/project/priority are otherwise settable.
- * At least one of status/assignee/project/priority/appendDesc must be given.
+ * At least one of status/assignee/project/priority/appendDesc/blockedBy must
+ * be given.
  *
  * `appendDesc` deliberately APPENDS rather than replaces: a task description
  * cannot otherwise be corrected after creation, which twice in one hour drove
@@ -417,6 +420,15 @@ function findTaskFileByPrefix(
  * alongside the addition matters specifically when the addition is a
  * correction: a retraction next to the false claim it retracts is legible in
  * a way that a silent overwrite is not.
+ *
+ * `opts.blockedBy` is ADDITIVE, never a replace: a gate normally emerges
+ * AFTER creation (that's why a task transitions to `blocked` at all), and
+ * create-task already owns the initial full list. IDs already present in
+ * blocked_by are silently deduped rather than re-validated or re-audited —
+ * only genuinely new edges go through the cycle check and get a symmetric
+ * `blocks` edge written on the peer, mirroring createTask's own
+ * validate-before-write / mutate-peers-after-write ordering so a rejected
+ * cycle never leaves partial state on disk.
  */
 export function updateTask(
   paths: BusPaths,
@@ -427,6 +439,7 @@ export function updateTask(
     project?: string;
     priority?: Priority;
     appendDesc?: string;
+    blockedBy?: string[];
     /**
      * Who is performing this update. Recorded as the audit entry's `agent`.
      *
@@ -440,6 +453,7 @@ export function updateTask(
     actor?: string;
   } = {},
 ): void {
+  const blockedByInput = opts.blockedBy ?? [];
   // `actor` is metadata about the update, not a field being updated — it
   // deliberately does not satisfy this guard.
   if (
@@ -447,10 +461,11 @@ export function updateTask(
     opts.assignee === undefined &&
     opts.project === undefined &&
     opts.priority === undefined &&
-    opts.appendDesc === undefined
+    opts.appendDesc === undefined &&
+    blockedByInput.length === 0
   ) {
     throw new Error(
-      'updateTask requires at least one of: status, assignee, project, priority, appendDesc',
+      'updateTask requires at least one of: status, assignee, project, priority, appendDesc, blockedBy',
     );
   }
   if (opts.priority !== undefined) validatePriority(opts.priority);
@@ -462,10 +477,26 @@ export function updateTask(
   }
   let prevStatus: TaskStatus | undefined;
   const noteParts: string[] = [];
+  let newBlockers: string[] = [];
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
+
+    const currentBlockedBy = task.blocked_by ?? [];
+    newBlockers = blockedByInput.filter(depId => !currentBlockedBy.includes(depId));
+    if (newBlockers.length) {
+      // Cycle check BEFORE any field mutation, same ordering rule createTask
+      // enforces — a rejected cycle must never leave partial state on disk.
+      // The virtual task carries the FULL post-update blocked_by set (old +
+      // new), not just the new edges, so a cycle running back through an
+      // already-existing blocker is still caught.
+      const virtualTask = { id: taskId, blocked_by: [...currentBlockedBy, ...newBlockers] };
+      detectCycleOrThrow(paths, taskId, newBlockers, virtualTask);
+      task.blocked_by = [...currentBlockedBy, ...newBlockers];
+      noteParts.push(`blocked_by: +[${newBlockers.join(', ')}]`);
+    }
+
     if (status !== undefined) task.status = status;
     if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
       noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
@@ -490,6 +521,11 @@ export function updateTask(
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
+
+  // Symmetric edge maintenance — mirrors createTask's own post-write step.
+  // Cycle-safe now: validation already passed above.
+  for (const depId of newBlockers) addSymmetricEdge(paths, depId, 'blocks', taskId);
+
   appendTaskAudit(paths, taskId, {
     event: 'update',
     agent: opts.actor || 'unknown',
