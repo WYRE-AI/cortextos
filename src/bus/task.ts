@@ -399,25 +399,31 @@ function findTaskFileByPrefix(
 }
 
 /**
- * Update a task's status, and/or reroute it to a new assignee/project.
+ * Update a task's status, and/or reroute it to a new assignee/project/priority.
  * Matches bash update-task.sh behavior for the status-only case, with the
  * cross-org fallback from findTaskFile so an assignee in one org can drive
  * the lifecycle of a task filed by an orchestrator in a sibling org.
  *
- * `status` is optional so a caller can reassign/re-project a task without
- * restating (and risking accidentally churning) its current status —
- * create-task is the only place assignee/project are otherwise settable.
- * At least one of status/assignee/project must be given.
+ * `status` is optional so a caller can reassign/re-project/re-prioritize a task
+ * without restating (and risking accidentally churning) its current status —
+ * create-task is the only place assignee/project/priority are otherwise settable.
+ * At least one of status/assignee/project/priority must be given.
  */
 export function updateTask(
   paths: BusPaths,
   taskId: string,
   status?: TaskStatus,
-  opts: { assignee?: string; project?: string } = {},
+  opts: { assignee?: string; project?: string; priority?: Priority } = {},
 ): void {
-  if (status === undefined && opts.assignee === undefined && opts.project === undefined) {
-    throw new Error('updateTask requires at least one of: status, assignee, project');
+  if (
+    status === undefined &&
+    opts.assignee === undefined &&
+    opts.project === undefined &&
+    opts.priority === undefined
+  ) {
+    throw new Error('updateTask requires at least one of: status, assignee, project, priority');
   }
+  if (opts.priority !== undefined) validatePriority(opts.priority);
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
     throw new Error(
@@ -440,6 +446,10 @@ export function updateTask(
     if (opts.project !== undefined && opts.project !== task.project) {
       noteParts.push(`project: '${task.project}' -> '${opts.project}'`);
       task.project = opts.project;
+    }
+    if (opts.priority !== undefined && opts.priority !== task.priority) {
+      noteParts.push(`priority: ${task.priority} -> ${opts.priority}`);
+      task.priority = opts.priority;
     }
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));

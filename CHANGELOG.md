@@ -29,6 +29,21 @@ can't drift out of sync with them), prefixes it with a sentinel so commander
 accepts it as the positional value. The action handler strips the sentinel
 back off before the question ever reaches `queryKnowledgeBase`.
 
+### Fixed — `update-task` had no way to change a task's priority
+
+A task's priority was settable only at creation (`create-task --priority`,
+defaulting to `normal`); `update-task` accepted only `<status>`, `--assignee`,
+and `--project`. There was no way to correct it afterward short of hand-editing
+the task's JSON file on disk. Concretely: a task filed with `[P1]` in its title
+would sit at `priority: "normal"` in the record forever, and anything that
+sweeps or sorts on the `priority` field — not the title — ranks it as routine.
+
+Added `--priority <level>` to `update-task`, validated against the same
+`urgent | high | normal | low` enum as `create-task`, wired through
+`updateTask()` in `src/bus/task.ts` the same way `--assignee`/`--project`
+already were (independently settable, recorded in the task audit log as
+`priority: <old> -> <new>`, no status argument required).
+
 ### Fixed — `check-stale-blockers` summary had no coverage denominator
 
 `resolved_dependency: 0` in `StaleBlockerReport.summary` was indistinguishable
