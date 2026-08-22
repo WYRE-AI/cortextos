@@ -88,6 +88,28 @@ to `'no fire attempt recorded — fail-safe'`, and added a comment at the
 No behavior change — `evaluateHang`'s live anchor is unaffected
 (`mostRecentAnswerableFireMs`, added in #121, was already correctly named).
 
+### Fixed — `mmrag.py` required a bus wrapper for every subcommand, even ones with none
+
+`kb-ingest`/`kb-query`/`kb-collections` all work via the bus CLI because
+`buildKBEnv()` (`src/bus/knowledge-base.ts`) explicitly injects
+`MMRAG_CONFIG`/`MMRAG_DIR`/`MMRAG_CHROMADB_DIR` pointing at the real
+per-instance/org config before every call. Any subcommand invoked directly —
+`mmrag.py delete`, at the time this was found, had no bus wrapper at all —
+fell through to `mmrag.py`'s own hardcoded default (`~/.mmrag/config.json`),
+which never exists in practice, producing a "Config not found... run
+knowledge-base/scripts/setup.sh" error that read like the KB was broken
+fleet-wide when only the unwrapped path was.
+
+`mmrag.py` now self-computes the same per-instance/org default
+(`~/.cortextos/<instance>/orgs/<org>/knowledge-base`, including the same
+org-casing normalization as `normalizeOrgName()`) directly from
+`CTX_INSTANCE_ID`/`CTX_ORG`/`CTX_FRAMEWORK_ROOT` when `MMRAG_DIR` isn't
+explicitly set — every agent shell in this fleet already has those three
+exported, so a bare invocation of any subcommand, wrapped or not, now
+resolves to the correct config without needing a wrapper written for it
+first. Falls back to the original `~/.mmrag` default when those env vars
+aren't present (unchanged behavior for anything outside this fleet).
+
 ### Fixed — fenced injection bodies capped at 16KB (tail-truncated)
 
 Every fenced PTY-injection path — inbox message bodies, Telegram/Slack text,
