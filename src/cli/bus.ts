@@ -1434,6 +1434,35 @@ busCommand
 // Knowledge Base commands
 // ---------------------------------------------------------------------------
 
+// kb-query's <question> is free-form text and can legitimately start with '-'
+// (a markdown bullet line copied verbatim is the common case). Commander parses
+// a leading-dash positional as an unrecognized option before the action handler
+// ever runs, so the shielding has to happen on argv itself, pre-parse. Exported
+// so index.ts can apply it right before program.parse(); derives the "is this
+// actually one of kb-query's own flags" check from the command's own registered
+// options rather than a hand-maintained list, so it can't drift from the
+// .option() calls below (see task_1786910207793_59268544).
+export const KB_QUERY_DASH_SENTINEL = ' kb-query-literal-dash ';
+
+export function shieldKbQueryLeadingDash(argv: string[]): string[] {
+  const idx = argv.indexOf('kb-query');
+  if (idx === -1) return argv;
+  const next = argv[idx + 1];
+  if (!next || !next.startsWith('-') || next === '--') return argv;
+
+  const kbQueryCmd = busCommand.commands.find((c) => c.name() === 'kb-query');
+  const knownFlags = new Set<string>(['-h', '--help']);
+  for (const o of kbQueryCmd?.options ?? []) {
+    if (o.short) knownFlags.add(o.short);
+    if (o.long) knownFlags.add(o.long);
+  }
+  if (knownFlags.has(next)) return argv;
+
+  const patched = argv.slice();
+  patched[idx + 1] = KB_QUERY_DASH_SENTINEL + next;
+  return patched;
+}
+
 busCommand
   .command('kb-query')
   .description('Query the knowledge base (RAG search)')
@@ -1444,7 +1473,13 @@ busCommand
   .option('--top-k <n>', 'Number of results', '5')
   .option('--threshold <f>', 'Minimum similarity score (0-1)', '0.5')
   .option('--json', 'Output raw JSON')
-  .action((question: string, opts: { org?: string; agent?: string; scope?: string; topK?: string; threshold?: string; json?: boolean }) => {
+  .action((rawQuestion: string, opts: { org?: string; agent?: string; scope?: string; topK?: string; threshold?: string; json?: boolean }) => {
+    // A query starting with '-' (e.g. a markdown bullet line) already survived
+    // commander's parser by the time we're here, thanks to shieldKbQueryLeadingDash
+    // below stripping it back down to the literal text — see task_1786910207793_59268544.
+    const question = rawQuestion.startsWith(KB_QUERY_DASH_SENTINEL)
+      ? rawQuestion.slice(KB_QUERY_DASH_SENTINEL.length)
+      : rawQuestion;
     const env = resolveEnv();
     const org = opts.org || env.org;
     if (!org) {
