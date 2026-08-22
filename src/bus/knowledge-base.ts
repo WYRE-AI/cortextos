@@ -333,6 +333,59 @@ export function ingestKnowledgeBase(
 }
 
 /**
+ * Delete a previously-ingested source file's chunks from its collection.
+ *
+ * Mirrors ingestKnowledgeBase's env/collection-resolution logic exactly —
+ * without this wrapper, deleting required a raw `mmrag.py delete` call with
+ * MMRAG_CONFIG/MMRAG_DIR/MMRAG_CHROMADB_DIR set by hand (mmrag.py's own
+ * defaults point at ~/.mmrag/config.json, which never exists), so the
+ * command was effectively unusable outside this module (task_1786414730820).
+ */
+export function deleteFromKnowledgeBase(
+  sourcePath: string,
+  options: {
+    org: string;
+    agent?: string;
+    scope?: 'shared' | 'private';
+    frameworkRoot: string;
+    instanceId: string;
+  },
+): void {
+  const { agent, scope = 'shared', frameworkRoot, instanceId } = options;
+  const org = normalizeOrgName(frameworkRoot, options.org);
+
+  const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
+
+  if (!kbConfigured(env)) {
+    console.warn(
+      `[kb] Knowledge base not configured for org ${org}. Skipping delete — ` +
+      `run setup to enable (see HEARTBEAT.md step 10 for the config path).`,
+    );
+    return;
+  }
+
+  const pythonPath = getVenvPython(frameworkRoot);
+  const mmragPath = join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
+
+  let collection: string;
+  if (scope === 'private') {
+    if (!agent) throw new Error('--agent or CTX_AGENT_NAME required for --scope private');
+    collection = `agent-${agent}`;
+  } else {
+    collection = `shared-${org}`;
+  }
+
+  console.log(`Deleting from collection: ${collection}`);
+  console.log(`  Source: ${sourcePath}`);
+
+  execFileSync(
+    pythonPath,
+    [mmragPath, 'delete', sourcePath, '--collection', collection],
+    { encoding: 'utf-8', env, stdio: 'inherit' },
+  );
+}
+
+/**
  * Ensure the knowledge base directories exist for an org.
  *
  * `frameworkRoot` is required so the org name can be normalized to its
