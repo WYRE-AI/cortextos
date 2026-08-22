@@ -1271,3 +1271,24 @@ fire constantly, and *a guard that false-positives on your most frequent action 
 📌 **Corollary that earned its place tonight: recording a retrieval failure and fixing one are different
 acts.** This section is the fix; the write-up that noticed the problem was not.
 
+## Learnings - 2026-08-22
+
+- **This root checkout backs a live shared binary for 15 agents — `npm run build` on it is a
+  production deploy, not a scratch command.** `analyst`, dry-run testing whether two upstream commits
+  cherry-pick cleanly, switched to a feature branch and ran `npm run build` directly on the shared
+  `~/cortextos` checkout. `/opt/homebrew/bin/cortextos` symlinks straight to this repo's
+  `dist/cli.js`, so every fleet agent's `cortextos` CLI invocation briefly ran code built from an
+  unmerged branch, not `main`. Caught within about a minute (no known actual impact, but other
+  agents' concurrent CLI calls in that window are outside any one agent's visibility) — switched
+  back to `main` and rebuilt immediately. **Same shape as the 2026-08-04 auto-updater incident**
+  (N private agent configs sharing one binary, no lock) — different mechanism, same root class: a
+  personal/branch-scoped action against a path that is actually shared fleet-wide infrastructure.
+  **Fix: any build/test verification against this repo belongs in an isolated `git worktree`
+  (`git worktree add <path> <branch>`), never run directly on the shared checkout that backs the
+  live binary — even for a "quick" dry-run.** Separately and earlier the same session: `git reset
+  --hard HEAD`, used to clean up a dry-run cherry-pick test without first checking `git status`,
+  discarded an unrelated agent's (Aaron's) uncommitted WIP on two files — recovered exactly because
+  the diff had been printed and reviewed minutes earlier in the same session, which turned out to be
+  a real recovery artifact. **Two mistakes, one afternoon, same root cause: treating a shared
+  checkout as disposable scratch space during what felt like "just a dry run."**
+
