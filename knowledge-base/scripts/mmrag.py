@@ -29,8 +29,53 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-# cortextOS env-var overrides (set by kb-*.sh scripts)
-MMRAG_DIR = Path(os.environ.get("MMRAG_DIR", str(Path.home() / ".mmrag")))
+def _normalize_org_name(framework_root, org):
+    """Map an org name to its canonical filesystem casing.
+
+    Mirrors src/utils/org.ts normalizeOrgName() so a bare mmrag.py invocation
+    (no bus wrapper) resolves to the same on-disk org directory the wrapper
+    would have used — exact-case match first, then a single case-insensitive
+    match, else the input unchanged. Never returns a name that doesn't exist
+    on disk when a listing was available to check.
+    """
+    if not org or not framework_root:
+        return org
+    orgs_dir = Path(framework_root) / "orgs"
+    try:
+        entries = [e.name for e in orgs_dir.iterdir()]
+    except OSError:
+        return org
+    if org in entries and (orgs_dir / org).is_dir():
+        return org
+    matches = [e for e in entries if e.lower() == org.lower() and (orgs_dir / e).is_dir()]
+    if len(matches) == 1:
+        return matches[0]
+    return org
+
+
+def _default_mmrag_dir():
+    """Self-computed default, mirroring buildKBEnv() in src/bus/knowledge-base.ts.
+
+    A bare mmrag.py invocation (no bus wrapper, e.g. `mmrag.py delete`) used to
+    fall through to a hardcoded ~/.mmrag that's never configured in practice,
+    producing a "Config not found" error even though the wrapped kb-ingest/
+    kb-query commands work fine (they inject MMRAG_DIR explicitly). When the
+    calling agent's shell already has CTX_INSTANCE_ID/CTX_ORG exported — true
+    for every agent shell in this fleet — compute the same per-instance/org
+    path directly instead of requiring a wrapper for every subcommand.
+    """
+    instance_id = os.environ.get("CTX_INSTANCE_ID")
+    org = os.environ.get("CTX_ORG")
+    if not instance_id or not org:
+        return Path.home() / ".mmrag"
+    framework_root = os.environ.get("CTX_FRAMEWORK_ROOT")
+    canonical_org = _normalize_org_name(framework_root, org)
+    return Path.home() / ".cortextos" / instance_id / "orgs" / canonical_org / "knowledge-base"
+
+
+# cortextOS env-var overrides (set by kb-*.sh scripts, or self-computed above
+# from CTX_INSTANCE_ID/CTX_ORG/CTX_FRAMEWORK_ROOT when not explicitly set)
+MMRAG_DIR = Path(os.environ.get("MMRAG_DIR", str(_default_mmrag_dir())))
 CONFIG_FILE = Path(os.environ.get("MMRAG_CONFIG", str(MMRAG_DIR / "config.json")))
 CHROMADB_DIR = Path(os.environ.get("MMRAG_CHROMADB_DIR", str(MMRAG_DIR / "chromadb")))
 MEDIA_DIR = MMRAG_DIR / "media"
