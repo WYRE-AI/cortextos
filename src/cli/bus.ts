@@ -239,18 +239,26 @@ busCommand
 busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
-  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project is given')
+  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project/--priority is given')
   .option('--assignee <name>', 'Reroute the task to a different agent')
   .option('--project <name>', 'Change the task\'s project')
-  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string }) => {
-    if (status === undefined && opts.assignee === undefined && opts.project === undefined) {
-      console.error('Nothing to update — pass a status, --assignee, and/or --project');
+  .option('--priority <level>', 'Change the task\'s priority (urgent, high, normal, low)')
+  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string; priority?: string }) => {
+    if (status === undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined) {
+      console.error('Nothing to update — pass a status, --assignee, --project, and/or --priority');
       process.exit(1);
     }
     if (status !== undefined) {
       const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
       if (!validStatuses.includes(status as TaskStatus)) {
         console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
+        process.exit(1);
+      }
+    }
+    if (opts.priority !== undefined) {
+      const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
+      if (!validPriorities.includes(opts.priority as Priority)) {
+        console.error(`Invalid priority '${opts.priority}'. Must be one of: ${validPriorities.join(', ')}`);
         process.exit(1);
       }
     }
@@ -269,8 +277,12 @@ busCommand
     }
 
     try {
-      updateTask(paths, id, status as TaskStatus | undefined, { assignee: opts.assignee, project: opts.project });
-      if (status !== undefined && opts.assignee === undefined && opts.project === undefined) {
+      updateTask(paths, id, status as TaskStatus | undefined, {
+        assignee: opts.assignee,
+        project: opts.project,
+        priority: opts.priority as Priority | undefined,
+      });
+      if (status !== undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined) {
         // Preserve the original status-only message verbatim — scripts/
         // dashboards may already parse it.
         console.log(`Updated ${id} -> ${status}`);
@@ -279,6 +291,7 @@ busCommand
           status !== undefined ? `status -> ${status}` : null,
           opts.assignee !== undefined ? `assignee -> ${opts.assignee}` : null,
           opts.project !== undefined ? `project -> ${opts.project}` : null,
+          opts.priority !== undefined ? `priority -> ${opts.priority}` : null,
         ].filter(Boolean);
         console.log(`Updated ${id}: ${changes.join(', ')}`);
       }

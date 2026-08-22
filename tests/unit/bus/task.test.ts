@@ -128,10 +128,10 @@ describe('Task Management', () => {
       expect(after >= before).toBe(true);
     });
 
-    it('throws when neither status, assignee, nor project is given', () => {
+    it('throws when neither status, assignee, project, nor priority is given', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Test task');
       expect(() => updateTask(paths, taskId)).toThrow(
-        'updateTask requires at least one of: status, assignee, project',
+        'updateTask requires at least one of: status, assignee, project, priority',
       );
     });
 
@@ -142,6 +142,31 @@ describe('Task Management', () => {
       const log = readTaskAudit(paths, taskId);
       const reassignEntry = log[log.length - 1];
       expect(reassignEntry.note).toContain('assignee: boss -> dev');
+    });
+
+    it('changes priority without a status argument', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      updateTask(paths, taskId, undefined, { priority: 'high' });
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.priority).toBe('high');
+      expect(content.status).toBe('pending'); // untouched
+    });
+
+    it('rejects an invalid priority', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      expect(() => updateTask(paths, taskId, undefined, { priority: 'urgentish' as any })).toThrow(
+        /Invalid priority/,
+      );
+    });
+
+    it('records the priority change in the task audit log', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Test task');
+      updateTask(paths, taskId, undefined, { priority: 'low' });
+
+      const log = readTaskAudit(paths, taskId);
+      const entry = log[log.length - 1];
+      expect(entry.note).toContain('priority: normal -> low');
     });
   });
 

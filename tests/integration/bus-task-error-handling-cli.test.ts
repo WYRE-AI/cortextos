@@ -203,7 +203,7 @@ describe.skipIf(!existsSync(DIST_CLI))(
       expect(stdout).toContain("project -> conduit");
     });
 
-    it("update-task with neither status nor --assignee/--project exits 1 with a clean message", async () => {
+    it("update-task with neither status nor --assignee/--project/--priority exits 1 with a clean message", async () => {
       writeTask("task_real_005");
       const { stdout, stderr, code } = await runCli([
         "bus",
@@ -213,8 +213,37 @@ describe.skipIf(!existsSync(DIST_CLI))(
 
       expect(code).toBe(1);
       expect(stderr.trim()).toBe(
-        "Nothing to update — pass a status, --assignee, and/or --project",
+        "Nothing to update — pass a status, --assignee, --project, and/or --priority",
       );
+      expect(stdout).toBe("");
+    });
+
+    it("update-task --priority changes the priority without a status argument", async () => {
+      writeTask("task_real_006");
+      const { stdout, code } = await runCli([
+        "bus",
+        "update-task",
+        "task_real_006",
+        "--priority",
+        "high",
+      ]);
+
+      expect(code).toBe(0);
+      expect(stdout).toContain("priority -> high");
+    });
+
+    it("update-task --priority rejects an invalid level with a clean exit 1", async () => {
+      writeTask("task_real_007");
+      const { stdout, stderr, code } = await runCli([
+        "bus",
+        "update-task",
+        "task_real_007",
+        "--priority",
+        "nonsense",
+      ]);
+
+      expect(code).toBe(1);
+      expect(stderr).toContain("Invalid priority 'nonsense'");
       expect(stdout).toBe("");
     });
   },
