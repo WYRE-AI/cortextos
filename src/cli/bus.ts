@@ -239,13 +239,14 @@ busCommand
 busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
-  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project/--priority is given')
+  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project/--priority/--append-desc is given')
   .option('--assignee <name>', 'Reroute the task to a different agent')
   .option('--project <name>', 'Change the task\'s project')
   .option('--priority <level>', 'Change the task\'s priority (urgent, high, normal, low)')
-  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string; priority?: string }) => {
-    if (status === undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined) {
-      console.error('Nothing to update — pass a status, --assignee, --project, and/or --priority');
+  .option('--append-desc <text>', 'Append text to the description with a timestamp — does NOT overwrite the original (a description cannot be edited in place; this keeps a correction visible next to the claim it corrects)')
+  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string; priority?: string; appendDesc?: string }) => {
+    if (status === undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined && opts.appendDesc === undefined) {
+      console.error('Nothing to update — pass a status, --assignee, --project, --priority, and/or --append-desc');
       process.exit(1);
     }
     if (status !== undefined) {
@@ -281,8 +282,15 @@ busCommand
         assignee: opts.assignee,
         project: opts.project,
         priority: opts.priority as Priority | undefined,
+        appendDesc: opts.appendDesc,
       });
-      if (status !== undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined) {
+      if (
+        status !== undefined &&
+        opts.assignee === undefined &&
+        opts.project === undefined &&
+        opts.priority === undefined &&
+        opts.appendDesc === undefined
+      ) {
         // Preserve the original status-only message verbatim — scripts/
         // dashboards may already parse it.
         console.log(`Updated ${id} -> ${status}`);
@@ -292,6 +300,7 @@ busCommand
           opts.assignee !== undefined ? `assignee -> ${opts.assignee}` : null,
           opts.project !== undefined ? `project -> ${opts.project}` : null,
           opts.priority !== undefined ? `priority -> ${opts.priority}` : null,
+          opts.appendDesc !== undefined ? 'description appended' : null,
         ].filter(Boolean);
         console.log(`Updated ${id}: ${changes.join(', ')}`);
       }

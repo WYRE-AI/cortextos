@@ -203,7 +203,7 @@ describe.skipIf(!existsSync(DIST_CLI))(
       expect(stdout).toContain("project -> conduit");
     });
 
-    it("update-task with neither status nor --assignee/--project/--priority exits 1 with a clean message", async () => {
+    it("update-task with neither status nor --assignee/--project/--priority/--append-desc exits 1 with a clean message", async () => {
       writeTask("task_real_005");
       const { stdout, stderr, code } = await runCli([
         "bus",
@@ -213,7 +213,7 @@ describe.skipIf(!existsSync(DIST_CLI))(
 
       expect(code).toBe(1);
       expect(stderr.trim()).toBe(
-        "Nothing to update — pass a status, --assignee, --project, and/or --priority",
+        "Nothing to update — pass a status, --assignee, --project, --priority, and/or --append-desc",
       );
       expect(stdout).toBe("");
     });
@@ -245,6 +245,20 @@ describe.skipIf(!existsSync(DIST_CLI))(
       expect(code).toBe(1);
       expect(stderr).toContain("Invalid priority 'nonsense'");
       expect(stdout).toBe("");
+    });
+
+    it("update-task --append-desc appends without overwriting, and without requiring a status", async () => {
+      writeTask("task_real_008", { description: "Original claim." });
+      const { stdout, code } = await runCli([
+        "bus",
+        "update-task",
+        "task_real_008",
+        "--append-desc",
+        "Correction.",
+      ]);
+
+      expect(code).toBe(0);
+      expect(stdout).toContain("description appended");
     });
   },
 );
