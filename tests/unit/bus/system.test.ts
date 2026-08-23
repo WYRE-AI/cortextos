@@ -512,6 +512,76 @@ describe('Bus System', () => {
       expect(report.entries).toHaveLength(0);
     });
 
+    // task_1786902033624 (grower/analyst, 2026-08-20 then again 2026-08-22):
+    // a check-stale-blockers sweep flagged the SAME task twice, two days
+    // apart, both times a false positive — conduit PR #1424 is a real,
+    // correctly-cited reference, but it's cited as the source of a
+    // supporting statistic ("13 lapsed rows verified against prod"), not as
+    // the fix for this task's blocker. Distinct from precedent-citation
+    // (that class isn't naming a blocker at all; this one names a real,
+    // relevant PR, just not as the thing that resolves the block).
+    it('does not flag a PR mention cited as the source of a supporting fact, not the fix ("documented ... by PR #NN as", "verified against")', () => {
+      writeTask('myorg', {
+        id: 'task_stat_source',
+        title: 'Trialing rows with NULL current_period_end are invisible to the scheduler',
+        status: 'blocked',
+        description:
+          '14 of 15 trialing rows are lapsed, documented in-code by conduit PR #1424 as 13 verified against prod 2026-08-15.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    // NOTE: the two mentions are kept far apart on purpose (separate
+    // sentences, no shared clause) — this exercise found that a stat-source
+    // cue sitting in the GAP between two close references (e.g. "...verified
+    // against prod. This one is blocked on PR#67...") can leak into the
+    // NEXT reference's before-window despite the existing prev-match-end
+    // clamp, because that clamp only protects against reaching before/into
+    // the previous match's own span, not the trailing prose after it. Not
+    // fixed here — pre-existing architecture limitation (the after-window
+    // has no symmetric next-match-start clamp), same class as the "e.g."
+    // trailing-period note above, just not previously triggered because no
+    // existing cue phrase naturally sits in that gap zone. Flagging in case
+    // a tighter mixed-citation case is ever reported for real.
+    it('still flags a genuine blocking PR mention even when a stat-source citation appears earlier, well-separated, in the same description', () => {
+      writeTask('myorg', {
+        id: 'task_stat_source_mixed',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'Documented in-code by conduit PR #1424 as 13 verified against prod 2026-08-15. ' +
+          'Separately, this task itself cannot proceed until PR#67 merges.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+      expect(report.entries[0].detail).not.toContain('PR #1424');
+    });
+
+    it('does not flag other stat-source citation phrasings ("sourced from", "per PR #NN\'s own data")', () => {
+      writeTask('org-a', {
+        id: 'task_sourced_from',
+        title: 'reconcile the counts',
+        status: 'blocked',
+        description: 'The 41-org figure is sourced from PR #914.',
+      });
+      writeTask('org-a', {
+        id: 'task_own_data',
+        title: 'confirm the regression window',
+        status: 'blocked',
+        description: 'Per PR #200\'s own data, the window is 72 hours.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
     it('does not flag a blocked task with no dependency signal at all, and does not count it as eligible', () => {
       writeTask('myorg', {
         id: 'task_plain',
