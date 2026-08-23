@@ -249,11 +249,23 @@ const PR_REFERENCE_REGEX = /\bPR\s*#\s*(\d+)\b/gi;
 // narrow and nameable (precedent/example citation), so exclude it
 // specifically rather than narrowing the whole match surface.
 //
+// Widened 2026-08-22 (analyst, task_1786902033624 — a check-stale-blockers
+// sweep flagged the same false positive TWICE, two days apart, both times
+// resolved by the same peer): a genuinely real, correctly-cited PR can still
+// be a false positive if it's cited as the SOURCE OF A SUPPORTING FACT
+// ("documented in-code by conduit PR #1424 as 13 verified against prod")
+// rather than as the thing that resolves the blocker. This is a distinct
+// shape from precedent-citation (that class isn't naming a blocker at all;
+// this class names a real, relevant PR, just not as *the fix*) — added as a
+// second cue category on the same exclude-list mechanism rather than new
+// persisted state, since the failure mode (a citation-shape phrase near the
+// reference) and the fix (widen the window check) are identical in kind.
+//
 // No trailing \b: several cues end in a non-word char ("e.g."), and \b only
 // holds at a word/non-word transition — a trailing \b after "e.g." silently
 // never matches, since both the "." and the space after it are non-word.
 const PRECEDENT_CITATION_CUE_REGEX =
-  /\b(same (shape|pattern|approach|idiom) as|see .{0,10}for (the )?pattern|per the .{0,40}precedent|precedent|e\.g\.|for example|prior art)/i;
+  /\b(same (shape|pattern|approach|idiom) as|see .{0,10}for (the )?pattern|per the .{0,40}precedent|precedent|e\.g\.|for example|prior art|documented (in-code )?by|verified against|sourced from|per .{0,40}('s)? own (data|finding|number|stat))/i;
 
 // Some cues fully precede the reference ("same shape as ... PR #306"); one
 // straddles it ("see PR #12 for the pattern" — the reference sits INSIDE the
