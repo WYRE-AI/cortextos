@@ -1750,7 +1750,8 @@ Periodic liveness signals with context for dashboard status cards.
 
 ### Approval Workflow
 
-Pre-action approval gate for external or sensitive operations.
+Convention for requesting human sign-off on external or sensitive operations —
+a record-and-notify mechanism, not a programmatic gate (see correction below).
 
 - **`createApproval()`**: Writes to `orgs/{org}/approvals/pending/{id}.json`
 - **Approval ID format**: `approval_{epochMs}_{rand6}`
@@ -1758,7 +1759,22 @@ Pre-action approval gate for external or sensitive operations.
 - **Categories**: `external-comms`, `financial`, `deployment`, `data-deletion`, `other`
 - **`updateApproval()`**: Moves from `pending/` to `resolved/` on approve/reject
 - **Status values**: `pending`, `approved`, `rejected`
-- **Blocked task integration**: Approval ID stored in task's `blocked_by` field; auto-unblocks on decision
+
+**Correction (2026-08-24, dev):** the line originally here — *"Blocked task
+integration: Approval ID stored in task's `blocked_by` field; auto-unblocks
+on decision"* — described a control that does not exist and never shipped.
+Verified against current source: `createApproval()`/`updateApproval()`
+(`src/bus/approval.ts`) never read or write a task's `blocked_by` field —
+`updateApproval()` only moves the approval file to `resolved/` and sends an
+inbox notification. `blocked_by` (`src/bus/task.ts`) is a task-to-task
+dependency DAG unrelated to approvals; nothing links an approval id to it.
+An agent that files an approval and treats a pending status as blocking its
+own next action is relying on convention, not enforcement — nothing in the
+codebase currently reads an approval's status to gate execution. This entry
+is left in place (not deleted) per the project's own discipline elsewhere in
+this file of correcting inaccuracies visibly rather than silently rewriting
+history. Enforcement, if built, is tracked separately
+(task_1786761697570_08546551).
 
 ### Knowledge Base (RAG / mmrag)
 
@@ -1782,7 +1798,18 @@ Structured hypothesis-test-evaluate loop for autonomous agent experimentation.
 - **`evaluateExperiment()`**: Records outcome, transitions to `completed` or `failed`
 - **`manageCycle()`**: Manages full experiment cycle with pass/fail/continue logic
 - **`loadExperimentConfig()`**: Reads `experiments/config.json` for `approval_required` and other settings
-- **Approval gate**: If `experiments/config.json` has `approval_required: true`, `create-experiment` CLI auto-creates an approval and blocks until approved
+
+**Correction (2026-08-24, dev):** the line originally here — *"Approval
+gate: If `experiments/config.json` has `approval_required: true`,
+`create-experiment` CLI auto-creates an approval and blocks until
+approved"* — described a control that does not exist. Verified against
+current source (`src/bus/experiment.ts`): `approval_required` is declared
+on the config type but is never read anywhere else in the file —
+`createExperiment()` never calls `createApproval()` and there is no
+blocking/waiting logic. The field is currently inert. Left in place (not
+deleted) per this file's own discipline of correcting inaccuracies
+visibly. Same systemic gap as the Approval Workflow correction above
+(task_1786761697570_08546551 tracks building real enforcement, if wanted).
 
 ### Agent Discovery
 
