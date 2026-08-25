@@ -10,6 +10,10 @@ const PROJECT_ROOT = process.env.CTX_PROJECT_ROOT || FRAMEWORK_ROOT;
 const INSTANCE_ID = process.env.CTX_INSTANCE_ID || 'default';
 const CTX_ROOT = process.env.CTX_ROOT || path.join(os.homedir(), '.cortextos', INSTANCE_ID);
 const CTX_ORG = process.env.CTX_ORG || '';
+// Org-level Slack Socket Mode credentials (SP3b). Scoped narrowly on purpose — see
+// the restart-invocation note on the daemon app's `env` block below.
+const SLACK_APP_TOKEN = process.env.SLACK_APP_TOKEN || '';
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || '';
 
 // Instance-suffix the pm2 process name for non-default instances so multiple
 // instances run side-by-side. Default stays 'cortextos-daemon' (unchanged) so a
@@ -26,12 +30,27 @@ module.exports = {
       script: path.join(FRAMEWORK_ROOT, 'dist', 'daemon.js'),
       args: `--instance ${INSTANCE_ID}`,
       cwd: FRAMEWORK_ROOT,
+      // Restart with:
+      //   SLACK_APP_TOKEN=$(cortex-secret get SLACK_APP_TOKEN --context conduit) \
+      //   SLACK_BOT_TOKEN=$(cortex-secret get SLACK_BOT_TOKEN --context conduit) \
+      //   pm2 restart ecosystem.config.js --update-env
+      // NEVER `pm2 restart cortextos-daemon --update-env` (bare app name) from an
+      // agent's own shell — that snapshots the ENTIRE calling environment into pm2's
+      // stored copy for this process, unscoped, and leaked a real BOT_TOKEN +
+      // CTX_AGENT_NAME into the daemon's own env this way on 2026-08-25
+      // (task_1787663199029_25580749), making every agent look Telegram-capable to
+      // hasTelegram()'s daemon-side check. Restarting via the ecosystem FILE
+      // re-evaluates only the `process.env.X` reads this file explicitly makes —
+      // anything else set in the calling shell (an agent's BOT_TOKEN, ALLOWED_USER,
+      // etc.) is irrelevant regardless of what that shell contains.
       env: {
         CTX_INSTANCE_ID: INSTANCE_ID,
         CTX_ROOT: CTX_ROOT,
         CTX_FRAMEWORK_ROOT: FRAMEWORK_ROOT,
         CTX_PROJECT_ROOT: PROJECT_ROOT,
         CTX_ORG: CTX_ORG,
+        SLACK_APP_TOKEN: SLACK_APP_TOKEN,
+        SLACK_BOT_TOKEN: SLACK_BOT_TOKEN,
         // Debug-only: set to '1' to enable SIGUSR2 signal → controlled
         // uncaughtException for testing the crash-visibility path
         // (.daemon-crashed markers + crash-loop operator Telegram alert).

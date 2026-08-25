@@ -1246,19 +1246,26 @@ export class AgentProcess {
    * five bus-only agents while BOT_TOKEN is empty, so its presence is a false
    * positive for Telegram capability.
    *
-   * Precedence matches `cortextos bus send-telegram` itself (src/cli/bus.ts): agent
-   * `.env` first, then the process environment. If the two ever disagree, this and
-   * the command it advertises must agree, or the prompt resumes lying.
+   * NO process.env fallback (fixed 2026-08-25, task_1787663199029_25580749): this
+   * class only ever runs inside the daemon's own Node process, which is SHARED
+   * across every agent. `process.env` there is the daemon's environment, never an
+   * individual agent's — a `pm2 restart cortextos-daemon --update-env` run from
+   * inside any one agent's shell leaks that agent's real BOT_TOKEN into the
+   * daemon's process env, and a fallback here then reported EVERY agent as
+   * Telegram-capable, including bus-only ones (reproduced twice on infra, same
+   * incident). There is no legitimate standalone invocation of this method to
+   * fall back for — the agent's own `.env` file is always present and is the
+   * complete, correct signal.
    */
   private hasTelegram(): boolean {
     try {
       const envPath = join(this.env.agentDir, '.env');
       if (existsSync(envPath)) {
         const match = readFileSync(envPath, 'utf-8').match(/^BOT_TOKEN=(.+)$/m);
-        if (match && match[1].trim()) return true;
+        return !!(match && match[1].trim());
       }
-    } catch { /* fall through to process env */ }
-    return Boolean(process.env.BOT_TOKEN && process.env.BOT_TOKEN.trim());
+    } catch { /* .env unreadable — no telegram, do not fall back to process.env */ }
+    return false;
   }
 
   /**
