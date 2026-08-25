@@ -44,6 +44,20 @@
  * quoted-delimiter heredoc, then passing that file with --body-file,
  * prevents the corruption before argv even exists — complementary to the
  * checks here, which only see what already survived to argv.
+ *
+ * THE "-" SENTINEL (2026-08-25): the CLI help text has always said "omit
+ * the argument to read from stdin" — but a fixed-arity commander command
+ * makes that awkward once you need a LATER positional too (e.g. reply-to),
+ * and "-" is the standard Unix idiom (curl, tar, git, jq) for "read this
+ * from stdin" that anyone reaches for instead of reading the help text
+ * again. Before this fix, "-" was ordinary inline text: it passed the
+ * metachar check untouched and was sent as a literal one-character body,
+ * with a normal message ID returned to the sender — no error on either
+ * side. boss lost 4 coordination messages to this in one session before
+ * noticing. "-" is now a reserved sentinel for both resolveMessageBody and
+ * resolveOptionalTextField: it reads stdin explicitly and bypasses
+ * checkInlineText entirely, so it can never again reach the recipient as
+ * literal text.
  */
 import { readFileSync } from 'node:fs';
 
@@ -79,17 +93,26 @@ export interface ResolveMessageBodyOptions {
  * backtick or $( that survived to this process — see the module docblock
  * for why that check cannot see the more dangerous double-quoted case, and
  * is a secondary net rather than the fix.
+ *
+ * A bare "-" as the inline argument is a reserved stdin sentinel (the same
+ * convention curl/tar/git use), never a literal one-character body — see
+ * the 2026-08-25 incident note below. It bypasses checkInlineText entirely,
+ * the same way --body-file and stdin content do.
  */
 export function resolveMessageBody(opts: ResolveMessageBodyOptions): string {
   if (opts.bodyFile) {
     return readFileSync(opts.bodyFile, 'utf8');
   }
 
+  const readStdin = opts.readStdin ?? (() => readFileSync(0, 'utf8'));
+
   if (opts.inlineText !== undefined) {
+    if (opts.inlineText === '-') {
+      return readStdin();
+    }
     return checkInlineText(opts.inlineText, opts);
   }
 
-  const readStdin = opts.readStdin ?? (() => readFileSync(0, 'utf8'));
   return readStdin();
 }
 
@@ -112,6 +135,10 @@ export function resolveOptionalTextField(opts: ResolveMessageBodyOptions): strin
     return readFileSync(opts.bodyFile, 'utf8');
   }
   if (opts.inlineText !== undefined) {
+    if (opts.inlineText === '-') {
+      const readStdin = opts.readStdin ?? (() => readFileSync(0, 'utf8'));
+      return readStdin();
+    }
     return checkInlineText(opts.inlineText, { ...opts, stdinAvailable: false });
   }
   return undefined;

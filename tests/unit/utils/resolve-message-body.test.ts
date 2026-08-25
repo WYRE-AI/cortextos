@@ -124,6 +124,77 @@ describe('resolveMessageBody — priority order', () => {
   });
 });
 
+// 2026-08-25 incident: boss piped a body via stdin but ALSO passed the
+// conventional Unix "-" sentinel as the positional text argument (the
+// convention curl/tar/git etc. use for "read this from stdin"). Because
+// "-" !== undefined, the old code treated it as a literal one-character
+// inline body — sent with no error, recipient got the text "-", sender got
+// a normal message ID back. Four coordination messages were lost this way
+// before anyone noticed. "-" must be an explicit, unambiguous stdin
+// request, not literal text — never fall through to the metachar/length
+// checks that ordinary inline text gets, and never silently succeed.
+describe('resolveMessageBody — "-" is an explicit stdin sentinel', () => {
+  it('reads from stdin when inlineText is exactly "-"', () => {
+    const readStdin = vi.fn(() => 'piped body');
+    expect(resolveMessageBody({ inlineText: '-', readStdin })).toBe('piped body');
+    expect(readStdin).toHaveBeenCalledOnce();
+  });
+
+  it('round-trips a "-"-sentinel stdin body containing backticks/$()/apostrophes byte-identical', () => {
+    const readStdin = () => DANGEROUS_BODY;
+    expect(resolveMessageBody({ inlineText: '-', readStdin })).toBe(DANGEROUS_BODY);
+  });
+
+  it('--body-file still takes priority over a "-" sentinel', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resolve-body-'));
+    const file = join(dir, 'body.txt');
+    writeFileSync(file, 'from the file');
+    const readStdin = vi.fn(() => 'from stdin');
+
+    try {
+      expect(resolveMessageBody({ inlineText: '-', bodyFile: file, readStdin })).toBe('from the file');
+      expect(readStdin).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a single dash can no longer be sent as literal text', () => {
+    // Documents the deliberate behavior change: "-" is reserved as the
+    // stdin sentinel, so it is not a valid inline body value any more.
+    const readStdin = () => 'not a dash';
+    expect(resolveMessageBody({ inlineText: '-', readStdin })).not.toBe('-');
+  });
+});
+
+describe('resolveOptionalTextField — "-" is an explicit stdin sentinel', () => {
+  it('reads from stdin when inlineText is exactly "-", even though omission does not', () => {
+    const readStdin = vi.fn(() => 'piped description');
+    expect(resolveOptionalTextField({ inlineText: '-', readStdin })).toBe('piped description');
+    expect(readStdin).toHaveBeenCalledOnce();
+  });
+
+  it('still returns undefined on omission (the "-" sentinel does not change the no-stdin-on-omit default)', () => {
+    const readStdin = vi.fn(() => 'should not be called');
+    expect(resolveOptionalTextField({ readStdin })).toBeUndefined();
+    expect(readStdin).not.toHaveBeenCalled();
+  });
+
+  it('--*-file still takes priority over a "-" sentinel', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resolve-optional-'));
+    const file = join(dir, 'desc.txt');
+    writeFileSync(file, 'from the file');
+    const readStdin = vi.fn(() => 'from stdin');
+
+    try {
+      expect(resolveOptionalTextField({ inlineText: '-', bodyFile: file, readStdin })).toBe('from the file');
+      expect(readStdin).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // resolveOptionalTextField backs create-task's --desc and complete-task's
 // result — free-text fields that must stay valid when OMITTED entirely
 // (an empty task description is normal), so unlike resolveMessageBody they
