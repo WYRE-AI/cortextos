@@ -121,7 +121,7 @@ export const importAgentCommand = new Command('import-agent')
       model: importedConfig?.model || manifest?.model || 'claude-sonnet-4-6',
       runtime: importedConfig?.runtime || manifest?.runtime || 'claude-code',
       crons: importedConfig?.crons || manifest?.crons || [],
-      ecosystem: { local_version_control: { enabled: true } },
+      ecosystem: {},
       day_mode_start: '08:00',
       day_mode_end: '00:00',
       communication_style: importedConfig?.communication_style || 'casual',

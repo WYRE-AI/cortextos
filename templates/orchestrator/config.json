@@ -46,7 +46,5 @@
       "prompt": "Read .claude/skills/weekly-review/SKILL.md and run the full weekly review. Review all agent outputs, evaluate performance, plan next week."
     }
   ],
-  "ecosystem": {
-    "local_version_control": { "enabled": true }
-  }
+  "ecosystem": {}
 }

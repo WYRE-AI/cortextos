@@ -423,10 +423,9 @@ Proceed with the rest of the session start protocol in AGENTS.md. Crons are alre
 ### Step 20: Ask about ecosystem preferences
 
 > "I can manage some automated workflows for the team. Quick yes/no for each:
-> 1. Daily git snapshots - I commit agent changes daily so nothing is lost
-> 2. Framework updates - I check for cortextOS updates and tell you what changed before applying
-> 3. Community catalog - I browse for new skills weekly and recommend useful ones
-> 4. Community publishing - I can help package your custom skills to share with the community
+> 1. Framework updates - I check for cortextOS updates and tell you what changed before applying
+> 2. Community catalog - I browse for new skills weekly and recommend useful ones
+> 3. Community publishing - I can help package your custom skills to share with the community
 >
 > Which of these do you want enabled?"
 
@@ -436,7 +435,6 @@ Proceed with the rest of the session start protocol in AGENTS.md. Crons are alre
 
 ```bash
 jq --argjson eco '{
-  "local_version_control": {"enabled": true},
   "upstream_sync": {"enabled": false},
   "catalog_browse": {"enabled": false},
   "community_publish": {"enabled": false}
@@ -460,11 +458,6 @@ DAILY_HOUR=$(( (NIGHT_HOUR + 1) % 24 ))
 ```
 
 For each enabled feature, create a persistent cron via `cortextos bus add-cron`. Do NOT use CronCreate or config.json edits — all crons are daemon-managed from `crons.json`:
-
-**local_version_control** (time-anchored, daily):
-```bash
-cortextos bus add-cron $CTX_AGENT_NAME auto-commit "0 ${DAILY_HOUR} * * *" Run daily git snapshot. cortextos bus auto-commit - review the staged diff for PII - commit with descriptive message. Never push.
-```
 
 **upstream_sync** (time-anchored, same hour, 2 minutes offset):
 ```bash
@@ -529,7 +522,7 @@ fi
 
 ### Step 26: If theta wave enabled, register the cron
 
-Compute the theta wave hour (2 hours into night mode, so it runs after auto-commit and check-upstream):
+Compute the theta wave hour (2 hours into night mode, so it runs after check-upstream):
 
 ```bash
 # Re-read night hour (each bash block is a separate shell invocation)

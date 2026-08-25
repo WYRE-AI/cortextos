@@ -215,18 +215,22 @@ describe('Sprint 1: Template Completeness', () => {
       }
     });
 
-    it('has config.json with 6 analyst crons + ecosystem config', () => {
+    it('has config.json with 5 analyst crons + ecosystem config', () => {
       const config = JSON.parse(readFileSync(join(analystDir, 'config.json'), 'utf-8'));
-      expect(config.crons.length).toBe(6);
+      expect(config.crons.length).toBe(5);
       const cronNames = config.crons.map((c: any) => c.name);
       expect(cronNames).toContain('heartbeat');
       expect(cronNames).toContain('usage-monitor');
       expect(cronNames).toContain('nightly-metrics');
-      expect(cronNames).toContain('auto-commit');
       expect(cronNames).toContain('check-upstream');
       expect(cronNames).toContain('catalog-browse');
       expect(config.ecosystem).toBeDefined();
-      expect(config.ecosystem.local_version_control).toBeDefined();
+      // local_version_control retired 2026-08-25: its premise (git-snapshotting
+      // agent workspace state) is structurally impossible while orgs/ is
+      // gitignored repo-wide, and the shared autoCommit() function staged an
+      // unrelated agent's live WIP the same night this was found. See
+      // decision-docs/2026-08-25-auto-commit-retirement.md.
+      expect(config.ecosystem.local_version_control).toBeUndefined();
     });
 
     it('goals.json exists with all expected fields', () => {
@@ -240,10 +244,12 @@ describe('Sprint 1: Template Completeness', () => {
       expect(goals).toHaveProperty('updated_by');
     });
 
-    it('has 10 skills including analyst-specific ones', () => {
+    it('has 9 skills including analyst-specific ones', () => {
+      // local-version-control retired 2026-08-25 — see
+      // decision-docs/2026-08-25-auto-commit-retirement.md.
       const expectedSkills = [
         'autoresearch', 'comms', 'cron-management', 'tasks',
-        'catalog-browse', 'community-publish', 'local-version-control',
+        'catalog-browse', 'community-publish',
         'theta-wave', 'upstream-sync', 'onboarding',
       ];
       for (const skill of expectedSkills) {

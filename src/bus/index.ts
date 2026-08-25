@@ -8,10 +8,8 @@ export { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from './hear
 export { createApproval, updateApproval, listPendingApprovals } from './approval.js';
 export {
   selfRestart,
-  autoCommit,
   checkGoalStaleness,
   postActivity,
-  type AutoCommitReport,
   type AgentGoalStatus,
   type GoalStalenessReport,
 } from './system.js';

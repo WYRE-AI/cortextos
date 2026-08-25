@@ -87,7 +87,6 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 |---|---|
 | `self-restart --reason "<why>"` | Restart with --continue (keeps history) |
 | `hard-restart --reason "<why>"` | Fresh session (no history) |
-| `auto-commit [--dry-run]` | Daily workspace snapshot (local only) |
 | `check-upstream [--apply]` | Check for framework updates |
 | `check-deploy-drift` | Verify checkout + dist match origin/main. Caveat: "clean" means source and build agree — it cannot see a running daemon still on older code (process-vs-dist drift), so a rebuild still needs a daemon restart to be fully deployed |
 

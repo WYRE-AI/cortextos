@@ -183,8 +183,6 @@ export interface EcosystemFeatureConfig {
 }
 
 export interface EcosystemConfig {
-  /** Daily git snapshots of agent workspace. Agent stages safe files, reviews diff, commits. */
-  local_version_control?: EcosystemFeatureConfig;
   /** 24h cron to check canonical repo for framework updates. Requires upstream git remote. */
   upstream_sync?: EcosystemFeatureConfig;
   /** Weekly cron to browse community catalog and surface new skills/templates to user. */

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, postActivity } from '../../../src/bus/system';
+import { selfRestart, hardRestart, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, postActivity } from '../../../src/bus/system';
 import type { BusPaths, Task } from '../../../src/types';
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
@@ -77,126 +77,6 @@ describe('Bus System', () => {
       hardRestart(paths, 'test-agent');
       const logContent = readFileSync(join(paths.logDir, 'restarts.log'), 'utf-8');
       expect(logContent).toContain('HARD-RESTART: no reason specified');
-    });
-  });
-
-  describe('autoCommit', () => {
-    let gitDir: string;
-
-    beforeEach(() => {
-      gitDir = mkdtempSync(join(tmpdir(), 'cortextos-autocommit-test-'));
-      execSync('git init', { cwd: gitDir, stdio: 'pipe' });
-      execSync('git config user.email "test@test.com"', { cwd: gitDir, stdio: 'pipe' });
-      execSync('git config user.name "Test"', { cwd: gitDir, stdio: 'pipe' });
-      // Create initial commit so git status works properly
-      writeFileSync(join(gitDir, '.gitkeep'), '');
-      execSync('git add .gitkeep && git commit -m "init"', { cwd: gitDir, stdio: 'pipe' });
-    });
-
-    afterEach(() => {
-      rmSync(gitDir, { recursive: true, force: true });
-    });
-
-    it('filters out .env files', () => {
-      writeFileSync(join(gitDir, 'app.env'), 'SECRET=abc');
-      writeFileSync(join(gitDir, 'safe.txt'), 'hello');
-
-      const report = autoCommit(gitDir, true);
-      expect(report.status).toBe('dry_run');
-      expect(report.staged).toContain('safe.txt');
-      expect(report.blocked.some(b => b.includes('app.env'))).toBe(true);
-    });
-
-    it('filters out files with credential patterns', () => {
-      writeFileSync(join(gitDir, 'config.json'), '{"token=abc123"}');
-      writeFileSync(join(gitDir, 'readme.md'), 'just a readme');
-
-      const report = autoCommit(gitDir, true);
-      expect(report.blocked.some(b => b.includes('config.json') && b.includes('credential'))).toBe(true);
-      expect(report.staged).toContain('readme.md');
-    });
-
-    // 2026-07-15 (analyst root-cause): the pre-fix sk- branch was a bare
-    // substring match, so prose merely DOCUMENTING a token format (no real
-    // secret value) tripped it — e.g. CLAUDE.md's "Setup-tokens (sk-ant-oat01)
-    // lack the user:profile scope" blocked the daily auto-commit for a week.
-    it('does NOT false-positive on prose documenting a token FORMAT, not a real value (regression guard)', () => {
-      writeFileSync(
-        join(gitDir, 'CLAUDE.md'),
-        '- Setup-tokens (`sk-ant-oat01`) lack the `user:profile` scope, so preflight 403s with them.',
-      );
-
-      const report = autoCommit(gitDir, true);
-      expect(report.staged).toContain('CLAUDE.md');
-      expect(report.blocked.some(b => b.includes('CLAUDE.md'))).toBe(false);
-    });
-
-    it('STILL blocks a real sk- shaped token — the false-positive fix must not weaken real leak detection', () => {
-      writeFileSync(
-        join(gitDir, 'oops.json'),
-        '{"key":"sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-ABCDEF"}',
-      );
-
-      const report = autoCommit(gitDir, true);
-      expect(report.blocked.some(b => b.includes('oops.json') && b.includes('credential'))).toBe(true);
-    });
-
-    it('allows script files even with credential-like patterns', () => {
-      writeFileSync(join(gitDir, 'deploy.sh'), '#!/bin/bash\ntoken=get_from_env');
-      writeFileSync(join(gitDir, 'app.py'), 'password=input("Enter:")');
-      writeFileSync(join(gitDir, 'main.js'), 'const secret=process.env.SECRET');
-
-      const report = autoCommit(gitDir, true);
-      expect(report.staged).toContain('deploy.sh');
-      expect(report.staged).toContain('app.py');
-      expect(report.staged).toContain('main.js');
-    });
-
-    it('filters out binary/temp files', () => {
-      writeFileSync(join(gitDir, 'output.log'), 'log data');
-      writeFileSync(join(gitDir, 'cache.tmp'), 'temp');
-      writeFileSync(join(gitDir, 'app.pid'), '12345');
-
-      const report = autoCommit(gitDir, true);
-      expect(report.blocked.some(b => b.includes('output.log'))).toBe(true);
-      expect(report.blocked.some(b => b.includes('cache.tmp'))).toBe(true);
-      expect(report.blocked.some(b => b.includes('app.pid'))).toBe(true);
-    });
-
-    it('dry-run does not stage files', () => {
-      writeFileSync(join(gitDir, 'newfile.txt'), 'content');
-
-      const report = autoCommit(gitDir, true);
-      expect(report.status).toBe('dry_run');
-
-      // Verify nothing is staged
-      const staged = execSync('git diff --cached --name-only', { cwd: gitDir, encoding: 'utf-8' });
-      expect(staged.trim()).toBe('');
-    });
-
-    it('returns clean when no changes', () => {
-      const report = autoCommit(gitDir);
-      expect(report.status).toBe('clean');
-    });
-
-    it('stages safe files when not dry-run', () => {
-      writeFileSync(join(gitDir, 'newfile.txt'), 'content');
-
-      const report = autoCommit(gitDir, false);
-      expect(report.status).toBe('staged');
-      expect(report.staged).toContain('newfile.txt');
-
-      // Verify file is actually staged
-      const staged = execSync('git diff --cached --name-only', { cwd: gitDir, encoding: 'utf-8' });
-      expect(staged.trim()).toContain('newfile.txt');
-    });
-
-    it('returns nothing_to_stage when all files blocked', () => {
-      writeFileSync(join(gitDir, 'secrets.env'), 'API_KEY=123');
-
-      const report = autoCommit(gitDir);
-      expect(report.status).toBe('nothing_to_stage');
-      expect(report.blocked.length).toBeGreaterThan(0);
     });
   });
 
