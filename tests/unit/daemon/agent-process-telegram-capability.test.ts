@@ -168,11 +168,18 @@ describe('boot prompt — Telegram capability gating', () => {
     expect(prompt).toContain('update-heartbeat');
   });
 
-  it('falls back to process.env.BOT_TOKEN when the agent .env has none', () => {
+  it('does NOT fall back to process.env.BOT_TOKEN when the agent .env has none (fixed 2026-08-25, task_1787663199029_25580749)', () => {
+    // This class runs only inside the daemon's own shared Node process, so
+    // process.env.BOT_TOKEN there is never THIS agent's token — it can only be a
+    // different agent's real token that leaked in (e.g. via `pm2 restart
+    // cortextos-daemon --update-env` run from inside another agent's shell).
+    // A fallback here previously reported every agent, including bus-only ones,
+    // as Telegram-capable the moment any one agent's token touched the daemon's
+    // process env. The agent's own .env is always the complete signal.
     withAgentEnv(null);
     process.env.BOT_TOKEN = '123456:AAEabcdef';
     const prompt = boot(new AgentProcess('alice', mockEnv, {}));
-    expect(prompt).not.toContain('NO Telegram bot configured');
+    expect(prompt).toContain('NO Telegram bot configured');
   });
 
   it('treats a whitespace-only BOT_TOKEN as absent', () => {
