@@ -1779,7 +1779,7 @@ busCommand
   .argument('<path>', 'Source file path that was ingested')
   .option('--org <org>', 'Organization name')
   .option('--agent <name>', 'Agent name (for private scope)')
-  .option('--scope <s>', 'Scope: shared or private', 'shared')
+  .option('--scope <s>', 'Scope: shared or private — required, no default (a KB delete cannot be undone)')
   .action((sourcePath: string, opts: { org?: string; agent?: string; scope?: string }) => {
     const env = resolveEnv();
     const org = opts.org || env.org;
@@ -1787,11 +1787,15 @@ busCommand
       console.error('ERROR: --org or CTX_ORG required');
       process.exit(1);
     }
+    if (opts.scope !== 'shared' && opts.scope !== 'private') {
+      console.error(`ERROR: --scope shared|private required (got: ${opts.scope === undefined ? 'nothing' : JSON.stringify(opts.scope)}) — a knowledge-base delete cannot be undone, so it never defaults.`);
+      process.exit(1);
+    }
 
     deleteFromKnowledgeBase(sourcePath, {
       org,
       agent: opts.agent || env.agentName,
-      scope: (opts.scope as 'shared' | 'private') || 'shared',
+      scope: opts.scope,
       frameworkRoot: env.frameworkRoot || process.cwd(),
       instanceId: env.instanceId,
     });

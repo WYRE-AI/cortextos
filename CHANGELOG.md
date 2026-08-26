@@ -263,6 +263,25 @@ is given explicitly, regardless of value.
 
 Closes task_1787699537830_61600762.
 
+### Fixed — `bus kb-delete --scope` silently defaulted to `shared` instead of refusing
+
+A knowledge-base delete is a destructive ChromaDB operation with no undo, and `orgs/` (where
+every agent's private-scope content lives) is gitignored repo-wide — there is no git history to
+recover a delete that silently ran against the wrong collection. `kb-delete` defaulted `--scope`
+to `'shared'` at both the CLI option level and inside `deleteFromKnowledgeBase()` itself, so an
+omitted `--scope` silently deleted from the shared collection rather than refusing.
+
+`--scope` is now required with no default. Omitting it, or passing anything other than `shared`
+or `private`, exits 1 with a clear message at the CLI layer before the knowledge base is ever
+touched; `deleteFromKnowledgeBase()` carries the same guard independently as a second layer,
+since it has only one caller today but should refuse a bad value from any future one too.
+
+Surfaced while closing cortextos#130 (a separate, since-superseded PR that added `kb-delete`
+before this one shipped) as superseded — that PR's own implementation got this exact point right
+and is credited in its close comment.
+
+Closes task_1787747897711_56565516.
+
 ### Added — `bus update-task --append-desc` — a task description can now be corrected without churning its ID
 
 A task description had no edit path after creation: `update-task` only

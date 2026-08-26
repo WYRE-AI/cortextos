@@ -37,7 +37,7 @@ vi.mock('../../../src/utils/org.js', () => ({
   normalizeOrgName: (_root: string, org: string) => org,
 }));
 
-const { queryKnowledgeBase, ingestKnowledgeBase } = await import('../../../src/bus/knowledge-base.js');
+const { queryKnowledgeBase, ingestKnowledgeBase, deleteFromKnowledgeBase } = await import('../../../src/bus/knowledge-base.js');
 
 // Minimal BusPaths stub — knowledge-base.ts doesn't actually USE the paths
 // object at call time, just the options/env it constructs.
@@ -178,6 +178,67 @@ describe('queryKnowledgeBase — graceful missing-config', () => {
     expect(result.results[0].content).toBe('hit');
     // Happy path emits no [kb] warning.
     expect(warnLog.filter((m) => m.includes('[kb]'))).toHaveLength(0);
+  });
+});
+
+describe('deleteFromKnowledgeBase — scope requires no default', () => {
+  it('throws when scope is missing (undefined), execFileSync NEVER called', () => {
+    mockConfiguredKb();
+
+    expect(() =>
+      deleteFromKnowledgeBase('/some/file.md', {
+        ...baseOptions,
+        scope: undefined as unknown as 'shared' | 'private',
+      }),
+    ).toThrow(/requires an explicit scope/i);
+
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it('throws on an invalid scope string, execFileSync NEVER called', () => {
+    mockConfiguredKb();
+
+    expect(() =>
+      deleteFromKnowledgeBase('/some/file.md', {
+        ...baseOptions,
+        scope: 'everything' as unknown as 'shared' | 'private',
+      }),
+    ).toThrow(/requires an explicit scope/i);
+
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it('scope: "shared" deletes from the shared-<org> collection', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+
+    deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, scope: 'shared' });
+
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+    const [, argv] = execFileSyncMock.mock.calls[0] as [string, string[], object];
+    expect(argv).toEqual(expect.arrayContaining(['delete', '/some/file.md', '--collection', 'shared-TestOrg']));
+  });
+
+  it('scope: "private" deletes from the agent-<agent> collection', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+
+    deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, scope: 'private' });
+
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+    const [, argv] = execFileSyncMock.mock.calls[0] as [string, string[], object];
+    expect(argv).toEqual(expect.arrayContaining(['delete', '/some/file.md', '--collection', 'agent-tester']));
+  });
+
+  it('missing config: warn + return cleanly, execFileSync NEVER called', () => {
+    mockMissingKbConfig();
+
+    expect(() =>
+      deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, scope: 'shared' }),
+    ).not.toThrow();
+
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+    expect(warnLog.some((m) => m.includes('TestOrg') && /run setup/i.test(m))).toBe(true);
   });
 });
 

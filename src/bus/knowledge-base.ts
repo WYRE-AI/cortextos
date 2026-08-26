@@ -340,18 +340,31 @@ export function ingestKnowledgeBase(
  * MMRAG_CONFIG/MMRAG_DIR/MMRAG_CHROMADB_DIR set by hand (mmrag.py's own
  * defaults point at ~/.mmrag/config.json, which never exists), so the
  * command was effectively unusable outside this module (task_1786414730820).
+ *
+ * `scope` has NO default, unlike ingest/query. A delete is a destructive
+ * ChromaDB operation with no undo, and `orgs/` (where every agent's private
+ * scope lives) is gitignored repo-wide — there is no git history to recover
+ * from a delete that silently ran against the wrong collection. A caller
+ * that hasn't decided which scope to delete from must be refused, not
+ * defaulted to a guess.
  */
 export function deleteFromKnowledgeBase(
   sourcePath: string,
   options: {
     org: string;
     agent?: string;
-    scope?: 'shared' | 'private';
+    scope: 'shared' | 'private';
     frameworkRoot: string;
     instanceId: string;
   },
 ): void {
-  const { agent, scope = 'shared', frameworkRoot, instanceId } = options;
+  const { agent, scope, frameworkRoot, instanceId } = options;
+  if (scope !== 'shared' && scope !== 'private') {
+    throw new Error(
+      `kb-delete requires an explicit scope of "shared" or "private" (got: ${JSON.stringify(scope)}) — ` +
+      'a knowledge-base delete cannot be undone, so it never defaults.',
+    );
+  }
   const org = normalizeOrgName(frameworkRoot, options.org);
 
   const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
