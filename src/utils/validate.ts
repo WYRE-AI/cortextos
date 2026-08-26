@@ -59,6 +59,45 @@ export function validatePriority(priority: string): asserts priority is Priority
   }
 }
 
+const VALID_KB_SCOPES = ['shared', 'private'] as const;
+export type KBScope = typeof VALID_KB_SCOPES[number];
+
+/**
+ * Shared by kb-delete and kb-ingest, both of which have no default: a delete
+ * can't be undone, and a wrong-scope ingest silently writes agent-private
+ * content into the shared collection (or vice versa) with no error signal.
+ * `orgs/` (where private-scope content lives) is gitignored repo-wide, so
+ * there is no git history to recover from either mistake — a caller that
+ * hasn't decided which scope it means must be refused, not defaulted.
+ */
+export function validateKBScope(scope: string | undefined): asserts scope is KBScope {
+  if (scope === undefined || !VALID_KB_SCOPES.includes(scope as KBScope)) {
+    throw new Error(
+      `Invalid scope ${scope === undefined ? '(none)' : `'${scope}'`}. Must be one of: ${VALID_KB_SCOPES.join(', ')}`
+    );
+  }
+}
+
+const VALID_KB_QUERY_SCOPES = ['shared', 'private', 'all'] as const;
+export type KBQueryScope = typeof VALID_KB_QUERY_SCOPES[number];
+
+/**
+ * kb-query is a read, so an OMITTED scope may still default to 'all' at the
+ * call site — that default is a sensible search-everything behavior, not a
+ * guess with unrecoverable consequences. This validator only rejects a value
+ * that was actually supplied and isn't one of the three real scopes; without
+ * it, a typo'd/garbage scope fell through `queryKnowledgeBase`'s collection
+ * switch with no matching case, silently returning zero results —
+ * indistinguishable from a legitimate no-match.
+ */
+export function validateKBQueryScope(scope: string): asserts scope is KBQueryScope {
+  if (!VALID_KB_QUERY_SCOPES.includes(scope as KBQueryScope)) {
+    throw new Error(
+      `Invalid scope '${scope}'. Must be one of: ${VALID_KB_QUERY_SCOPES.join(', ')}`
+    );
+  }
+}
+
 const VALID_CATEGORIES: EventCategory[] = [
   'action', 'error', 'metric', 'milestone', 'heartbeat', 'message', 'task', 'approval',
 ];

@@ -8,6 +8,11 @@
  * collection. Fixed to refuse instead of guess (task from closing
  * cortextos#130 as superseded, which had this right and #130 didn't ship).
  *
+ * `kb-ingest --scope` had the identical defect (default 'shared'), flagged
+ * in review as worse than delete's: a wrong-scope ingest doesn't just touch
+ * the wrong collection, it silently WRITES agent-private content into the
+ * shared one with no error signal. Fixed the same way, covered here too.
+ *
  * Drives the real compiled CLI as a subprocess so it exercises the actual
  * gap: whether the CLI layer refuses BEFORE ever touching the knowledge
  * base, not just whether the underlying function validates.
@@ -56,8 +61,8 @@ describe.skipIf(!existsSync(DIST_CLI))("bus kb-delete — --scope is required, n
       );
 
       expect(code).toBe(1);
-      expect(stderr).toContain("--scope shared|private required");
-      expect(stderr).toContain("cannot be undone");
+      expect(stderr).toContain("Invalid scope");
+      expect(stderr).toContain("shared, private");
       expect(stdout).toBe("");
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
@@ -73,7 +78,7 @@ describe.skipIf(!existsSync(DIST_CLI))("bus kb-delete — --scope is required, n
       );
 
       expect(code).toBe(1);
-      expect(stderr).toContain("--scope shared|private required");
+      expect(stderr).toContain("Invalid scope");
       expect(stdout).toBe("");
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
@@ -92,7 +97,40 @@ describe.skipIf(!existsSync(DIST_CLI))("bus kb-delete — --scope is required, n
       // own graceful missing-config path handles it (warn + exit 0), which
       // proves --scope validation didn't block a legitimate value.
       expect(code).toBe(0);
-      expect(stderr).not.toContain("--scope shared|private required");
+      expect(stderr).not.toContain("Invalid scope");
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!existsSync(DIST_CLI))("bus kb-ingest — --scope is required, never defaults", () => {
+  it("omitting --scope refuses with exit 1, before ever touching the knowledge base", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "kb-ingest-cli-"));
+    try {
+      const { stdout, stderr, code } = await runCli(
+        ["bus", "kb-ingest", "/some/file.md", "--org", "testorg"],
+        fakeHome,
+      );
+
+      expect(code).toBe(1);
+      expect(stderr).toContain("Invalid scope");
+      expect(stdout).toBe("");
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("--scope private passes CLI validation (proceeds to the graceful missing-config warn, not a crash)", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "kb-ingest-cli-"));
+    try {
+      const { stderr, code } = await runCli(
+        ["bus", "kb-ingest", "/some/file.md", "--org", "testorg", "--scope", "private"],
+        fakeHome,
+      );
+
+      expect(code).toBe(0);
+      expect(stderr).not.toContain("Invalid scope");
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
     }

@@ -4,6 +4,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import type { BusPaths } from '../types/index.js';
 import { normalizeOrgName } from '../utils/org.js';
+import { validateKBScope, validateKBQueryScope } from '../utils/validate.js';
 
 /**
  * Knowledge base integration — calls mmrag.py directly (cross-platform,
@@ -134,7 +135,9 @@ export function queryKnowledgeBase(
     instanceId: string;
   },
 ): KBQueryResponse {
-  const { agent, scope = 'all', topK = 5, threshold = 0.5, frameworkRoot, instanceId } = options;
+  const { agent, scope: rawScope = 'all', topK = 5, threshold = 0.5, frameworkRoot, instanceId } = options;
+  validateKBQueryScope(rawScope);
+  const scope = rawScope;
   // Normalize once at the top so every downstream path join, env var, and
   // ChromaDB collection name uses the canonical filesystem casing. Without
   // this, `shared-acmecorp` and `shared-AcmeCorp` become two
@@ -252,13 +255,14 @@ export function ingestKnowledgeBase(
   options: {
     org: string;
     agent?: string;
-    scope?: 'shared' | 'private';
+    scope: 'shared' | 'private';
     force?: boolean;
     frameworkRoot: string;
     instanceId: string;
   },
 ): void {
-  const { agent, scope = 'shared', force, frameworkRoot, instanceId } = options;
+  const { agent, scope, force, frameworkRoot, instanceId } = options;
+  validateKBScope(scope);
   // Normalize once (see queryKnowledgeBase for rationale).
   const org = normalizeOrgName(frameworkRoot, options.org);
 
@@ -359,12 +363,7 @@ export function deleteFromKnowledgeBase(
   },
 ): void {
   const { agent, scope, frameworkRoot, instanceId } = options;
-  if (scope !== 'shared' && scope !== 'private') {
-    throw new Error(
-      `kb-delete requires an explicit scope of "shared" or "private" (got: ${JSON.stringify(scope)}) — ` +
-      'a knowledge-base delete cannot be undone, so it never defaults.',
-    );
-  }
+  validateKBScope(scope);
   const org = normalizeOrgName(frameworkRoot, options.org);
 
   const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
