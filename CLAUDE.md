@@ -1292,3 +1292,17 @@ acts.** This section is the fix; the write-up that noticed the problem was not.
   a real recovery artifact. **Two mistakes, one afternoon, same root cause: treating a shared
   checkout as disposable scratch space during what felt like "just a dry run."**
 
+
+## Learnings - 2026-08-26
+
+- **The Bash-tool `grep` is not grep — it silently skips any file containing a literal NUL byte
+  (rc=0, no warning), and `src/cli/bus.ts` contains an intentional NUL sentinel
+  (`KB_QUERY_DASH_SENTINEL`), so it is invisible to every Bash-tool grep sweep of this repo.**
+  (maintainer, 2026-08-26 00:5xZ, verified: a 25-file `grep -rlE` sweep found 24/25 and silently
+  omitted bus.ts; `git grep`, `rg`, and `command grep` all find it.) The tool execs the claude
+  binary under `ARGV0=ugrep` with `-I` (skip-binary), and the NUL trips the binary heuristic.
+  **Any absence claim ("grep found nothing") against this repo made via Bash-tool grep is
+  unverified for bus.ts and any future NUL-carrying file — re-check with `git grep` or `rg`.**
+  Same false-zero family as the 08-17 seven-zeros table: the miss is silent, the rc is clean, and
+  the hidden file is exactly the CLI file most sweeps target. A fleet broadcast went out same
+  night; this entry is the boot-loaded copy.
