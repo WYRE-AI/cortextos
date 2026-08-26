@@ -1302,7 +1302,11 @@ acts.** This section is the fix; the write-up that noticed the problem was not.
   omitted bus.ts; `git grep`, `rg`, and `command grep` all find it.) The tool execs the claude
   binary under `ARGV0=ugrep` with `-I` (skip-binary), and the NUL trips the binary heuristic.
   **Any absence claim ("grep found nothing") against this repo made via Bash-tool grep is
-  unverified for bus.ts and any future NUL-carrying file — re-check with `git grep` or `rg`.**
+  unverified for bus.ts and any future NUL-carrying file — re-check with `git grep` specifically.**
+  ⚠️ **CORRECTED same night (dev's repro, second repo: conduit `src/auth/safe-path.ts`): ~~or `rg`~~ —
+  `rg -l` over a DIRECTORY also silently omits NUL-carrying files** (it only prints "binary file
+  matches" when pointed at the single file directly). **`git grep` is the instrument that surfaces
+  them by default; `rg`/`grep` need explicit `-a`/`--text`.**
   Same false-zero family as the 08-17 seven-zeros table: the miss is silent, the rc is clean, and
   the hidden file is exactly the CLI file most sweeps target. A fleet broadcast went out same
   night; this entry is the boot-loaded copy.
