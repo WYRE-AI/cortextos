@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Fixed — a bare `-` message body was sent as literal text instead of reading stdin
+
+`send-message`, `send-telegram`, `create-task --desc`, and `complete-task --result` all
+resolve their free-text body through `resolveMessageBody`/`resolveOptionalTextField`. The
+documented safe path for a body containing shell metacharacters is to omit the positional
+argument (or `--desc`/`--result`) and pipe the content via stdin — but a fixed-arity
+commander command makes omitting a middle positional argument awkward, so the natural move
+is to pass the standard Unix stdin sentinel, `-` (as `curl`, `tar`, and `git` all accept it).
+Before this fix, `-` was ordinary inline text: it passed the shell-metacharacter check
+untouched and was sent as a literal one-character body, with a normal message ID returned to
+the sender and no error on either side. boss lost 4 coordination messages to this in one
+session before noticing (recipients got the text `-`).
+
+`-` is now a reserved stdin sentinel in both `resolveMessageBody` and
+`resolveOptionalTextField`: it reads stdin explicitly, bypassing the metachar/length checks
+entirely (the same way `--body-file` and plain-omission stdin already do), so it can never
+again reach a recipient as literal text. `--body-file`/`--desc-file`/`--result-file` still
+take priority over the sentinel when both are given. CLI help text updated to mention `-`
+alongside "omit the argument."
+
 ### Added — `bus update-task --append-desc` — a task description can now be corrected without churning its ID
 
 A task description had no edit path after creation: `update-task` only
