@@ -274,6 +274,13 @@ busCommand
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
+    if (opts.assignee === undefined) {
+      process.stderr.write(
+        `Warning: no --assignee given — task defaults to assigned_to: "${env.agentName}" (the calling agent). ` +
+          'If this task is meant for someone else, pass --assignee <agent> now; there is no unassign later, ' +
+          'only update-task --assignee to reroute it.\n',
+      );
+    }
     const taskId = createTask(paths, env.agentName, env.org, title, {
       description: resolvedDesc,
       assignee: opts.assignee,
