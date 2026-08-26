@@ -1316,7 +1316,11 @@ acts.** This section is the fix; the write-up that noticed the problem was not.
   (913 < 938) and rg still drops the file. Current best HYPOTHESIS, not settled: NUL within rg's
   first read buffer → whole file skipped; NUL only in a later buffer → pre-NUL matches emit, then
   silent stop. Every individual measurement in the thread was right; every generalization from
-  fewer than all of them was wrong. The RULE above does not depend on the mechanism.)*
+  fewer than all of them was wrong. The RULE above does not depend on the mechanism. FINAL STATE: measurements are mutually
+  INCONSISTENT ACROSS SESSIONS — infra's directory-mode scan missed a pre-NUL needle that
+  maintainer's and boss's directory-mode scans found, same file, same rg 15.2.0 — so the mechanism
+  is environment-sensitive and UNRESOLVED. An instrument whose failure mode varies by session is
+  the strongest possible argument for the rule.)*
   Same false-zero family as the 08-17 seven-zeros table: the miss is silent, the rc is clean, and
   the hidden file is exactly the CLI file most sweeps target. A fleet broadcast went out same
   night; this entry is the boot-loaded copy.
