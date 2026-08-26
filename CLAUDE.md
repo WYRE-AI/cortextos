@@ -1303,10 +1303,16 @@ acts.** This section is the fix; the write-up that noticed the problem was not.
   binary under `ARGV0=ugrep` with `-I` (skip-binary), and the NUL trips the binary heuristic.
   **Any absence claim ("grep found nothing") against this repo made via Bash-tool grep is
   unverified for bus.ts and any future NUL-carrying file — re-check with `git grep` specifically.**
-  ⚠️ **CORRECTED same night (dev's repro, second repo: conduit `src/auth/safe-path.ts`): ~~or `rg`~~ —
-  `rg -l` over a DIRECTORY also silently omits NUL-carrying files** (it only prints "binary file
-  matches" when pointed at the single file directly). **`git grep` is the instrument that surfaces
-  them by default; `rg`/`grep` need explicit `-a`/`--text`.**
+  ⚠️ **CORRECTED same night, TWICE — final form settled by measurement (maintainer's pushback + a
+  both-directions test on bus.ts itself, rg 15.2.0): ~~or `rg`~~ — rg's miss is
+  MATCH-POSITION-DEPENDENT.** `rg -l` over a directory reports matches occurring BEFORE a file's
+  first NUL byte and **silently drops matches occurring AFTER it** (rc=0, plausible non-empty
+  output). Verified: needle-after-NUL (`shieldKbQueryLeadingDash`, past offset 68099) vanished from
+  `rg -l src/cli/`; needle-before-NUL (`^import`) was found — same file, same tool. ⟹ **rg is
+  CATEGORICALLY unsafe for absence claims — you cannot know your needle's position relative to an
+  unknown NUL. Use `git grep` (correct in every test), or force text mode with `-a`/`--text`.**
+  *(Both intermediate generalizations — "version-dependent", "rg always misses" — were wrong while
+  every individual measurement was right; the axis was needle position.)*
   Same false-zero family as the 08-17 seven-zeros table: the miss is silent, the rc is clean, and
   the hidden file is exactly the CLI file most sweeps target. A fleet broadcast went out same
   night; this entry is the boot-loaded copy.
