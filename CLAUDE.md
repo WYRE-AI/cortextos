@@ -1311,8 +1311,12 @@ acts.** This section is the fix; the write-up that noticed the problem was not.
   `rg -l src/cli/`; needle-before-NUL (`^import`) was found — same file, same tool. ⟹ **rg is
   CATEGORICALLY unsafe for absence claims — you cannot know your needle's position relative to an
   unknown NUL. Use `git grep` (correct in every test), or force text mode with `-a`/`--text`.**
-  *(Both intermediate generalizations — "version-dependent", "rg always misses" — were wrong while
-  every individual measurement was right; the axis was needle position.)*
+  *(THREE generalizations failed in one thread — "version-dependent", "rg always misses", then
+  "match-position-dependent" itself: dev's safe-path.ts counterexample has the needle BEFORE the NUL
+  (913 < 938) and rg still drops the file. Current best HYPOTHESIS, not settled: NUL within rg's
+  first read buffer → whole file skipped; NUL only in a later buffer → pre-NUL matches emit, then
+  silent stop. Every individual measurement in the thread was right; every generalization from
+  fewer than all of them was wrong. The RULE above does not depend on the mechanism.)*
   Same false-zero family as the 08-17 seven-zeros table: the miss is silent, the rc is clean, and
   the hidden file is exactly the CLI file most sweeps target. A fleet broadcast went out same
   night; this entry is the boot-loaded copy.
