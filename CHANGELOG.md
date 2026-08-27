@@ -172,6 +172,18 @@ route bypassing `fast-checker`'s batching rather than reusing it) is deliberatel
 follow-up PR per boss's review — the two paths don't share a blocking dependency and splitting
 them lands the simpler, unbatched half first.
 
+### Fixed — `list-experiments` had no `--format` flag, unlike every other list-* command
+
+`list-experiments` declared a `--json` boolean option that was never actually read in the
+action body (output was always JSON regardless of its presence or absence) — the one
+inconsistency against `list-tasks`/`list-agents`'s established `--format <fmt>` (json|text)
+convention. Anything written assuming that convention (docs, skills, a Theta-wave scan) failed
+with `error: unknown option '--format'`.
+
+Replaced with `--format <fmt>`, default `json` (preserving the prior always-JSON behavior for
+anyone still passing nothing). `--format text` renders a compact table matching the other
+list-* commands' style. An unrecognized format value falls back to `json` rather than erroring.
+
 ### Fixed — a bare `-` message body was sent as literal text instead of reading stdin
 
 `send-message`, `send-telegram`, `create-task --desc`, and `complete-task --result` all
