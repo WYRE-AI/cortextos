@@ -319,6 +319,19 @@ describe('addCron', () => {
     expect(() => addCron('paul', makeHeartbeat())).not.toThrow();
     expect(readCrons('paul')).toHaveLength(1);
   });
+
+  it('persists an optional goal field when set', async () => {
+    const { addCron, getCronByName } = await importCrons();
+    addCron('boris', makeHeartbeat({ goal: 'All heartbeats green for 24h' }));
+    expect(getCronByName('boris', 'heartbeat')?.goal).toBe('All heartbeats green for 24h');
+  });
+
+  it('omits goal entirely when not set — no stray key on disk', async () => {
+    const { addCron, readCrons } = await importCrons();
+    addCron('boris', makeHeartbeat());
+    const [cron] = readCrons('boris');
+    expect('goal' in cron).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -391,6 +404,22 @@ describe('updateCron', () => {
     updateCron('boris', 'heartbeat', { fire_count: 42 });
     const cron = getCronByName('boris', 'heartbeat');
     expect(cron?.fire_count).toBe(42);
+  });
+
+  it('patches goal onto a cron that had none', async () => {
+    const { addCron, updateCron, getCronByName } = await importCrons();
+    addCron('boris', makeHeartbeat());
+    updateCron('boris', 'heartbeat', { goal: 'All heartbeats green for 24h' });
+    expect(getCronByName('boris', 'heartbeat')?.goal).toBe('All heartbeats green for 24h');
+  });
+
+  it('clears an existing goal when patched with undefined (CLI --goal "" path)', async () => {
+    const { addCron, updateCron, getCronByName } = await importCrons();
+    addCron('boris', makeHeartbeat({ goal: 'some condition' }));
+    updateCron('boris', 'heartbeat', { goal: undefined });
+    const cron = getCronByName('boris', 'heartbeat');
+    expect(cron?.goal).toBeUndefined();
+    expect('goal' in (cron as object)).toBe(false);
   });
 
   it('patch merges — unpatched fields are preserved', async () => {

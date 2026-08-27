@@ -489,6 +489,22 @@ export interface CronDefinition {
    * @default false (manual fire is allowed by default — opt-out model)
    */
   manualFireDisabled?: boolean;
+
+  /**
+   * A verifiable completion condition to register on the agent session via
+   * Claude Code's `/goal` slash command, injected as its OWN standalone PTY
+   * submission immediately before this cron's normal prompt injection.
+   *
+   * `/goal` only parses when it is the sole content of an input submission
+   * (see agent-manager.ts's onFire handler) — it cannot be embedded inside
+   * the cron's `prompt` text, and it is deliberately NOT routed through
+   * fast-checker's batched message queue (Telegram/Slack/inbox share one
+   * injection call per poll cycle; a goal line could get concatenated with
+   * unrelated queued text and lose the sole-content property).
+   *
+   * @example "All 12 vendor repos show green CI on main"
+   */
+  goal?: string;
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Added — `add-cron`/`update-cron --goal` — register a verifiable `/goal` completion condition on cron fire
+
+Claude Code's `/goal` slash command is user-side input: it only parses when it is the sole
+content of a PTY input submission. The daemon's cron injection wraps every fire's prompt as
+`[CRON FIRED <ts>] <name>: <prompt>`, so a goal condition embedded in the prompt text never
+reaches position 0 of its own submission and cannot register. Worse, `fast-checker`'s inbox/
+Telegram/Slack poll cycle batches all queued messages into a single injected block per cycle,
+so even a bare `/goal` line queued alongside other traffic would not reliably stand alone —
+ruling out routing this through the existing message-injection path.
+
+`CronDefinition` gains an optional `goal` field. When set, `onFire` now injects `/goal
+<condition>` as its own standalone PTY submission immediately before the cron's normal prompt
+injection — two sequential, independent submissions, never merged into one paste. The goal
+text carries a trailing salt (cron name + fire timestamp) matching the existing prompt-salting
+convention, so a recurring cron's identical goal doesn't collapse against `MessageDedup`'s
+rolling hash window on repeat fires.
+
+This locally increases exposure to the known, still-unresolved inject race
+(`task_1786736201138_53511893`: a fixed 300ms Enter can fire before a busy TUI has committed
+the preceding paste). A generous 2000ms gap is inserted between the two submissions as a
+stopgap mitigation — not a fix for the underlying race, which remains tracked separately.
+
+Cron-only for this PR; a parallel `send-message --goal` path (which needs its own injection
+route bypassing `fast-checker`'s batching rather than reusing it) is deliberately left for a
+follow-up PR per boss's review — the two paths don't share a blocking dependency and splitting
+them lands the simpler, unbatched half first.
+
 ### Fixed — a bare `-` message body was sent as literal text instead of reading stdin
 
 `send-message`, `send-telegram`, `create-task --desc`, and `complete-task --result` all
