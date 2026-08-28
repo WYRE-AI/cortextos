@@ -293,6 +293,34 @@ describe('bus add-cron', () => {
     expect(errOut).toContain('Invalid');
     expect(errOut).toContain('timezone');
   });
+
+  it('success: --goal persists a verifiable completion condition on the cron', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync([
+      'node', 'bus', 'add-cron', TEST_AGENT, 'autoresearch', '4h',
+      '--goal', 'p95 latency improved by 10%',
+      'Run the autoresearch loop.',
+    ]);
+
+    const crons = readCronsFile();
+    expect(crons).toHaveLength(1);
+    expect(crons[0].goal).toBe('p95 latency improved by 10%');
+  });
+
+  it('omitting --goal leaves the field unset', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync([
+      'node', 'bus', 'add-cron', TEST_AGENT, 'weekly-report', '0 16 * * 1',
+      'Compile the weekly report.',
+    ]);
+
+    const crons = readCronsFile();
+    expect(crons[0].goal).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -460,6 +488,33 @@ describe('bus update-cron', () => {
 
     const crons = readCronsFile();
     expect(crons[0].timezone).toBe('America/New_York');
+  });
+
+  it('sets a goal (--goal)', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync([
+      'node', 'bus', 'update-cron', TEST_AGENT, 'heartbeat', '--goal', 'All heartbeats green for 24h',
+    ]);
+
+    const crons = readCronsFile();
+    expect(crons[0].goal).toBe('All heartbeats green for 24h');
+  });
+
+  it('clears an existing goal via --goal ""', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await busCommand.parseAsync([
+      'node', 'bus', 'update-cron', TEST_AGENT, 'heartbeat', '--goal', 'some condition',
+    ]);
+    expect(readCronsFile()[0].goal).toBe('some condition');
+
+    await busCommand.parseAsync([
+      'node', 'bus', 'update-cron', TEST_AGENT, 'heartbeat', '--goal', '',
+    ]);
+    expect(readCronsFile()[0].goal).toBeUndefined();
   });
 
   it('error: --timezone with an invalid IANA string exits 1 with helpful message', async () => {

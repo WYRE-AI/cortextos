@@ -2396,7 +2396,8 @@ busCommand
   .argument('<prompt...>', 'Prompt text injected when the cron fires (all remaining words joined)')
   .option('--desc <description>', 'Human-readable description (optional)')
   .option('--timezone <tz>', 'IANA timezone for a cron-expression schedule (default: UTC). No effect on interval schedules.')
-  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string; timezone?: string }) => {
+  .option('--goal <condition>', 'Verifiable completion condition registered via /goal, injected as its own standalone submission immediately before this cron fires (optional)')
+  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string; timezone?: string; goal?: string }) => {
     // Validate agent name format
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
@@ -2427,6 +2428,7 @@ busCommand
       created_at: new Date().toISOString(),
       ...(opts.desc ? { description: opts.desc } : {}),
       ...(timezone ? { timezone } : {}),
+      ...(opts.goal ? { goal: opts.goal } : {}),
     };
 
     try {
@@ -2563,12 +2565,13 @@ busCommand
   .option('--enabled <bool>', 'Enable (true) or disable (false) the cron')
   .option('--desc <d>', 'New description')
   .option('--timezone <tz>', 'IANA timezone for a cron-expression schedule (default: UTC)')
-  .action(async (agent: string, name: string, opts: { interval?: string; cronExpr?: string; prompt?: string; enabled?: string; desc?: string; timezone?: string }) => {
+  .option('--goal <condition>', 'Verifiable /goal completion condition, injected as its own standalone submission before this cron fires. Pass an empty string to clear it.')
+  .action(async (agent: string, name: string, opts: { interval?: string; cronExpr?: string; prompt?: string; enabled?: string; desc?: string; timezone?: string; goal?: string }) => {
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
     const rawSchedule = opts.interval ?? opts.cronExpr;
-    if (!rawSchedule && opts.prompt === undefined && opts.enabled === undefined && opts.desc === undefined && opts.timezone === undefined) {
-      console.error('Error: at least one of --interval, --cron-expr, --prompt, --enabled, --desc, or --timezone is required.');
+    if (!rawSchedule && opts.prompt === undefined && opts.enabled === undefined && opts.desc === undefined && opts.timezone === undefined && opts.goal === undefined) {
+      console.error('Error: at least one of --interval, --cron-expr, --prompt, --enabled, --desc, --timezone, or --goal is required.');
       process.exit(1);
     }
 
@@ -2592,6 +2595,11 @@ busCommand
     }
     if (opts.timezone !== undefined) {
       try { patch.timezone = validateTimezone(opts.timezone); } catch (err) { console.error(String(err)); process.exit(1); }
+    }
+    if (opts.goal !== undefined) {
+      // Empty string clears an existing goal — updateCron's Partial<CronDefinition>
+      // patch would otherwise have no way to remove a previously-set field.
+      patch.goal = opts.goal === '' ? undefined : opts.goal;
     }
 
     let ok: boolean;

@@ -1458,6 +1458,12 @@ export class AgentManager {
       return;
     }
 
+    // Gap between the /goal submission and the cron's normal prompt submission
+    // when a cron carries a goal (see onFire below). Generous relative to
+    // inject.ts's default 300ms enterDelay — a local mitigation for the known
+    // unresolved inject race (task_1786736201138_53511893), not a fix for it.
+    const GOAL_INJECTION_GAP_MS = 2000;
+
     const onFire = async (cron: CronDefinition): Promise<void> => {
       const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
       // Salt with the fire timestamp so MessageDedup (which hashes the last 100
@@ -1465,6 +1471,38 @@ export class AgentManager {
       // Without the salt, every recurring cron after its first fire would be
       // dedup-rejected and treated as a dispatch failure.
       const firedAt = new Date().toISOString();
+
+      if (cron.goal) {
+        // /goal only parses when it is the SOLE content of a PTY input submission,
+        // so it must go in first as its own standalone injectAgent call, never
+        // merged into the cron's normal prompt injection below (see
+        // CronDefinition.goal's docblock for why fast-checker's batched
+        // Telegram/Slack/inbox queue can't carry this either).
+        //
+        // Trailing salt (cron name + fire timestamp) mirrors the prompt salting
+        // above: without it, a recurring cron's identical goal text collapses
+        // against MessageDedup's rolling hash window on every fire after the
+        // first. A DEDUPED result is tolerated here (not fatal) — it means an
+        // identical goal was already sent within the dedup window, which is
+        // harmless since the condition hasn't changed.
+        const goalInjection = `/goal ${cron.goal} (cron:${cron.name} fired:${firedAt})`;
+        const goalResult = this.injectAgentDetailed(agentName, goalInjection);
+        if (!goalResult.ok && goalResult.code !== 'DEDUPED') {
+          throw new Error(`goal injectAgent failed for agent "${agentName}": ${goalResult.message}`);
+        }
+
+        // Generous gap before the second, separate submission below. inject.ts's
+        // fixed 300ms Enter-vs-paste-commit race (task_1786736201138_53511893,
+        // unresolved) means two back-to-back submissions roughly double that
+        // exposure. This is a local mitigation, not a fix for the general race —
+        // that fix (condition-based waiting for paste commit) is tracked
+        // separately. A busy-check was considered and rejected: isAgentActive()
+        // is Telegram-scoped (lastMessageInjectedAt is only set on Telegram
+        // sends, never for cron/inbox), so it has no signal for "is the TUI
+        // mid-render" on a cron-fired submission.
+        await new Promise(resolve => setTimeout(resolve, GOAL_INJECTION_GAP_MS));
+      }
+
       const injection = `[CRON FIRED ${firedAt}] ${cron.name}: ${prompt}`;
       const injected = this.injectAgent(agentName, injection);
       if (!injected) {
