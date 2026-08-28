@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Fixed — `evaluate-experiment` silently overwrote `baseline_value`, destroying the historical baseline it was compared against
+
+Confirmed independently by 3 agents across 3+ weeks (pearl, murph, adoption; 4+ repro instances).
+On a `keep` decision, `evaluateExperiment` overwrote the completed record's `baseline_value` with
+the measured/scored result, so a reader auditing a completed experiment could no longer tell what
+it had actually been compared against — `baseline_value` and `result_value` ended up identical,
+which also made the dashboard's `baseline_value → result_value` delta display always read zero on
+every keep. `baseline_value` is now frozen at creation time; a new `next_baseline_value` field
+(populated on completion) carries the ratchet — what the *next* experiment on this metric should
+pass as `--baseline` — without mutating history.
+
+Three related correctness gaps fixed alongside it, per analyst's experiment-record-integrity spec
+(task_1787278742191_41460753):
+
+- **Score-vs-value ambiguity** (adoption, exp_1786934595_ltugf): `evaluate-experiment` let `--score`
+  silently override the keep/discard comparison even when a real, non-placeholder `measured_value`
+  was also given — self-inflicted in this instance, but silent. It now refuses when `--score` is
+  given alongside a non-zero `measured_value`, since every existing qualitative-metric usage already
+  passes `measured_value 0` as the placeholder convention.
+- **Uninitialized/placeholder baseline** (murph): `create-experiment --placeholder-baseline` marks a
+  forced baseline (no real prior measurement existed) as such; `evaluate-experiment` now sets
+  `needs_manual_review: true` on the completed record instead of shipping a mechanical decision
+  against a placeholder silently.
+- **Stale `gather-context`** (adoption): `gatherContext`'s `learnings`/`results_tsv` fields are now
+  recomputed live from experiment records on every call instead of reading the static
+  `learnings.md`/`results.tsv` files, which never update if a completed record is corrected after
+  the fact — theta-wave's own consumer of `gather-context` could otherwise read a decision that had
+  already been fixed at the source.
+
 ### Added — `add-cron`/`update-cron --goal` — register a verifiable `/goal` completion condition on cron fire
 
 Claude Code's `/goal` slash command is user-side input: it only parses when it is the sole
