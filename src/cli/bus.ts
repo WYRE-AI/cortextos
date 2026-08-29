@@ -809,7 +809,7 @@ busCommand
     const reason = opts.reason || 'self-restart requested';
 
     // Write .user-restart marker (same as soft-restart)
-    const ctxRoot = require('path').join(require('os').homedir(), '.cortextos', env.instanceId);
+    const ctxRoot = env.ctxRoot;
     const stateDir = join(ctxRoot, 'state', env.agentName);
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(join(stateDir, '.user-restart'), reason);
@@ -1776,7 +1776,7 @@ busCommand
     const { existsSync, readdirSync, readFileSync } = require('fs');
     const { join } = require('path');
     const env = resolveEnv();
-    const ctxRoot = require('path').join(require('os').homedir(), '.cortextos', env.instanceId);
+    const ctxRoot = env.ctxRoot;
     const frameworkRoot = env.frameworkRoot || process.cwd();
 
     // Collect agents from enabled-agents.json + filesystem scan (shared with
@@ -1942,7 +1942,7 @@ busCommand
     const { join } = require('path');
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
-    const ctxRoot = require('path').join(require('os').homedir(), '.cortextos', env.instanceId);
+    const ctxRoot = env.ctxRoot;
 
     // Write urgent signal file that fast-checker checks on every poll
     const signalDir = join(ctxRoot, 'state', targetAgent);
@@ -1971,7 +1971,7 @@ busCommand
     const { mkdirSync, writeFileSync } = require('fs');
     const { join } = require('path');
     const env = resolveEnv();
-    const ctxRoot = require('path').join(require('os').homedir(), '.cortextos', env.instanceId);
+    const ctxRoot = env.ctxRoot;
 
     // Step 1: Write .user-restart marker BEFORE triggering exit
     const stateDir = join(ctxRoot, 'state', targetAgent);
@@ -2006,7 +2006,7 @@ busCommand
     const { mkdirSync, writeFileSync, readFileSync, existsSync } = require('fs');
     const { join } = require('path');
     const env = resolveEnv();
-    const ctxRoot = require('path').join(require('os').homedir(), '.cortextos', env.instanceId);
+    const ctxRoot = env.ctxRoot;
     const staggerMs = parseInt(opts.stagger, 10) * 1000;
 
     // Read enabled agents from config
@@ -2072,7 +2072,7 @@ busCommand
     const { mkdirSync, appendFileSync } = require('fs');
     const { join } = require('path');
     const env = resolveEnv();
-    const ctxRoot = require('path').join(require('os').homedir(), '.cortextos', env.instanceId);
+    const ctxRoot = env.ctxRoot;
 
     // Write to outbound-messages.jsonl so iOS app chat history picks it up
     const logDir = join(ctxRoot, 'logs', agent);
@@ -2102,11 +2102,11 @@ busCommand
 const APPROVAL_STATUSES = ['pending', 'approved', 'rejected'] as const;
 
 /** Every org directory under CTX_ROOT — mirrors dashboard syncAll() behaviour. */
-function listOrgDirs(instanceId: string): string[] {
+function listOrgDirs(instanceId: string, ctxRoot?: string): string[] {
   const { readdirSync, existsSync } = require('fs');
   const { join } = require('path');
   const { homedir } = require('os');
-  const orgsDir = join(homedir(), '.cortextos', instanceId, 'orgs');
+  const orgsDir = join(ctxRoot || join(homedir(), '.cortextos', instanceId), 'orgs');
   return existsSync(orgsDir)
     ? readdirSync(orgsDir, { withFileTypes: true })
         .filter((d: { isDirectory(): boolean }) => d.isDirectory())
@@ -2141,7 +2141,7 @@ busCommand
     let approvals: unknown[] = [];
 
     if (opts.allOrgs) {
-      for (const org of listOrgDirs(env.instanceId)) {
+      for (const org of listOrgDirs(env.instanceId, env.ctxRoot)) {
         const orgPaths = resolvePaths(env.agentName, env.instanceId, org, env.ctxRoot);
         approvals = approvals.concat(listApprovals(orgPaths, effectiveStatus));
       }
@@ -2187,7 +2187,7 @@ busCommand
     const { getApproval } = require('../bus/approval.js');
     const env = resolveEnv();
 
-    const orgs = opts.allOrgs ? listOrgDirs(env.instanceId) : [env.org];
+    const orgs = opts.allOrgs ? listOrgDirs(env.instanceId, env.ctxRoot) : [env.org];
     let found: { id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; updated_at?: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string } | null = null;
     for (const org of orgs) {
       found = getApproval(resolvePaths(env.agentName, env.instanceId, org, env.ctxRoot), approvalId);
