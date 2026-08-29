@@ -5,7 +5,8 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInboxWithStatus, ackInbox } from '../bus/message.js';
-import { validateAgentName, validateTaskId } from '../utils/validate.js';
+import { validateAgentName, validateTaskId, validatePriority } from '../utils/validate.js';
+import { randomDigits } from '../utils/random.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
@@ -233,6 +234,109 @@ busCommand
       const desc = opts.desc ? ` — ${opts.desc.slice(0, 120)}` : '';
       sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
         `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
+    }
+  });
+
+/**
+ * One item in a `dispatch-batch` items file: becomes one task.
+ */
+interface DispatchBatchItem {
+  title: string;
+  desc?: string;
+}
+
+/**
+ * Parse and validate a dispatch-batch items file's contents.
+ *
+ * Validates the WHOLE batch before any task is created (see the caller) —
+ * a malformed item N should never leave tasks 1..N-1 created with no batch
+ * id anyone can find, which is the exact "durable but orphaned" half of the
+ * gap this command exists to close.
+ */
+export function parseDispatchBatchItems(raw: string): DispatchBatchItem[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`items file is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error('items file must be a non-empty JSON array of {"title": "...", "desc"?: "..."} objects');
+  }
+  return parsed.map((item, i) => {
+    if (typeof item !== 'object' || item === null || typeof (item as { title?: unknown }).title !== 'string' || (item as { title: string }).title.trim() === '') {
+      throw new Error(`item ${i} is missing a non-empty string "title"`);
+    }
+    const desc = (item as { desc?: unknown }).desc;
+    if (desc !== undefined && typeof desc !== 'string') {
+      throw new Error(`item ${i}'s "desc" must be a string if present`);
+    }
+    return { title: (item as { title: string }).title, desc: desc as string | undefined };
+  });
+}
+
+busCommand
+  .command('dispatch-batch')
+  .description('Create N tasks from a JSON items file, all sharing one traceable batch id — the durable alternative to describing a multi-item batch only in a bus message body, whose delivery-ack has no idea how much of the work got done before a session died (task_1787921691733_11462336).')
+  .argument('<assignee>', 'Agent the whole batch is dispatched to')
+  .argument('<items-file>', 'Path to a JSON file: an array of {"title": "...", "desc"?: "..."} objects. Pass "-" to read from stdin. Keep items FINE-GRAINED (one file/step per item, not one item for the whole batch) so a crash mid-batch loses at most one item, not a fraction of an in_progress one.')
+  .option('--priority <p>', 'Priority applied to every item task (urgent, high, normal, low)', 'normal')
+  .option('--project <name>', 'Override the auto-generated batch id (advanced — default is batch-<timestamp>-<rand>, unique and sufficient for tracing without this)')
+  .action((assignee: string, itemsFile: string, opts: { priority: string; project?: string }) => {
+    try {
+      validateAgentName(assignee);
+      validatePriority(opts.priority as Priority);
+    } catch (err) {
+      console.error(String(err));
+      process.exit(1);
+    }
+
+    let raw: string;
+    try {
+      raw = itemsFile === '-' ? readFileSync(0, 'utf-8') : readFileSync(itemsFile, 'utf-8');
+    } catch (err) {
+      console.error(`Could not read items file '${itemsFile}': ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+
+    let items: DispatchBatchItem[];
+    try {
+      items = parseDispatchBatchItems(raw);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const batchId = opts.project || `batch-${Date.now()}-${randomDigits(6)}`;
+
+    const taskIds = items.map(item =>
+      createTask(paths, env.agentName, env.org, item.title, {
+        description: item.desc ?? '',
+        assignee,
+        priority: opts.priority as Priority,
+        project: batchId,
+      })
+    );
+
+    console.log(batchId);
+    for (const id of taskIds) console.log(id);
+
+    // One summary message, not N individual create-task auto-notifies — and
+    // the check-before-trusting-an-ack instruction lives IN the dispatch
+    // text itself (instruction-at-point-of-use), not only in a doc a
+    // successor session has no particular reason to re-read.
+    if (assignee !== env.agentName) {
+      const assigneePaths = resolvePaths(assignee, env.instanceId, env.org);
+      sendMessage(
+        assigneePaths, env.agentName, assignee, 'normal',
+        `Batch dispatch ${batchId}: ${taskIds.length} task(s) created (${taskIds.join(', ')}). ` +
+        `Before executing on ANY of these, run \`cortextos bus list-tasks --project ${batchId} --status pending\` ` +
+        `to see what is actually still outstanding — do not trust this message alone if you are a successor to a ` +
+        `session that already started this batch (acking this message only confirms delivery, never how much of ` +
+        `the batch got done before the prior session ended).`,
+      );
     }
   });
 
