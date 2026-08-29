@@ -429,7 +429,7 @@ export class AgentManager {
       projectRoot: this.frameworkRoot,
     };
 
-    const paths = resolvePaths(name, this.instanceId, resolvedOrg);
+    const paths = resolvePaths(name, this.instanceId, resolvedOrg, this.ctxRoot);
 
     const log = (msg: string) => {
       console.log(`[${name}] ${msg}`);

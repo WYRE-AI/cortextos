@@ -729,7 +729,7 @@ export function broadcastActivityViaBus(
   );
   for (const agent of recipients) {
     try {
-      const recipientPaths = resolvePaths(agent.name, instanceId, org);
+      const recipientPaths = resolvePaths(agent.name, instanceId, org, ctxRoot);
       sendMessage(recipientPaths, sender, agent.name, 'normal', `[ACTIVITY] ${message}`);
       delivered.push(agent.name);
     } catch {
