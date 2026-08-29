@@ -1,6 +1,6 @@
-import { execSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync, readdirSync, statSync, appendFileSync, writeFileSync } from 'fs';
-import { join, extname } from 'path';
+import { execSync } from 'child_process';
+import { existsSync, readFileSync, readdirSync, appendFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import { ensureDir } from '../utils/atomic.js';
 import { TelegramAPI } from '../telegram/api.js';
 import type { BusPaths, TaskStatus } from '../types/index.js';
@@ -10,13 +10,6 @@ import { sendMessage } from './message.js';
 import { listTasks, checkTaskDependenciesWithStatus } from './task.js';
 
 // --- Types ---
-
-export interface AutoCommitReport {
-  status: 'staged' | 'clean' | 'nothing_to_stage' | 'dry_run';
-  staged: string[];
-  blocked: string[];
-  diff_stat?: string;
-}
 
 export interface AgentGoalStatus {
   agent: string;
@@ -32,33 +25,6 @@ export interface GoalStalenessReport {
   summary: { total: number; stale: number; fresh: number; threshold_days: number };
   agents: AgentGoalStatus[];
 }
-
-// --- Blocked file patterns ---
-
-const BINARY_TEMP_EXTENSIONS = new Set([
-  '.log', '.tmp', '.pid', '.pyc', '.pyo', '.class', '.o', '.so', '.dylib',
-]);
-
-const EXCLUDED_DIR_PREFIXES = [
-  'telegram-images/',
-  'node_modules/',
-  '__pycache__/',
-  '.venv/',
-];
-
-// sk- requires a real-token-shaped tail (20+ alphanumeric/_/- chars), not a
-// bare substring match. Pre-fix, prose merely DOCUMENTING a token format —
-// e.g. CLAUDE.md's "Setup-tokens (sk-ant-oat01) lack the user:profile
-// scope" — tripped the sk- branch (analyst root-cause, 2026-07-15) and
-// silently blocked the daily auto-commit snapshot for a week. Real
-// Anthropic/OpenAI-shaped keys are 40-100+ chars after the prefix, so 20 is
-// a wide safety margin below any real key while comfortably excluding short
-// format-name mentions like "sk-ant-oat01" (9 chars after "sk-").
-const CREDENTIAL_PATTERNS = /(?:token=|key=|password=|secret=|sk-[a-zA-Z0-9_-]{20,}|ghp_|xoxb-|AKIA)/;
-
-const SCRIPT_EXTENSIONS = new Set(['.sh', '.py', '.js']);
-
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 // --- Functions ---
 
@@ -101,131 +67,6 @@ export function hardRestart(paths: BusPaths, agentName: string, reason?: string)
   const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const logLine = `[${timestamp}] HARD-RESTART: ${resolvedReason}\n`;
   appendFileSync(join(paths.logDir, 'restarts.log'), logLine, 'utf-8');
-}
-
-/**
- * Auto-commit safe files in a project directory.
- * Filters out dangerous files (credentials, env, large, binary).
- * Never pushes. Mirrors bash bus/auto-commit.sh.
- */
-export function autoCommit(projectDir: string, dryRun: boolean = false): AutoCommitReport {
-  // Check if git repo
-  try {
-    execSync('git rev-parse --is-inside-work-tree', { cwd: projectDir, stdio: 'pipe' });
-  } catch {
-    return { status: 'clean', staged: [], blocked: [] };
-  }
-
-  // Get changed files
-  let porcelainOutput: string;
-  try {
-    porcelainOutput = execSync('git status --porcelain', { cwd: projectDir, encoding: 'utf-8' });
-  } catch {
-    return { status: 'clean', staged: [], blocked: [] };
-  }
-
-  if (!porcelainOutput.trim()) {
-    return { status: 'clean', staged: [], blocked: [] };
-  }
-
-  const changedFiles = porcelainOutput
-    .split('\n')
-    .filter(line => line.trim())
-    .map(line => line.slice(3)); // cut from column 4 (0-indexed col 3)
-
-  const staged: string[] = [];
-  const blocked: string[] = [];
-
-  for (const file of changedFiles) {
-    if (!file) continue;
-
-    // Block .env files
-    if (file.endsWith('.env') || file.includes('/.env')) {
-      blocked.push(`${file}:contains_credentials`);
-      continue;
-    }
-
-    // Block .cortextos-env
-    if (file === '.cortextos-env' || file.endsWith('/.cortextos-env')) {
-      blocked.push(`${file}:runtime_env`);
-      continue;
-    }
-
-    // Block binary/temp extensions
-    const ext = extname(file);
-    if (BINARY_TEMP_EXTENSIONS.has(ext)) {
-      blocked.push(`${file}:binary_or_temp`);
-      continue;
-    }
-
-    // Block excluded directories
-    if (EXCLUDED_DIR_PREFIXES.some(prefix => file.startsWith(prefix))) {
-      blocked.push(`${file}:excluded_directory`);
-      continue;
-    }
-
-    const fullPath = join(projectDir, file);
-
-    // Block files over 10MB
-    if (existsSync(fullPath)) {
-      try {
-        const stat = statSync(fullPath);
-        if (stat.isFile() && stat.size > MAX_FILE_SIZE) {
-          blocked.push(`${file}:over_10MB`);
-          continue;
-        }
-      } catch {
-        // If can't stat, still try to stage
-      }
-    }
-
-    // Check credential patterns in non-script file content
-    if (existsSync(fullPath) && !SCRIPT_EXTENSIONS.has(ext)) {
-      try {
-        const stat = statSync(fullPath);
-        if (stat.isFile() && stat.size < MAX_FILE_SIZE) {
-          const content = readFileSync(fullPath, 'utf-8');
-          if (CREDENTIAL_PATTERNS.test(content)) {
-            blocked.push(`${file}:credential_pattern_detected`);
-            continue;
-          }
-        }
-      } catch {
-        // Binary files may throw on utf-8 read - skip credential check
-      }
-    }
-
-    staged.push(file);
-  }
-
-  if (staged.length === 0) {
-    return { status: 'nothing_to_stage', staged: [], blocked };
-  }
-
-  if (dryRun) {
-    return { status: 'dry_run', staged, blocked };
-  }
-
-  // Stage safe files
-  for (const file of staged) {
-    try {
-      execFileSync('git', ['add', file], { cwd: projectDir, stdio: 'pipe' });
-    } catch {
-      // Ignore individual add failures
-    }
-  }
-
-  // Get diff stat
-  let diffStat: string | undefined;
-  try {
-    const stat = execSync('git diff --cached --stat', { cwd: projectDir, encoding: 'utf-8' });
-    const lines = stat.trim().split('\n');
-    diffStat = lines[lines.length - 1]?.trim() || undefined;
-  } catch {
-    // Ignore
-  }
-
-  return { status: 'staged', staged, blocked, diff_stat: diffStat };
 }
 
 /**

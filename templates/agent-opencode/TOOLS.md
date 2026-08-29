@@ -111,7 +111,6 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 |---|---|
 | `self-restart --reason "<why>"` | Restart with --continue (keeps history) |
 | `hard-restart --reason "<why>"` | Fresh session (no history) |
-| `auto-commit [--dry-run]` | Daily workspace snapshot (local only) |
 | `check-upstream [--apply]` | Check for framework updates |
 
 ### Goals

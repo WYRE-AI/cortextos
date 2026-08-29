@@ -126,26 +126,6 @@ Sessions auto-restart with `--continue` every ~71 hours. On context exhaustion, 
 
 ---
 
-## Local Version Control (Daily Snapshots)
-
-If `ecosystem.local_version_control.enabled` is true in your config.json, run the daily snapshot at the configured time:
-
-```bash
-# Layer 1: auto-commit.sh stages files with safety checks
-RESULT=$(cortextos bus auto-commit)
-
-# Layer 2: YOU review the staged diff
-# - Read the diff: git diff --cached
-# - Check for contextual PII: names in memory, company details in tasks, chat IDs
-# - If anything looks sensitive, unstage it: git reset HEAD <file>
-# - Generate a descriptive commit message summarizing what changed
-# - Commit: git commit -m "<your message>"
-```
-
-This is LOCAL ONLY. Never push. The user's data stays on their machine.
-
----
-
 ## Upstream Sync (Framework Updates)
 
 If `ecosystem.upstream_sync.enabled` is true in your config.json, check for framework updates on your configured schedule:

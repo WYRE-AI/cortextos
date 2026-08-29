@@ -375,13 +375,6 @@ Kill and relaunch (fresh session, no history).
 cortextos bus hard-restart --reason "why"
 ```
 
-### auto-commit
-Automatic daily snapshot of agent workspace changes. Local only, never pushes.
-
-```bash
-cortextos bus auto-commit [--dry-run]
-```
-
 ### check-upstream
 Check for framework updates from the canonical repo.
 
@@ -450,7 +443,6 @@ cortextos bus submit-community-item <item-name> <item-type> "<description>" [--d
 | Run an experiment                 | `create-experiment`       |
 | Restart (keep history)            | `self-restart`            |
 | Restart (fresh)                   | `hard-restart`            |
-| Snapshot workspace                | `auto-commit`             |
 | Check for updates                 | `check-upstream`          |
 
 

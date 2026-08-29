@@ -49,6 +49,35 @@ again reach a recipient as literal text. `--body-file`/`--desc-file`/`--result-f
 take priority over the sentinel when both are given. CLI help text updated to mention `-`
 alongside "omit the argument."
 
+### Removed — `bus auto-commit` and the `local_version_control` ecosystem feature
+
+Retired entirely rather than rescoped. `autoCommit()` ran `git add` against a
+target directory intended to snapshot an individual agent's workspace under
+`orgs/`, which is gitignored repo-wide (`.gitignore:14`) — `git add` on a
+gitignored path exits 1 and stages nothing, but the function's own
+`try { execFileSync('git', ['add', file]) } catch { /* ignore */ }` silently
+swallowed that failure, so its JSON report claimed `status: 'staged'` for
+files that were never staged. Rescoping the target to an individual agent
+directory would not have fixed this: the same outer repo and the same
+`.gitignore` apply from any subdirectory, so per-agent workspace snapshotting
+is structurally impossible via a `git add` in this repo, regardless of scope.
+
+The one thing `autoCommit` could actually stage — tracked files anywhere in
+the shared 15-agent framework checkout — is what caused a real incident: a
+cron-triggered auto-commit staged another agent's live, uncommitted dashboard
+work. Indiscriminately auto-staging a shared checkout is dangerous
+independent of the `orgs/` question, so the feature is removed rather than
+rescoped. See `decision-docs/2026-08-25-auto-commit-retirement.md` for the
+full analysis.
+
+Removed the `auto-commit` CLI command, the `autoCommit()` function and its
+helper constants, the `bus/auto-commit.sh` wrapper, the `local_version_control`
+field from `EcosystemConfig`, and all template/doc references (`analyst`'s
+`local-version-control` skill and its cron, and matching `TOOLS.md` /
+`bus-reference` rows across all five agent templates). `community/` was left
+untouched — it had already independently diverged from `templates/` and
+fixing that drift is separate, lower-urgency follow-up work.
+
 ### Added — `bus update-task --append-desc` — a task description can now be corrected without churning its ID
 
 A task description had no edit path after creation: `update-task` only
