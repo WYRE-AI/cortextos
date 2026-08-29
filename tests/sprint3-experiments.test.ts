@@ -253,7 +253,8 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(result.status).toBe('completed');
       expect(result.decision).toBe('keep');
       expect(result.result_value).toBe(42);
-      expect(result.baseline_value).toBe(42); // updated to measured
+      expect(result.baseline_value).toBe(0); // frozen — what this cycle was actually compared against
+      expect(result.next_baseline_value).toBe(42); // ratchet: what the NEXT cycle should use
       expect(result.completed_at).toBeTruthy();
       expect(result.learning).toBe('Emojis work');
 
@@ -285,7 +286,8 @@ describe('Sprint 3: Experiment Framework', () => {
       // Measured 0 vs baseline 0 should discard (not strictly greater)
       const result = evaluateExperiment(testDir, id, 0);
       expect(result.decision).toBe('discard');
-      expect(result.baseline_value).toBe(0); // NOT updated
+      expect(result.baseline_value).toBe(0); // frozen, unchanged
+      expect(result.next_baseline_value).toBe(0); // discard: target doesn't move
     });
 
     it('keeps when lower is better and measured < baseline', () => {
@@ -302,6 +304,33 @@ describe('Sprint 3: Experiment Framework', () => {
     it('throws if experiment is not running', () => {
       const id = createExperiment(testDir, 'testbot', 'ctr', 'test');
       expect(() => evaluateExperiment(testDir, id, 10)).toThrow("expected 'running'");
+    });
+
+    describe('baseline_is_placeholder / needs_manual_review (murph, exp_1787745238_vzgah shape)', () => {
+      it('defaults to false when not marked as a placeholder', () => {
+        const id = createExperiment(testDir, 'testbot', 'kb_freshness', 'test', { baseline: 5 });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 10);
+        expect(result.needs_manual_review).toBe(false);
+      });
+
+      it('flags needs_manual_review on completion when baseline_is_placeholder was set at creation', () => {
+        const id = createExperiment(testDir, 'testbot', 'kb_freshness', 'No real prior baseline exists', {
+          baseline: 0,
+          baselineIsPlaceholder: true,
+        });
+        const exp = JSON.parse(
+          readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim(),
+        );
+        expect(exp.baseline_is_placeholder).toBe(true);
+        expect(exp.needs_manual_review).toBe(false); // not yet evaluated
+
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 3);
+        // Decision is still computed mechanically (3 > 0 = keep) — it just isn't trusted silently.
+        expect(result.decision).toBe('keep');
+        expect(result.needs_manual_review).toBe(true);
+      });
     });
 
     describe('--score (qualitative metrics)', () => {
@@ -328,7 +357,21 @@ describe('Sprint 3: Experiment Framework', () => {
         const result = evaluateExperiment(testDir, id, 0, { score: 7 });
 
         expect(result.decision).toBe('keep');
-        expect(result.baseline_value).toBe(7); // next eval's baseline is the score, not the placeholder
+        expect(result.baseline_value).toBe(5); // frozen — the true prior baseline, not clobbered
+        expect(result.next_baseline_value).toBe(7); // next eval's baseline is the score, not the placeholder
+      });
+
+      it('refuses --score alongside a non-zero measured_value (score-vs-value ambiguity, adoption exp_1786934595_ltugf)', () => {
+        const id = createExperiment(testDir, 'testbot', 'manual_steps', 'Fewer manual steps', {
+          direction: 'lower',
+          baseline: 9,
+        });
+        runExperiment(testDir, id);
+        // A real measurement (8) AND a score (9) together is ambiguous — refuse rather than
+        // silently let score win and discard the real measurement.
+        expect(() => evaluateExperiment(testDir, id, 8, { score: 9 })).toThrow(
+          '--score 9 given alongside a non-zero measured_value (8)',
+        );
       });
 
       it('score is null when not given, on both a scored-metric and a plain-metric evaluation', () => {
@@ -487,6 +530,38 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(ctx.keep_rate).toBeCloseTo(2 / 3);
       expect(ctx.learnings).toContain('Experiment Learnings');
       expect(ctx.results_tsv).toContain('experiment_id');
+    });
+
+    it('never goes stale relative to list-experiments after a record is corrected post-completion (task_1787278742191_41460753 item D, adoption\'s exp_1786934595_ltugf shape)', () => {
+      const id = createExperiment(testDir, 'testbot', 'manual_steps', 'test', {
+        direction: 'lower',
+        baseline: 9,
+      });
+      runExperiment(testDir, id);
+      evaluateExperiment(testDir, id, 8); // correctly decides keep (8 < 9)
+
+      // Simulate a hand-correction to the persisted record — e.g. a decision
+      // fixed after the fact, exactly as adoption did for exp_1786934595_ltugf
+      // (no update-experiment CLI exists yet; this is how corrections happen
+      // today). The physical results.tsv/learnings.md written at evaluate
+      // time are NOT touched by this — they still say the pre-correction
+      // decision, same as the real incident.
+      const filePath = join(testDir, 'experiments', 'history', `${id}.json`);
+      const corrected = JSON.parse(readFileSync(filePath, 'utf-8').trim());
+      expect(corrected.decision).toBe('keep');
+      corrected.decision = 'discard';
+      writeFileSync(filePath, JSON.stringify(corrected, null, 2));
+
+      const fromList = listExperiments(testDir, { agent: 'testbot' }).find(e => e.id === id);
+      expect(fromList?.decision).toBe('discard');
+
+      const ctx = gatherContext(testDir, 'testbot');
+      // gatherContext must reflect the CORRECTED record, not the stale
+      // physical files written at original evaluate-experiment time.
+      expect(ctx.discards).toBe(1);
+      expect(ctx.keeps).toBe(0);
+      expect(ctx.results_tsv).toContain(`${id}\ttestbot\tmanual_steps\t8\t9\tdiscard`);
+      expect(ctx.learnings).toContain(`## ${id} (discard)`);
     });
 
     it('reads IDENTITY.md and GOALS.md if present', () => {

@@ -1080,7 +1080,8 @@ busCommand
   .option('--window <dur>', 'Measurement window', '24h')
   .option('--kind <kind>', 'intervention or snapshot', 'intervention')
   .option('--baseline <n>', 'Baseline value to compare the measured result against (required before evaluate-experiment will accept this experiment)')
-  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string; baseline?: string }) => {
+  .option('--placeholder-baseline', 'Mark --baseline as a forced placeholder (no real prior measurement existed) rather than a genuine baseline — the completed record gets flagged needs_manual_review instead of shipping a mechanical decision silently')
+  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string; baseline?: string; placeholderBaseline?: boolean }) => {
     try { validateExperimentBaseline(opts.baseline); } catch (err) { console.error(String(err)); process.exit(1); }
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
@@ -1090,6 +1091,7 @@ busCommand
       window: opts.window,
       kind: opts.kind as 'intervention' | 'snapshot',
       baseline: opts.baseline !== undefined ? parseFloat(opts.baseline) : undefined,
+      baselineIsPlaceholder: opts.placeholderBaseline ?? false,
     });
     console.log(id);
 

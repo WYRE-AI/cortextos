@@ -16,6 +16,10 @@ export interface Experiment {
   window: string;
   measurement: string;
   status: 'proposed' | 'running' | 'completed';
+  /** The baseline this experiment was actually evaluated against. Frozen at
+   * whatever value it held when the experiment was created — evaluateExperiment
+   * never mutates it. Historical fact: "what was this cycle compared against."
+   * Do NOT read this to seed the next cycle's --baseline; use next_baseline_value. */
   baseline_value: number | null;
   result_value: number | null;
   /** Independent qualitative-score field (--score). Distinct from result_value,
@@ -24,6 +28,23 @@ export interface Experiment {
    * be conflated. null when no score was given. */
   score: number | null;
   decision: 'keep' | 'discard' | null;
+  /** Set by evaluateExperiment on completion: the value the NEXT experiment on
+   * this metric should pass as --baseline. On 'keep' this is the effective
+   * (decision-driving) value — the ratchet moves forward. On 'discard' it is
+   * the unchanged baseline_value — nothing improved, so the target doesn't move.
+   * null until the experiment completes. This is the ratchet mechanism;
+   * baseline_value itself is never touched, so history stays readable. */
+  next_baseline_value: number | null;
+  /** True when this experiment's baseline_value was a forced placeholder (no
+   * real prior measurement existed) rather than a genuine measured baseline.
+   * Set at creation via --placeholder-baseline. Doesn't change decision
+   * computation — only marks the completed record for manual review, since a
+   * mechanical decision against a placeholder baseline isn't ground truth. */
+  baseline_is_placeholder: boolean;
+  /** Set true by evaluateExperiment on completion when baseline_is_placeholder
+   * was true — flags that this record's decision needs a human/agent to
+   * confirm it rather than being trusted as a normal mechanical result. */
+  needs_manual_review: boolean;
   learning: string;
   experiment_commit: string | null;
   tracking_commit: string | null;
@@ -42,6 +63,7 @@ export interface ExperimentCreateOptions {
   approval_required?: boolean;
   kind?: 'intervention' | 'snapshot';
   baseline?: number;
+  baselineIsPlaceholder?: boolean;
 }
 
 export interface ExperimentEvaluateOptions {
@@ -205,6 +227,9 @@ export function createExperiment(
     result_value: null,
     score: null,
     decision: null,
+    next_baseline_value: null,
+    baseline_is_placeholder: options?.baselineIsPlaceholder ?? false,
+    needs_manual_review: false,
     learning: '',
     experiment_commit: null,
     tracking_commit: null,
@@ -304,6 +329,24 @@ export function evaluateExperiment(
   }
   const baseline = experiment.baseline_value;
 
+  // score only ever drives the decision for a QUALITATIVE evaluation, whose
+  // convention (see every --score test) is a placeholder measuredValue of 0.
+  // A non-zero measuredValue given alongside --score is ambiguous — which one
+  // is real? — and score would silently win, discarding a genuine measurement
+  // for decision purposes. Refuse rather than guess (cortextos analyst spec,
+  // adoption's exp_1786934595_ltugf: self-inflicted --score alongside a real
+  // measured_value=8 silently flipped a correct 'keep' into a wrong 'discard').
+  if (options?.score !== undefined && measuredValue !== 0) {
+    throw new Error(
+      `evaluate-experiment refused: --score ${options.score} given alongside a non-zero ` +
+      `measured_value (${measuredValue}). --score is only for qualitative metrics, where ` +
+      `measured_value is passed as a 0 placeholder and score is the real value. Passing a ` +
+      `real measured_value AND a score is ambiguous — which one should drive the keep/discard ` +
+      `decision? Pass measured_value 0 if this is a qualitative evaluation (score drives), or ` +
+      `drop --score if this is a quantitative evaluation (measured_value drives).`,
+    );
+  }
+
   // The value the keep/discard decision (and, on keep, the next baseline) is
   // computed against. For qualitative metrics the agent passes 0 as a
   // placeholder measuredValue and --score 7 as the real one, so score — when
@@ -329,6 +372,15 @@ export function evaluateExperiment(
   experiment.score = options?.score ?? null;
   experiment.decision = decision;
 
+  if (experiment.baseline_is_placeholder) {
+    experiment.needs_manual_review = true;
+    console.error(
+      `⚠ ${experimentId}: baseline_value was a placeholder (no real prior existed) — ` +
+      `decision '${decision}' is mechanical, not ground truth. Needs manual review before ` +
+      `treating this result as a real keep/discard.`,
+    );
+  }
+
   // Build learning from options
   const learningParts: string[] = [];
   if (options?.learning) learningParts.push(options.learning);
@@ -337,14 +389,16 @@ export function evaluateExperiment(
     experiment.learning = learningParts.join(' — ');
   }
 
-  // If keep, baseline becomes the effective (decision-driving) value — for a
-  // qualitative metric that's the score, so the NEXT evaluation on this
-  // metric (which will also pass a placeholder measuredValue + a real
-  // --score) compares score against score, not score against a stale
-  // placeholder.
-  if (decision === 'keep') {
-    experiment.baseline_value = effectiveValue;
-  }
+  // next_baseline_value is the ratchet: what the NEXT experiment on this
+  // metric should pass as --baseline. On keep it's the effective
+  // (decision-driving) value, so a qualitative metric's next evaluation
+  // compares score against score, not score against a stale placeholder. On
+  // discard nothing improved, so the target for next time doesn't move.
+  // baseline_value itself is NEVER touched here — it stays the frozen fact of
+  // what THIS cycle was actually compared against, so a reader auditing a
+  // completed experiment sees real history instead of a clobbered value that
+  // happens to equal its own result (cortextos analyst spec, 2026-08-27).
+  experiment.next_baseline_value = decision === 'keep' ? effectiveValue : baseline;
 
   saveExperiment(agentDir, experiment);
 
@@ -479,6 +533,72 @@ export function listAllExperiments(
   return experiments;
 }
 
+// The baseline a completed experiment's derived views (results.tsv,
+// gatherContext) should display. Recomputed LIVE from decision/score/
+// result_value/baseline_value — the same rule evaluateExperiment used —
+// rather than trusting the stored next_baseline_value field directly. That
+// matters because every real correction incident in this corpus (murph,
+// adoption) hand-edited only the `decision` field; recomputing from decision
+// keeps the ratchet target self-consistent with a decision-only correction
+// instead of silently displaying a now-stale next_baseline_value alongside a
+// corrected decision (task_1787278742191_41460753 item D).
+function displayBaseline(experiment: Experiment): number | null {
+  if (experiment.decision === null || experiment.result_value === null || experiment.baseline_value === null) {
+    return experiment.baseline_value;
+  }
+  const effectiveValue = experiment.score ?? experiment.result_value;
+  return experiment.decision === 'keep' ? effectiveValue : experiment.baseline_value;
+}
+
+// Regenerate the results.tsv content from live experiment records, oldest
+// first (matching the append order the physical file uses). Reading the
+// static file directly would go stale the moment any completed record is
+// corrected after the fact — this always matches listExperiments/
+// list-experiments for the same experiment id (task_1787278742191_41460753).
+function formatResultsTsv(completed: Experiment[]): string {
+  if (completed.length === 0) return '';
+  const rows = [...completed].sort(
+    (a, b) => new Date(a.completed_at ?? 0).getTime() - new Date(b.completed_at ?? 0).getTime(),
+  );
+  const lines = ['experiment_id\tagent\tmetric\tmeasured_value\tbaseline\tdecision\thypothesis\ttimestamp\tscore'];
+  for (const exp of rows) {
+    lines.push([
+      exp.id,
+      exp.agent,
+      exp.metric,
+      String(exp.result_value),
+      String(displayBaseline(exp)),
+      exp.decision,
+      exp.hypothesis,
+      exp.completed_at,
+      exp.score === null ? '' : String(exp.score),
+    ].join('\t'));
+  }
+  return lines.join('\n') + '\n';
+}
+
+// Regenerate learnings.md content the same way, for the same staleness reason.
+function formatLearnings(completed: Experiment[]): string {
+  if (completed.length === 0) return '';
+  const rows = [...completed].sort(
+    (a, b) => new Date(a.completed_at ?? 0).getTime() - new Date(b.completed_at ?? 0).getTime(),
+  );
+  const entries = rows.map(exp => {
+    const resultLine = exp.score !== null
+      ? `- **Result:** score ${exp.score} (measured_value: ${exp.result_value}, baseline: ${displayBaseline(exp)})`
+      : `- **Result:** ${exp.result_value} (baseline: ${displayBaseline(exp)})`;
+    return [
+      `## ${exp.id} (${exp.decision})`,
+      `- **Metric:** ${exp.metric}`,
+      `- **Hypothesis:** ${exp.hypothesis}`,
+      resultLine,
+      exp.learning ? `- **Learning:** ${exp.learning}` : '',
+      '',
+    ].filter(Boolean).join('\n');
+  });
+  return '# Experiment Learnings\n\n' + entries.join('\n') + '\n';
+}
+
 /**
  * Gather experiment context for an agent: learnings, stats, identity, goals.
  */
@@ -487,16 +607,6 @@ export function gatherContext(
   agentName: string,
   _options?: GatherContextOptions,
 ): ExperimentContext {
-  const expDir = join(agentDir, 'experiments');
-
-  // Read learnings
-  const learningsPath = join(expDir, 'learnings.md');
-  const learnings = existsSync(learningsPath) ? readFileSync(learningsPath, 'utf-8') : '';
-
-  // Read results TSV
-  const tsvPath = join(expDir, 'results.tsv');
-  const resultsTsv = existsSync(tsvPath) ? readFileSync(tsvPath, 'utf-8') : '';
-
   // Calculate stats from history
   const all = listExperiments(agentDir);
   const completed = all.filter(e => e.status === 'completed');
@@ -504,6 +614,14 @@ export function gatherContext(
   const discards = completed.filter(e => e.decision === 'discard').length;
   const total = all.length;
   const keepRate = completed.length > 0 ? keeps / completed.length : 0;
+
+  // learnings/results_tsv are regenerated fresh from `completed` above, not
+  // read from the static learnings.md/results.tsv files — those files are
+  // append-only and never rewritten if a completed record is corrected later,
+  // so reading them directly could serve a value that has gone stale relative
+  // to list-experiments for the same experiment id (analyst spec item 3).
+  const learnings = formatLearnings(completed);
+  const resultsTsv = formatResultsTsv(completed);
 
   // Read agent IDENTITY.md and GOALS.md
   const identityPath = join(agentDir, 'IDENTITY.md');
