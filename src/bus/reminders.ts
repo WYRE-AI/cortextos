@@ -25,6 +25,18 @@ export interface Reminder {
   prompt: string;       // The text to inject into the boot prompt when overdue
   status: 'pending' | 'acked';
   acked_at?: string;
+  /**
+   * ISO 8601 UTC timestamp of the most recent time this reminder was shown to
+   * the agent — either injected live by ReminderScheduler or included in a
+   * restart boot/continue prompt (buildReminderBlock marks it too). Distinct
+   * from `status`/`acked_at`: a reminder can be injected many times while
+   * still `pending` (the agent hasn't run ack-reminder yet). Its only job is
+   * to stop ReminderScheduler's 30s tick from re-injecting the SAME reminder
+   * every tick forever while it waits for an ack — it does not suppress the
+   * restart catch-up path, which must keep surfacing anything still pending
+   * regardless of a prior live nudge the agent may not have acted on.
+   */
+  injected_at?: string;
 }
 
 function remindersPath(paths: BusPaths): string {
@@ -93,6 +105,36 @@ export function getOverdueReminders(paths: BusPaths): Reminder[] {
   return readReminders(paths).filter(
     r => r.status === 'pending' && Date.parse(r.fire_at) <= now,
   );
+}
+
+/**
+ * Return overdue, pending reminders that have never been shown to the agent
+ * (injected_at unset). Used by ReminderScheduler's live 30s poller — unlike
+ * getOverdueReminders (used by the restart boot/continue prompt), this
+ * excludes anything already injected so a live tick doesn't re-fire the same
+ * reminder every 30 seconds while it waits for an ack.
+ */
+export function getUndeliveredOverdueReminders(paths: BusPaths): Reminder[] {
+  const now = Date.now();
+  return readReminders(paths).filter(
+    r => r.status === 'pending' && Date.parse(r.fire_at) <= now && !r.injected_at,
+  );
+}
+
+/**
+ * Mark a reminder as having been shown to the agent (live inject or a
+ * restart boot/continue prompt). Best-effort and idempotent: a missing ID or
+ * an already-acked reminder is a silent no-op rather than a throw, since
+ * callers (ReminderScheduler's tick, buildReminderBlock) run on a timer/boot
+ * path where a race against a concurrent ack-reminder is expected, not
+ * exceptional.
+ */
+export function markReminderInjected(paths: BusPaths, id: string): void {
+  const reminders = readReminders(paths);
+  const idx = reminders.findIndex(r => r.id === id);
+  if (idx === -1 || reminders[idx].status !== 'pending') return;
+  reminders[idx] = { ...reminders[idx], injected_at: new Date().toISOString() };
+  writeReminders(paths, reminders);
 }
 
 /**

@@ -10,7 +10,7 @@ import { MessageDedup, injectMessage as injectMessageIntoPty } from '../pty/inje
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
-import { getOverdueReminders } from '../bus/reminders.js';
+import { getOverdueReminders, markReminderInjected } from '../bus/reminders.js';
 import { writeAgentPid } from '../utils/agent-pidfile.js';
 import { resolvePaths } from '../utils/paths.js';
 import { tryAcquireRestartLock, releaseRestartLock, isRestartInFlight } from './restart-lock.js';
@@ -1270,8 +1270,22 @@ export class AgentProcess {
 
   /**
    * Build a reminder block for the boot prompt.
-   * If any pending reminders are overdue, include them so the agent handles them
-   * even after a hard-restart that cleared in-memory cron state (#69).
+   *
+   * SUPERSEDES the old "restart is the only delivery path" framing: as of
+   * task_1783983487266_03083173, ReminderScheduler (src/daemon/reminder-
+   * scheduler.ts) live-polls pending-reminders.json every 30s and injects
+   * overdue reminders into a RUNNING session, the same way CronScheduler
+   * fires crons. This method is now the restart-time BACKSTOP of that same
+   * delivery mechanism, not the only path: it re-surfaces any reminder still
+   * `pending` at boot/continue, including one the live poller already
+   * injected but the agent hadn't acked before the restart happened.
+   *
+   * Marks every reminder it includes via markReminderInjected — the same
+   * dedup marker ReminderScheduler sets on a successful live delivery — so a
+   * reminder shown here isn't redundantly re-injected by the live poller 30
+   * seconds into the new session. Marking does not suppress a FUTURE restart
+   * from showing it again; only `ack-reminder` does that (see
+   * src/bus/reminders.ts's injected_at docs for why the two are separate).
    */
   private buildReminderBlock(): string {
     try {
@@ -1281,6 +1295,9 @@ export class AgentProcess {
       const items = overdue.map(r =>
         `  - [${r.id}] (due ${r.fire_at}): ${r.prompt}`,
       ).join('\n');
+      for (const r of overdue) {
+        try { markReminderInjected(paths, r.id); } catch { /* best-effort dedup marker */ }
+      }
       return ` You also have ${overdue.length} overdue persistent reminder(s) from before this restart — handle each one, then run: cortextos bus ack-reminder <id>\n${items}`;
     } catch {
       return '';

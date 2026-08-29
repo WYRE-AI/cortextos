@@ -5,6 +5,7 @@ import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
 import { CronScheduler } from './cron-scheduler.js';
+import { ReminderScheduler } from './reminder-scheduler.js';
 import { migrateCronsForAgent } from './cron-migration.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
@@ -36,6 +37,8 @@ export class AgentManager {
   private workers: Map<string, WorkerProcess> = new Map();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
+  /** Daemon-level reminder scheduler registry: one ReminderScheduler per enabled agent. */
+  private reminderSchedulers: Map<string, ReminderScheduler> = new Map();
   // Tracks agents that received a start request while still stopping.
   // stopAgent() honors these after cleanup completes so restart-all is race-free.
   private pendingRestarts: Set<string> = new Set();
@@ -567,6 +570,13 @@ export class AgentManager {
     // external cron system — agents no longer need to call CronCreate on boot.
     this.startAgentCronScheduler(name);
 
+    // Wire daemon-level ReminderScheduler for this agent (task_1783983487266_03083173).
+    // Mirrors the cron scheduler above but for pending-reminders.json: without
+    // this, a reminder scheduled mid-session was only ever delivered by
+    // buildReminderBlock() on the agent's NEXT restart, silently skipped for
+    // as long as the session kept running past fire_at.
+    this.startAgentReminderScheduler(name);
+
     // Start fast checker in background
     checker.start().catch(err => {
       console.error(`[${name}] Fast checker error:`, err);
@@ -1082,6 +1092,11 @@ export class AgentManager {
       try { scheduler.stop(); } catch { /* ignore */ }
       this.cronSchedulers.delete(name);
     }
+    const reminderScheduler = this.reminderSchedulers.get(name);
+    if (reminderScheduler) {
+      try { reminderScheduler.stop(); } catch { /* ignore */ }
+      this.reminderSchedulers.delete(name);
+    }
     clearAgentPid(join(this.ctxRoot, 'state', name));
   }
 
@@ -1121,6 +1136,13 @@ export class AgentManager {
     if (scheduler) {
       scheduler.stop();
       this.cronSchedulers.delete(name);
+    }
+
+    // Stop and remove the agent's reminder scheduler (if one was wired)
+    const reminderScheduler = this.reminderSchedulers.get(name);
+    if (reminderScheduler) {
+      reminderScheduler.stop();
+      this.reminderSchedulers.delete(name);
     }
 
     // BUG-031: honor any restart that was queued while we were stopping.
@@ -1521,6 +1543,46 @@ export class AgentManager {
 
     const count = scheduler.getNextFireTimes().length;
     console.log(`[daemon] Loaded ${count} external cron(s) for agent "${agentName}" from crons.json`);
+  }
+
+  /**
+   * Wire a daemon-level ReminderScheduler for the named agent
+   * (task_1783983487266_03083173).
+   *
+   * Ticks every 30s and injects any overdue, not-yet-delivered reminder
+   * directly into the agent PTY via injectAgent() — the live counterpart to
+   * buildReminderBlock()'s restart-only delivery in agent-process.ts. Both
+   * paths share the same `injected_at` dedup marker (src/bus/reminders.ts) so
+   * a reminder shown once in a boot/continue prompt isn't redundantly
+   * re-delivered here 30 seconds later.
+   *
+   * Hermes agents manage their own native scheduling and PTY model — skipped
+   * here for the same reason startAgentCronScheduler skips them, not because
+   * reminders are cron-specific.
+   */
+  private startAgentReminderScheduler(agentName: string): void {
+    if (this.reminderSchedulers.has(agentName)) {
+      console.log(`[agent-manager] Reminder scheduler already running for ${agentName} — skipped`);
+      return;
+    }
+
+    const entry = this.agents.get(agentName);
+    if (!entry) return;
+
+    if (entry.process['config']?.runtime === 'hermes') {
+      console.log(`[daemon] Skipping live reminder scheduler for Hermes agent "${agentName}"`);
+      return;
+    }
+
+    const scheduler = new ReminderScheduler({
+      agentName,
+      instanceId: this.instanceId,
+      inject: (name, text) => this.injectAgent(name, text),
+      logger: (msg) => console.log(`[daemon] ${msg}`),
+    });
+
+    scheduler.start();
+    this.reminderSchedulers.set(agentName, scheduler);
   }
 
   /**

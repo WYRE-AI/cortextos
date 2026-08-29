@@ -8,6 +8,8 @@ import {
   ackReminder,
   pruneReminders,
   getOverdueReminders,
+  getUndeliveredOverdueReminders,
+  markReminderInjected,
 } from '../../../src/bus/reminders';
 import type { BusPaths } from '../../../src/types/index';
 
@@ -116,6 +118,63 @@ describe('reminders', () => {
       const r = createReminder(paths, past, 'already handled');
       ackReminder(paths, r.id);
       expect(getOverdueReminders(paths)).toHaveLength(0);
+    });
+  });
+
+  describe('getUndeliveredOverdueReminders', () => {
+    it('returns overdue pending reminders that have never been injected', () => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      createReminder(paths, past, 'never delivered');
+      const due = getUndeliveredOverdueReminders(paths);
+      expect(due).toHaveLength(1);
+      expect(due[0].prompt).toBe('never delivered');
+    });
+
+    it('excludes reminders already marked injected', () => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      const r = createReminder(paths, past, 'already shown once');
+      markReminderInjected(paths, r.id);
+      expect(getUndeliveredOverdueReminders(paths)).toHaveLength(0);
+      // But it must still show up as overdue for the restart/boot-prompt path —
+      // injected_at only suppresses the LIVE poller, never the restart catch-up.
+      expect(getOverdueReminders(paths)).toHaveLength(1);
+    });
+
+    it('excludes reminders that are not yet due', () => {
+      const future = new Date(Date.now() + 3600_000).toISOString();
+      createReminder(paths, future, 'not yet');
+      expect(getUndeliveredOverdueReminders(paths)).toHaveLength(0);
+    });
+
+    it('excludes acked reminders even if never marked injected', () => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      const r = createReminder(paths, past, 'acked without a live nudge');
+      ackReminder(paths, r.id);
+      expect(getUndeliveredOverdueReminders(paths)).toHaveLength(0);
+    });
+  });
+
+  describe('markReminderInjected', () => {
+    it('sets injected_at on the target reminder', () => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      const r = createReminder(paths, past, 'test');
+      markReminderInjected(paths, r.id);
+      const all = listReminders(paths, { all: true });
+      expect(all[0].injected_at).toBeTruthy();
+      expect(all[0].status).toBe('pending'); // marking injected is NOT the same as acking
+    });
+
+    it('is a no-op (does not throw) for an unknown ID', () => {
+      expect(() => markReminderInjected(paths, 'nonexistent-id')).not.toThrow();
+    });
+
+    it('is a no-op for an already-acked reminder', () => {
+      const past = new Date(Date.now() - 1000).toISOString();
+      const r = createReminder(paths, past, 'test');
+      ackReminder(paths, r.id);
+      markReminderInjected(paths, r.id);
+      const all = listReminders(paths, { all: true });
+      expect(all[0].injected_at).toBeFalsy();
     });
   });
 

@@ -45,7 +45,10 @@ vi.mock('../../../src/utils/env.js', () => ({
 
 vi.mock('../../../src/bus/reminders.js', () => ({
   getOverdueReminders: vi.fn().mockReturnValue([]),
+  markReminderInjected: vi.fn(),
 }));
+
+import { getOverdueReminders, markReminderInjected } from '../../../src/bus/reminders.js';
 
 const pidfileMocks = {
   writeAgentPid: vi.fn(),
@@ -1088,5 +1091,54 @@ describe('AgentProcess — pid record written at the start() choke point', () =>
     const ap = new AgentProcess('alice', mockEnv, {});
     await expect(ap.start()).resolves.toBeUndefined();
     expect(ap.getStatus().status).toBe('running');
+  });
+});
+
+describe('AgentProcess.buildReminderBlock — shared dedup marker with the live poller (task_1783983487266_03083173)', () => {
+  // buildReminderBlock is the restart-time BACKSTOP for reminder delivery,
+  // now that ReminderScheduler (src/daemon/reminder-scheduler.ts) delivers
+  // most reminders live. Both paths must mark a reminder `injected_at` via
+  // the SAME function so a reminder shown here at boot isn't redundantly
+  // re-injected by the live poller 30 seconds into the new session.
+  const buildReminderBlock = (ap: InstanceType<typeof AgentProcess>) =>
+    (ap as unknown as { buildReminderBlock(): string }).buildReminderBlock();
+
+  beforeEach(() => {
+    vi.mocked(getOverdueReminders).mockReset().mockReturnValue([]);
+    vi.mocked(markReminderInjected).mockReset();
+  });
+
+  it('marks every included overdue reminder injected, via the same function the live poller uses', () => {
+    vi.mocked(getOverdueReminders).mockReturnValue([
+      { id: 'r1', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do X', status: 'pending' },
+      { id: 'r2', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do Y', status: 'pending' },
+    ]);
+    const ap = new AgentProcess('alice', mockEnv, {});
+
+    const block = buildReminderBlock(ap);
+
+    expect(block).toContain('2 overdue persistent reminder');
+    expect(block).toContain('do X');
+    expect(block).toContain('do Y');
+    expect(vi.mocked(markReminderInjected)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(markReminderInjected)).toHaveBeenCalledWith(expect.anything(), 'r1');
+    expect(vi.mocked(markReminderInjected)).toHaveBeenCalledWith(expect.anything(), 'r2');
+  });
+
+  it('returns empty string and marks nothing when there are no overdue reminders', () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    expect(buildReminderBlock(ap)).toBe('');
+    expect(vi.mocked(markReminderInjected)).not.toHaveBeenCalled();
+  });
+
+  it('still delivers the block even if the dedup marker write fails (best-effort, never blocks delivery)', () => {
+    vi.mocked(getOverdueReminders).mockReturnValue([
+      { id: 'r1', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do X', status: 'pending' },
+    ]);
+    vi.mocked(markReminderInjected).mockImplementation(() => { throw new Error('disk full'); });
+    const ap = new AgentProcess('alice', mockEnv, {});
+
+    expect(() => buildReminderBlock(ap)).not.toThrow();
+    expect(buildReminderBlock(ap)).toContain('do X');
   });
 });
