@@ -27,9 +27,13 @@ export function resolvePaths(
   agentName: string,
   instanceId: string = 'default',
   org?: string,
+  ctxRootOverride?: string,
 ): BusPaths {
   validateInstanceId(instanceId);
-  const ctxRoot = join(homedir(), '.cortextos', instanceId);
+  // CTX_ROOT-aware: callers that already resolved a CtxEnv (resolveEnv())
+  // must pass its ctxRoot here, or a CTX_ROOT override is silently
+  // discarded and every bus path falls back to the real homedir.
+  const ctxRoot = ctxRootOverride || join(homedir(), '.cortextos', instanceId);
 
   // Org-scoped paths for tasks, approvals, analytics
   const orgBase = org ? join(ctxRoot, 'orgs', org) : ctxRoot;

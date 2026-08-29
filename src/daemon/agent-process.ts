@@ -396,7 +396,7 @@ export class AgentProcess {
     // agent-manager.ts's restartAgent does NOT call sessionRefresh() (it does
     // stopAgent+startAgent directly) and keeps its own separate lock acquire/release
     // — this gate has no effect on that path, they only share the same LOCK FILE.
-    const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
+    const paths = resolvePaths(this.name, this.env.instanceId, this.env.org, this.env.ctxRoot);
     const lock = tryAcquireRestartLock(paths.stateDir, 'session-refresh');
     if (!lock.acquired) {
       this.log(`Session refresh SKIPPED for ${this.name} — ${lock.reason}`);
@@ -463,7 +463,7 @@ export class AgentProcess {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
     }
 
-    const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
+    const paths = resolvePaths(this.name, this.env.instanceId, this.env.org, this.env.ctxRoot);
     if (isRestartInFlight(paths.stateDir)) {
       return { ok: false, code: 'RESTARTING', message: `agent "${this.name}" has a restart in flight — injection deferred to avoid a silent drop` };
     }
@@ -1275,7 +1275,7 @@ export class AgentProcess {
    */
   private buildReminderBlock(): string {
     try {
-      const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
+      const paths = resolvePaths(this.name, this.env.instanceId, this.env.org, this.env.ctxRoot);
       const overdue = getOverdueReminders(paths);
       if (overdue.length === 0) return '';
       const items = overdue.map(r =>

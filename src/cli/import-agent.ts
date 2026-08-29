@@ -1,11 +1,12 @@
 import { Command } from 'commander';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, cpSync } from 'fs';
 import { join, basename } from 'path';
-import { homedir, tmpdir } from 'os';
+import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { validateAgentName } from '../utils/validate.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { resolvePaths } from '../utils/paths.js';
+import { resolveEnv } from '../utils/env.js';
 import { resolveAgentDir } from '../utils/agent-dir.js';
 
 interface ExportManifest {
@@ -28,6 +29,7 @@ export const importAgentCommand = new Command('import-agent')
   .description('Import a cortextos-single agent export into full cortextOS')
   .action(async (tarball: string, options: { org?: string; name?: string; instance: string; start: boolean }) => {
     const projectRoot = process.env.CTX_FRAMEWORK_ROOT || process.env.CTX_PROJECT_ROOT || process.cwd();
+    const env = resolveEnv({ instanceId: options.instance });
 
     if (!existsSync(tarball)) {
       console.error(`\n  Error: file not found: ${tarball}\n`);
@@ -135,8 +137,7 @@ export const importAgentCommand = new Command('import-agent')
     // Copy state (tasks, memory) from export if present
     const exportedStateDir = join(tmpDir, 'state');
     if (existsSync(exportedStateDir)) {
-      const ctxRoot = join(homedir(), '.cortextos', options.instance);
-      const paths = resolvePaths(agentName, options.instance, org);
+      const paths = resolvePaths(agentName, options.instance, org, env.ctxRoot);
 
       // Tasks
       const exportedTasks = join(exportedStateDir, 'tasks');
@@ -156,8 +157,7 @@ export const importAgentCommand = new Command('import-agent')
     }
 
     // Register in enabled-agents.json
-    const ctxRoot = join(homedir(), '.cortextos', options.instance);
-    const enabledPath = join(ctxRoot, 'config', 'enabled-agents.json');
+    const enabledPath = join(env.ctxRoot, 'config', 'enabled-agents.json');
     let enabledAgents: Record<string, any> = {};
     try {
       if (existsSync(enabledPath)) {
@@ -165,7 +165,7 @@ export const importAgentCommand = new Command('import-agent')
       }
     } catch { /* start fresh */ }
     enabledAgents[agentName] = { enabled: true, status: 'configured', org };
-    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(join(env.ctxRoot, 'config'), { recursive: true });
     writeFileSync(enabledPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
     console.log(`  Registered in enabled-agents.json`);
 
