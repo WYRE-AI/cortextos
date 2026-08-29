@@ -31,6 +31,28 @@ Three related correctness gaps fixed alongside it, per analyst's experiment-reco
   the fact — theta-wave's own consumer of `gather-context` could otherwise read a decision that had
   already been fixed at the source.
 
+### Fixed — `run-experiment` did not check its own linked approval before starting
+
+`create-experiment` created a companion approval when `config.approval_required` was set, but
+only ever `console.log`'d the approval id — it was never written onto the experiment record, so
+nothing downstream had a status to check. `run-experiment` did not check anything either; it
+transitioned `proposed -> running` unconditionally. Net effect: an approval-gated experiment ran
+to completion regardless of the approval's status. Proven live twice — an experiment ran to
+completion in 13 seconds while its own approval sat pending — before warden's 2026-08-15
+approval-enforcement audit traced it to this exact gap and specified the fix as a refusing guard,
+not a warning.
+
+Two parts, matching the missing data link and the missing enforcement branch separately:
+`Experiment` gains a persisted `approval_id: string | null` field, and `create-experiment`'s CLI
+handler now calls the new `linkExperimentApproval` right after `createApproval` returns, instead
+of only logging the id. `run-experiment` fetches the linked approval (via `getApproval`) and
+throws — refusing the transition — unless it resolves to `status === 'approved'`; pending and
+rejected are refused identically, and a linked `approval_id` with no `BusPaths` supplied to check
+it also refuses rather than silently proceeding unchecked. An experiment with no `approval_id`
+(approval not required) is unaffected. Regression tests assert the actual discriminator — that a
+pending/rejected/missing-approval experiment cannot reach `running` status — not just that an
+error was logged, which would have passed under the previous behavior too.
+
 ### Added — `add-cron`/`update-cron --goal` — register a verifiable `/goal` completion condition on cron fire
 
 Claude Code's `/goal` slash command is user-side input: it only parses when it is the sole

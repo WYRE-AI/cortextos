@@ -3,6 +3,8 @@ import { join } from 'path';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomString } from '../utils/random.js';
 import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
+import { getApproval } from './approval.js';
+import type { BusPaths } from '../types/index.js';
 
 // --- Types ---
 
@@ -53,6 +55,11 @@ export interface Experiment {
   completed_at: string | null;
   changes_description: string | null;
   kind: 'intervention' | 'snapshot';
+  /** Approval linked at creation when config.approval_required is set (see
+   * linkExperimentApproval). null means no approval is required — runExperiment
+   * proceeds unchecked. Non-null is enforced at runExperiment: it must resolve
+   * to an 'approved' Approval or the transition is refused. */
+  approval_id: string | null;
 }
 
 export interface ExperimentCreateOptions {
@@ -238,11 +245,33 @@ export function createExperiment(
     completed_at: null,
     changes_description: null,
     kind: options?.kind ?? 'intervention',
+    approval_id: null,
   };
 
   saveExperiment(agentDir, experiment);
 
   return id;
+}
+
+/**
+ * Persist the approval linkage on an experiment record. The CLI's
+ * create-experiment handler creates the companion approval AFTER
+ * createExperiment returns (it needs the experiment id for the approval's
+ * context text), so the linkage can't be set inside createExperiment itself
+ * — it must be written back in a second step. Without this call, an
+ * experiment created under approval_required has no stored link to the
+ * approval that was created for it, and runExperiment has nothing to check:
+ * a status that was never persisted can't be enforced downstream.
+ */
+export function linkExperimentApproval(
+  agentDir: string,
+  experimentId: string,
+  approvalId: string,
+): Experiment {
+  const experiment = loadExperiment(agentDir, experimentId);
+  experiment.approval_id = approvalId;
+  saveExperiment(agentDir, experiment);
+  return experiment;
 }
 
 /**
@@ -276,16 +305,45 @@ function findCycleDefaults(
 
 /**
  * Start running a proposed experiment.
+ *
+ * Refusing guard: when the experiment has a linked approval_id (set by
+ * linkExperimentApproval at creation, under config.approval_required), this
+ * refuses to start unless that approval currently resolves to 'approved'.
+ * Pending and rejected are refused identically — both mean "not yet cleared
+ * to run," not two different outcomes to branch on. An experiment with no
+ * approval_id is unaffected and proceeds exactly as before.
+ *
+ * `paths` is required whenever approval_id is set — there is no silent
+ * bypass for "caller didn't pass paths": a linked approval with no way to
+ * check its status refuses closed, the same as a pending one, rather than
+ * quietly running unchecked.
  */
 export function runExperiment(
   agentDir: string,
   experimentId: string,
   changesDescription?: string,
+  paths?: BusPaths,
 ): Experiment {
   const experiment = loadExperiment(agentDir, experimentId);
 
   if (experiment.status !== 'proposed') {
     throw new Error(`Experiment ${experimentId} is '${experiment.status}', expected 'proposed'`);
+  }
+
+  if (experiment.approval_id) {
+    if (!paths) {
+      throw new Error(
+        `Experiment ${experimentId} requires approval ${experiment.approval_id} but no approval ` +
+        `context was supplied to check its status — refusing to start rather than run unchecked.`,
+      );
+    }
+    const approval = getApproval(paths, experiment.approval_id);
+    if (!approval || approval.status !== 'approved') {
+      throw new Error(
+        `Experiment ${experimentId} is linked to approval ${experiment.approval_id} ` +
+        `(status: ${approval ? approval.status : 'not found'}) — refusing to start until it is approved.`,
+      );
+    }
   }
 
   experiment.status = 'running';
