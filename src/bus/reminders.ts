@@ -12,10 +12,11 @@
  *   3. Agent processes the reminder, calls `cortextos bus ack-reminder <id>`
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
-import { ensureDir } from '../utils/atomic.js';
+import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
+import { withFileLockSync } from '../utils/lock.js';
 import type { BusPaths } from '../types/index.js';
 
 export interface Reminder {
@@ -56,8 +57,26 @@ function readReminders(paths: BusPaths): Reminder[] {
 }
 
 function writeReminders(paths: BusPaths, reminders: Reminder[]): void {
+  atomicWriteSync(remindersPath(paths), JSON.stringify(reminders, null, 2));
+}
+
+/**
+ * Per-agent lock directory for the read-modify-write helpers below — same
+ * mkdir-based mutex bus/crons.ts uses for its identical read-modify-write
+ * shape (see crons.ts's lockDirFor docblock). pending-reminders.json now has
+ * two concurrent writers in practice: ReminderScheduler's 30s daemon tick
+ * (markReminderInjected) and the agent's own `ack-reminder` CLI invocation,
+ * running as a separate OS process — a plain writeFileSync's read-modify-
+ * write is not atomic across that pair, and PR #163's review pinned the
+ * resulting lost-update race with a real multi-process repro
+ * (tests/integration/concurrent-reminder-mutations.test.ts). Locking on
+ * stateDir itself (rather than a name-derived subdirectory the way crons.ts
+ * does per-agent) is sufficient: reminders have no per-item file, only the
+ * one shared pending-reminders.json per agent.
+ */
+function lockDirFor(paths: BusPaths): string {
   ensureDir(paths.stateDir);
-  writeFileSync(remindersPath(paths), JSON.stringify(reminders, null, 2) + '\n', 'utf-8');
+  return paths.stateDir;
 }
 
 /**
@@ -81,9 +100,11 @@ export function createReminder(paths: BusPaths, fireAt: string, prompt: string):
     status: 'pending',
   };
 
-  const reminders = readReminders(paths);
-  reminders.push(reminder);
-  writeReminders(paths, reminders);
+  withFileLockSync(lockDirFor(paths), () => {
+    const reminders = readReminders(paths);
+    reminders.push(reminder);
+    writeReminders(paths, reminders);
+  });
   return reminder;
 }
 
@@ -130,28 +151,32 @@ export function getUndeliveredOverdueReminders(paths: BusPaths): Reminder[] {
  * exceptional.
  */
 export function markReminderInjected(paths: BusPaths, id: string): void {
-  const reminders = readReminders(paths);
-  const idx = reminders.findIndex(r => r.id === id);
-  if (idx === -1 || reminders[idx].status !== 'pending') return;
-  reminders[idx] = { ...reminders[idx], injected_at: new Date().toISOString() };
-  writeReminders(paths, reminders);
+  withFileLockSync(lockDirFor(paths), () => {
+    const reminders = readReminders(paths);
+    const idx = reminders.findIndex(r => r.id === id);
+    if (idx === -1 || reminders[idx].status !== 'pending') return;
+    reminders[idx] = { ...reminders[idx], injected_at: new Date().toISOString() };
+    writeReminders(paths, reminders);
+  });
 }
 
 /**
  * Acknowledge a reminder by ID — marks it as handled.
  */
 export function ackReminder(paths: BusPaths, id: string): void {
-  const reminders = readReminders(paths);
-  const idx = reminders.findIndex(r => r.id === id);
-  if (idx === -1) {
-    throw new Error(`Reminder ${id} not found`);
-  }
-  reminders[idx] = {
-    ...reminders[idx],
-    status: 'acked',
-    acked_at: new Date().toISOString(),
-  };
-  writeReminders(paths, reminders);
+  withFileLockSync(lockDirFor(paths), () => {
+    const reminders = readReminders(paths);
+    const idx = reminders.findIndex(r => r.id === id);
+    if (idx === -1) {
+      throw new Error(`Reminder ${id} not found`);
+    }
+    reminders[idx] = {
+      ...reminders[idx],
+      status: 'acked',
+      acked_at: new Date().toISOString(),
+    };
+    writeReminders(paths, reminders);
+  });
 }
 
 /**
@@ -159,14 +184,16 @@ export function ackReminder(paths: BusPaths, id: string): void {
  * Call periodically to prevent unbounded file growth.
  */
 export function pruneReminders(paths: BusPaths, retainDays: number = 7): number {
-  const cutoff = Date.now() - retainDays * 24 * 60 * 60 * 1000;
-  const reminders = readReminders(paths);
-  const kept = reminders.filter(r => {
-    if (r.status !== 'acked') return true;
-    const ackedAt = r.acked_at ? Date.parse(r.acked_at) : 0;
-    return ackedAt > cutoff;
+  return withFileLockSync(lockDirFor(paths), () => {
+    const cutoff = Date.now() - retainDays * 24 * 60 * 60 * 1000;
+    const reminders = readReminders(paths);
+    const kept = reminders.filter(r => {
+      if (r.status !== 'acked') return true;
+      const ackedAt = r.acked_at ? Date.parse(r.acked_at) : 0;
+      return ackedAt > cutoff;
+    });
+    const pruned = reminders.length - kept.length;
+    if (pruned > 0) writeReminders(paths, kept);
+    return pruned;
   });
-  const pruned = reminders.length - kept.length;
-  if (pruned > 0) writeReminders(paths, kept);
-  return pruned;
 }
