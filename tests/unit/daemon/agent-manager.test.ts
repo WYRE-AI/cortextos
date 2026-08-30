@@ -661,6 +661,95 @@ describe('AgentManager.reloadCrons - silent-success bug fix (iter 7)', () => {
   });
 });
 
+describe('AgentManager.startAgentReminderScheduler — live reminder delivery (task_1783983487266_03083173)', () => {
+  // Mirrors startAgentCronScheduler's own lifecycle exactly: wired at start,
+  // torn down at both exit paths (evictDeadEntry, stopAgent), skipped for
+  // Hermes agents, idempotent against a double call. This is the daemon-side
+  // half of the reminder-delivery fix — the poller itself is unit-tested in
+  // tests/unit/daemon/reminder-scheduler.test.ts.
+
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-remindersched-'));
+    ctxRoot = join(testDir, 'instance');
+    frameworkRoot = join(testDir, 'framework');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('wires a ReminderScheduler for a non-Hermes agent', () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const fakeProcess = { config: { runtime: undefined } } as any;
+    (am as any).agents.set('alice', { process: fakeProcess, checker: {} });
+
+    expect((am as any).reminderSchedulers.has('alice')).toBe(false);
+    (am as any).startAgentReminderScheduler('alice');
+    expect((am as any).reminderSchedulers.has('alice')).toBe(true);
+
+    (am as any).reminderSchedulers.get('alice').stop();
+  });
+
+  it('skips Hermes agents — native scheduling/PTY model, same reasoning as the cron scheduler', () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const fakeProcess = { config: { runtime: 'hermes' } } as any;
+    (am as any).agents.set('alice', { process: fakeProcess, checker: {} });
+
+    (am as any).startAgentReminderScheduler('alice');
+
+    expect((am as any).reminderSchedulers.has('alice')).toBe(false);
+  });
+
+  it('is idempotent — a second call does not replace the existing scheduler', () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const fakeProcess = { config: { runtime: undefined } } as any;
+    (am as any).agents.set('alice', { process: fakeProcess, checker: {} });
+
+    (am as any).startAgentReminderScheduler('alice');
+    const first = (am as any).reminderSchedulers.get('alice');
+    (am as any).startAgentReminderScheduler('alice');
+
+    expect((am as any).reminderSchedulers.get('alice')).toBe(first);
+    first.stop();
+  });
+
+  it('evictDeadEntry stops and removes the reminder scheduler alongside the cron scheduler', () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const fakeProcess = { config: { runtime: undefined }, dispose: () => {} } as any;
+    (am as any).agents.set('alice', { process: fakeProcess, checker: { stop() {} } });
+    (am as any).startAgentReminderScheduler('alice');
+    const stopSpy = vi.spyOn((am as any).reminderSchedulers.get('alice'), 'stop');
+
+    (am as any).evictDeadEntry('alice');
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect((am as any).reminderSchedulers.has('alice')).toBe(false);
+  });
+
+  it('stopAgent stops and removes the reminder scheduler alongside the cron scheduler', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const fakeProcess = {
+      config: { runtime: undefined },
+      stop: async () => {},
+      getPid: () => process.pid,
+    } as any;
+    (am as any).agents.set('alice', { process: fakeProcess, checker: { stop() {} } });
+    (am as any).startAgentReminderScheduler('alice');
+    const stopSpy = vi.spyOn((am as any).reminderSchedulers.get('alice'), 'stop');
+
+    await am.stopAgent('alice');
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect((am as any).reminderSchedulers.has('alice')).toBe(false);
+  });
+});
+
 describe('AgentManager.maybeStartSlackSocketMode — SP3b self-containment (analyst review)', () => {
   let testDir: string;
   let ctxRoot: string;

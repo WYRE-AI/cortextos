@@ -38,6 +38,7 @@ vi.mock('../../../src/utils/env.js', () => ({
 
 vi.mock('../../../src/bus/reminders.js', () => ({
   getOverdueReminders: vi.fn().mockReturnValue([]),
+  markReminderInjected: vi.fn(),
 }));
 
 vi.mock('../../../src/utils/paths.js', () => ({

@@ -45,7 +45,10 @@ vi.mock('../../../src/utils/env.js', () => ({
 
 vi.mock('../../../src/bus/reminders.js', () => ({
   getOverdueReminders: vi.fn().mockReturnValue([]),
+  markReminderInjected: vi.fn(),
 }));
+
+import { getOverdueReminders, markReminderInjected } from '../../../src/bus/reminders.js';
 
 const pidfileMocks = {
   writeAgentPid: vi.fn(),
@@ -1088,5 +1091,119 @@ describe('AgentProcess — pid record written at the start() choke point', () =>
     const ap = new AgentProcess('alice', mockEnv, {});
     await expect(ap.start()).resolves.toBeUndefined();
     expect(ap.getStatus().status).toBe('running');
+  });
+});
+
+describe('AgentProcess reminder delivery — dedup marker timing (task_1783983487266_03083173, PR #163 review finding #1)', () => {
+  // buildReminderBlock is the restart-time BACKSTOP for reminder delivery,
+  // now that ReminderScheduler (src/daemon/reminder-scheduler.ts) delivers
+  // most reminders live. Both paths must mark a reminder `injected_at` via
+  // the same function (markReminderInjected) so a reminder shown here at
+  // boot isn't redundantly re-injected by the live poller 30 seconds into
+  // the new session — BUT buildReminderBlock() runs BEFORE pty.spawn(), so
+  // it must not mark anything itself: if spawn then throws, the agent never
+  // saw the prompt, and marking it delivered anyway would falsely satisfy
+  // the live poller's dedup check and the reminder would never be retried.
+  // The marker only fires from markBootRemindersDelivered(), called by
+  // start() ONLY after a confirmed successful spawn.
+  const buildReminderBlock = (ap: InstanceType<typeof AgentProcess>) =>
+    (ap as unknown as { buildReminderBlock(): string }).buildReminderBlock();
+  const markBootRemindersDelivered = (ap: InstanceType<typeof AgentProcess>) =>
+    (ap as unknown as { markBootRemindersDelivered(): void }).markBootRemindersDelivered();
+
+  beforeEach(() => {
+    vi.mocked(getOverdueReminders).mockReset().mockReturnValue([]);
+    vi.mocked(markReminderInjected).mockReset();
+  });
+
+  it('buildReminderBlock builds the text but does NOT mark anything injected yet', () => {
+    vi.mocked(getOverdueReminders).mockReturnValue([
+      { id: 'r1', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do X', status: 'pending' },
+      { id: 'r2', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do Y', status: 'pending' },
+    ]);
+    const ap = new AgentProcess('alice', mockEnv, {});
+
+    const block = buildReminderBlock(ap);
+
+    expect(block).toContain('2 overdue persistent reminder');
+    expect(block).toContain('do X');
+    expect(block).toContain('do Y');
+    expect(vi.mocked(markReminderInjected)).not.toHaveBeenCalled();
+  });
+
+  it('markBootRemindersDelivered marks everything from the most recent buildReminderBlock call', () => {
+    vi.mocked(getOverdueReminders).mockReturnValue([
+      { id: 'r1', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do X', status: 'pending' },
+      { id: 'r2', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do Y', status: 'pending' },
+    ]);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    buildReminderBlock(ap);
+
+    markBootRemindersDelivered(ap);
+
+    expect(vi.mocked(markReminderInjected)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(markReminderInjected)).toHaveBeenCalledWith(expect.anything(), 'r1');
+    expect(vi.mocked(markReminderInjected)).toHaveBeenCalledWith(expect.anything(), 'r2');
+  });
+
+  it('a second markBootRemindersDelivered call is a no-op (list is cleared after use)', () => {
+    vi.mocked(getOverdueReminders).mockReturnValue([
+      { id: 'r1', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do X', status: 'pending' },
+    ]);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    buildReminderBlock(ap);
+    markBootRemindersDelivered(ap);
+    vi.mocked(markReminderInjected).mockClear();
+
+    markBootRemindersDelivered(ap);
+
+    expect(vi.mocked(markReminderInjected)).not.toHaveBeenCalled();
+  });
+
+  it('returns empty string and marks nothing when there are no overdue reminders', () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    expect(buildReminderBlock(ap)).toBe('');
+    markBootRemindersDelivered(ap);
+    expect(vi.mocked(markReminderInjected)).not.toHaveBeenCalled();
+  });
+
+  it('markBootRemindersDelivered never throws even if the dedup marker write fails (best-effort)', () => {
+    vi.mocked(getOverdueReminders).mockReturnValue([
+      { id: 'r1', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do X', status: 'pending' },
+    ]);
+    vi.mocked(markReminderInjected).mockImplementation(() => { throw new Error('disk full'); });
+    const ap = new AgentProcess('alice', mockEnv, {});
+    buildReminderBlock(ap);
+
+    expect(() => markBootRemindersDelivered(ap)).not.toThrow();
+  });
+
+  // --- Full start() regression coverage: the exact bug dev's review caught ---
+
+  it('start() marks boot reminders delivered after a SUCCESSFUL spawn', async () => {
+    vi.mocked(getOverdueReminders).mockReturnValue([
+      { id: 'r1', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do X', status: 'pending' },
+    ]);
+    const ap = new AgentProcess('alice', mockEnv, {});
+
+    await ap.start();
+
+    expect(vi.mocked(markReminderInjected)).toHaveBeenCalledWith(expect.anything(), 'r1');
+  });
+
+  it('start() does NOT mark boot reminders delivered when spawn THROWS (the bug this test pins)', async () => {
+    vi.mocked(getOverdueReminders).mockReturnValue([
+      { id: 'r1', created_at: '2026-01-01T00:00:00Z', fire_at: '2026-01-01T00:00:00Z', prompt: 'do X', status: 'pending' },
+    ]);
+    mockPty.spawn.mockRejectedValueOnce(new Error('dangling binary — exec failed'));
+    const ap = new AgentProcess('alice', mockEnv, {});
+
+    await ap.start();
+
+    expect(ap.getStatus().status).toBe('crashed');
+    // The agent never actually saw the prompt — falsely marking it delivered
+    // here would satisfy ReminderScheduler's dedup check and the reminder
+    // would never be retried live. This is finding #1 from the PR #163 review.
+    expect(vi.mocked(markReminderInjected)).not.toHaveBeenCalled();
   });
 });

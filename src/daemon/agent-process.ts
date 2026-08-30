@@ -10,7 +10,7 @@ import { MessageDedup, injectMessage as injectMessageIntoPty } from '../pty/inje
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
-import { getOverdueReminders } from '../bus/reminders.js';
+import { getOverdueReminders, markReminderInjected } from '../bus/reminders.js';
 import { writeAgentPid } from '../utils/agent-pidfile.js';
 import { resolvePaths } from '../utils/paths.js';
 import { tryAcquireRestartLock, releaseRestartLock, isRestartInFlight } from './restart-lock.js';
@@ -236,6 +236,12 @@ export class AgentProcess {
       this.status = 'running';
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
+
+      // Confirmed the boot/continue prompt actually reached a spawned PTY —
+      // now safe to mark any reminders it carried as delivered (PR #163
+      // review finding #1: must not happen at buildReminderBlock() time,
+      // before spawn is known to have succeeded).
+      this.markBootRemindersDelivered();
 
       // Record the live PTY pid HERE, at the one point every agent start
       // passes through — not at the caller. AgentManager used to do it, but it
@@ -1269,9 +1275,37 @@ export class AgentProcess {
   }
 
   /**
+   * IDs of reminders included in the most recently built boot/continue
+   * prompt, awaiting confirmation via markBootRemindersDelivered() that
+   * pty.spawn() actually succeeded. buildReminderBlock() runs BEFORE
+   * pty.spawn() (the prompt has to exist before it can be handed to spawn),
+   * so it must not mark a reminder injected at construction time — if spawn
+   * then throws (e.g. the 2026-08-04 dangling-binary class), the agent never
+   * saw the prompt at all, and a reminder falsely marked delivered would
+   * satisfy ReminderScheduler's dedup check and never be retried live (PR
+   * #163 review finding #1). Cleared by markBootRemindersDelivered() once
+   * used; a start() attempt that never reaches that call (spawn threw)
+   * simply leaves this populated until the next buildReminderBlock() call
+   * overwrites it on the retry — no leak, since only the current attempt's
+   * list is ever read.
+   */
+  private pendingBootReminderIds: string[] = [];
+
+  /**
    * Build a reminder block for the boot prompt.
-   * If any pending reminders are overdue, include them so the agent handles them
-   * even after a hard-restart that cleared in-memory cron state (#69).
+   *
+   * SUPERSEDES the old "restart is the only delivery path" framing: as of
+   * task_1783983487266_03083173, ReminderScheduler (src/daemon/reminder-
+   * scheduler.ts) live-polls pending-reminders.json every 30s and injects
+   * overdue reminders into a RUNNING session, the same way CronScheduler
+   * fires crons. This method is now the restart-time BACKSTOP of that same
+   * delivery mechanism, not the only path: it re-surfaces any reminder still
+   * `pending` at boot/continue, including one the live poller already
+   * injected but the agent hadn't acked before the restart happened.
+   *
+   * Does NOT mark reminders injected itself — see pendingBootReminderIds and
+   * markBootRemindersDelivered(), which does that only after a CONFIRMED
+   * successful spawn.
    */
   private buildReminderBlock(): string {
     try {
@@ -1281,10 +1315,35 @@ export class AgentProcess {
       const items = overdue.map(r =>
         `  - [${r.id}] (due ${r.fire_at}): ${r.prompt}`,
       ).join('\n');
+      this.pendingBootReminderIds = overdue.map(r => r.id);
       return ` You also have ${overdue.length} overdue persistent reminder(s) from before this restart — handle each one, then run: cortextos bus ack-reminder <id>\n${items}`;
     } catch {
       return '';
     }
+  }
+
+  /**
+   * Marks every reminder from the most recently built boot/continue prompt
+   * as injected — the same dedup marker ReminderScheduler sets on a
+   * successful live delivery — so a reminder shown here isn't redundantly
+   * re-injected by the live poller 30 seconds into the new session. Marking
+   * does not suppress a FUTURE restart from showing it again; only
+   * `ack-reminder` does that (see src/bus/reminders.ts's injected_at docs).
+   *
+   * Called ONLY after start() has confirmed pty.spawn() succeeded — never
+   * from buildReminderBlock() itself, which runs before spawn and cannot
+   * know whether the agent will actually see the prompt it just built.
+   */
+  private markBootRemindersDelivered(): void {
+    if (this.pendingBootReminderIds.length === 0) return;
+    const ids = this.pendingBootReminderIds;
+    this.pendingBootReminderIds = [];
+    try {
+      const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
+      for (const id of ids) {
+        try { markReminderInjected(paths, id); } catch { /* best-effort dedup marker */ }
+      }
+    } catch { /* best-effort */ }
   }
 
   /**

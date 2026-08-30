@@ -53,6 +53,36 @@ it also refuses rather than silently proceeding unchecked. An experiment with no
 pending/rejected/missing-approval experiment cannot reach `running` status — not just that an
 error was logged, which would have passed under the previous behavior too.
 
+### Fixed — reminders scheduled during a live session were silently skipped until the agent's next restart
+
+`getOverdueReminders()` (`src/bus/reminders.ts`) had exactly one caller, `buildReminderBlock()`
+in `agent-process.ts`, invoked only from the two restart paths (`buildStartupPrompt` on cold
+boot, `buildContinuePrompt` on `--continue`). Unlike crons, which fire live via
+`CronScheduler`'s 30s tick, a reminder created mid-session with no restart spanning its
+`fire_at` was never delivered — silently, forever, until the agent happened to restart after
+the fire time. Reproduced live: two reminders scheduled for 08:05Z never fired, with zero
+`cron-execution.log` entries for them while ordinary crons kept firing on schedule through the
+same window.
+
+Adds `ReminderScheduler` (`src/daemon/reminder-scheduler.ts`), the reminder-side mirror of
+`CronScheduler`: one instance per non-Hermes agent, ticking every 30s, injecting overdue
+reminders directly into the agent's PTY via the same `injectAgent()` mechanism crons use.
+Wired into `AgentManager` alongside the existing cron scheduler — started with the agent, and
+stopped/removed at both existing teardown paths (`evictDeadEntry`, `stopAgent`).
+
+A reminder can legitimately be shown to the agent more than once while still `pending` (it
+hasn't run `ack-reminder` yet) — that's what makes this at-least-once rather than
+fire-and-forget. What must not happen is the live poller re-injecting the *same* reminder every
+30 seconds forever while it waits for an ack. `Reminder` gains an `injected_at` field for
+exactly this: `getUndeliveredOverdueReminders` (the live poller's selector) excludes anything
+already marked, and a failed delivery (agent not running) leaves it unmarked so the next tick
+retries automatically. `buildReminderBlock()` now marks every reminder it shows via the same
+`markReminderInjected` function, so a reminder surfaced once in a restart boot/continue prompt
+isn't redundantly re-delivered by the live poller 30 seconds into the new session — both
+delivery paths share one dedup signal. The restart path's own behavior is otherwise unchanged:
+it remains the catch-up backstop for anything still `pending` when the daemon itself was down,
+independent of any live nudge the agent may not have acted on before a restart.
+
 ### Added — `add-cron`/`update-cron --goal` — register a verifiable `/goal` completion condition on cron fire
 
 Claude Code's `/goal` slash command is user-side input: it only parses when it is the sole
