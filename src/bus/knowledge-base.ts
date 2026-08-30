@@ -378,10 +378,14 @@ export function deleteFromKnowledgeBase(
   console.log(`Deleting from collection: ${collection}`);
   console.log(`  Source: ${sourcePath}`);
 
+  // delete's mmrag.py path is local disk I/O only (chromadb, no outbound
+  // network/Gemini calls), so it doesn't need ingest's minutes-scale
+  // floor/default/env-override machinery — mirrors queryKnowledgeBase's
+  // flat 30s timeout above, the other local-only call in this file.
   execFileSync(
     pythonPath,
     [mmragPath, 'delete', sourcePath, '--collection', collection],
-    { encoding: 'utf-8', env, stdio: 'inherit' },
+    { encoding: 'utf-8', env, stdio: 'inherit', timeout: 30000 },
   );
 }
 
