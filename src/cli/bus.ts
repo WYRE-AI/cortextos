@@ -13,7 +13,7 @@ import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity, broadcastActivityViaBus } from '../bus/system.js';
-import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline } from '../bus/experiment.js';
+import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline, linkExperimentApproval } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
@@ -1113,6 +1113,7 @@ busCommand
         env.frameworkRoot,
         env.agentDir,
       );
+      linkExperimentApproval(agentDir, id, approvalId);
       console.log(`approval_required: ${approvalId}`);
     }
   });
@@ -1125,8 +1126,14 @@ busCommand
   .action((id: string, description?: string) => {
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
-    const experiment = runExperiment(agentDir, id, description);
-    console.log(JSON.stringify(experiment, null, 2));
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
+    try {
+      const experiment = runExperiment(agentDir, id, description, paths);
+      console.log(JSON.stringify(experiment, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
   });
 
 busCommand

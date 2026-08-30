@@ -11,7 +11,9 @@ import {
   gatherContext,
   manageCycle,
   validateExperimentBaseline,
+  linkExperimentApproval,
 } from '../src/bus/experiment.js';
+import type { BusPaths, ApprovalStatus } from '../src/types/index.js';
 
 describe('Sprint 3: Experiment Framework', () => {
   const testDir = join(tmpdir(), `cortextos-sprint3-${Date.now()}`);
@@ -232,6 +234,129 @@ describe('Sprint 3: Experiment Framework', () => {
       const id = createExperiment(testDir, 'testbot', 'ctr', 'test');
       runExperiment(testDir, id);
       expect(() => runExperiment(testDir, id)).toThrow("expected 'proposed'");
+    });
+  });
+
+  describe('runExperiment — approval refusing guard', () => {
+    const approvalRoot = join(testDir, 'approvals-root');
+
+    function mkPaths(): BusPaths {
+      return {
+        ctxRoot: approvalRoot,
+        inbox: join(approvalRoot, 'inbox'),
+        inflight: join(approvalRoot, 'inflight'),
+        processed: join(approvalRoot, 'processed'),
+        logDir: join(approvalRoot, 'logs'),
+        stateDir: join(approvalRoot, 'state'),
+        taskDir: join(approvalRoot, 'tasks'),
+        approvalDir: join(approvalRoot, 'orgs', 'TestOrg', 'approvals'),
+        analyticsDir: join(approvalRoot, 'analytics'),
+        deliverablesDir: join(approvalRoot, 'deliverables'),
+      };
+    }
+
+    // Writes a minimal but shape-complete Approval record directly to the
+    // bucket getApproval actually reads from ('pending' vs 'resolved') —
+    // mirrors what createApproval/updateApproval produce, without needing
+    // Telegram/activity-channel plumbing live for a unit test.
+    function writeApproval(paths: BusPaths, approvalId: string, status: ApprovalStatus): void {
+      const bucket = status === 'pending' ? 'pending' : 'resolved';
+      const dir = join(paths.approvalDir, bucket);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, `${approvalId}.json`),
+        JSON.stringify({
+          id: approvalId,
+          title: 'Run experiment: test',
+          requesting_agent: 'testbot',
+          org: 'TestOrg',
+          category: 'other',
+          status,
+          description: '',
+          created_at: '2026-01-01T00:00:00Z',
+          updated_at: '2026-01-01T00:00:00Z',
+          resolved_at: status === 'pending' ? null : '2026-01-01T00:00:00Z',
+          resolved_by: status === 'pending' ? null : 'aaron',
+        }),
+      );
+    }
+
+    it('linkExperimentApproval persists approval_id onto the experiment record', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'linked test');
+      const linked = linkExperimentApproval(testDir, id, 'approval_123_abcde');
+      expect(linked.approval_id).toBe('approval_123_abcde');
+
+      const filePath = join(testDir, 'experiments', 'history', `${id}.json`);
+      const onDisk = JSON.parse(readFileSync(filePath, 'utf-8').trim());
+      expect(onDisk.approval_id).toBe('approval_123_abcde');
+    });
+
+    it('a freshly created experiment has approval_id: null', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'unlinked test');
+      const filePath = join(testDir, 'experiments', 'history', `${id}.json`);
+      const onDisk = JSON.parse(readFileSync(filePath, 'utf-8').trim());
+      expect(onDisk.approval_id).toBeNull();
+    });
+
+    it('refuses to start when the linked approval is pending — does not reach running', () => {
+      const paths = mkPaths();
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'pending-blocked');
+      linkExperimentApproval(testDir, id, 'approval_pending_1');
+      writeApproval(paths, 'approval_pending_1', 'pending');
+
+      expect(() => runExperiment(testDir, id, undefined, paths)).toThrow('refusing to start until it is approved');
+
+      const onDisk = JSON.parse(
+        readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim(),
+      );
+      expect(onDisk.status).toBe('proposed');
+    });
+
+    it('refuses to start when the linked approval is rejected — same discriminator as pending', () => {
+      const paths = mkPaths();
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'rejected-blocked');
+      linkExperimentApproval(testDir, id, 'approval_rejected_1');
+      writeApproval(paths, 'approval_rejected_1', 'rejected');
+
+      expect(() => runExperiment(testDir, id, undefined, paths)).toThrow('refusing to start until it is approved');
+
+      const onDisk = JSON.parse(
+        readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim(),
+      );
+      expect(onDisk.status).toBe('proposed');
+    });
+
+    it('refuses to start when the linked approval cannot be found at all', () => {
+      const paths = mkPaths();
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'missing-approval');
+      linkExperimentApproval(testDir, id, 'approval_does_not_exist');
+
+      expect(() => runExperiment(testDir, id, undefined, paths)).toThrow('status: not found');
+    });
+
+    it('refuses to start when approval_id is linked but no paths are supplied — fails closed, not open', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'no-paths-supplied');
+      linkExperimentApproval(testDir, id, 'approval_whatever');
+
+      expect(() => runExperiment(testDir, id)).toThrow('no approval context was supplied');
+    });
+
+    it('starts normally once the linked approval is approved', () => {
+      const paths = mkPaths();
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'approved-allowed');
+      linkExperimentApproval(testDir, id, 'approval_approved_1');
+      writeApproval(paths, 'approval_approved_1', 'approved');
+
+      const result = runExperiment(testDir, id, 'shipped', paths);
+      expect(result.status).toBe('running');
+      expect(result.started_at).toBeTruthy();
+    });
+
+    it('an experiment with no approval_id proceeds unaffected even when paths are supplied', () => {
+      const paths = mkPaths();
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'no-approval-required');
+      const result = runExperiment(testDir, id, undefined, paths);
+      expect(result.status).toBe('running');
     });
   });
 
