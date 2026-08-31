@@ -873,9 +873,15 @@ export class IPCServer {
             // Trigger scheduler reload for this agent
             if (request.agent) this.agentManager.reloadCrons(request.agent);
             if (request.agent && addDef?.name) {
+              // .trim() here matches handleAddCron's own fullDef.schedule
+              // (schedule.trim()) — without it, a caller passing a
+              // whitespace-padded schedule would log an audit trail that
+              // disagrees byte-for-byte with what actually landed in
+              // crons.json, the exact failure class this PR exists to close
+              // (infra's PR #166 review).
               this.logCronMutation(request.agent, 'cron_added', {
                 cron: addDef.name,
-                schedule: addDef.schedule,
+                schedule: addDef.schedule?.trim(),
               });
             }
             response = { success: true, data: { ok: true } };

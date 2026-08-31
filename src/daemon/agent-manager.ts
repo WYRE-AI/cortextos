@@ -48,10 +48,13 @@ export class AgentManager {
   // the exact kill window that strands inbox .lock.d mutexes.
   private stoppingAll = false;
   private instanceId: string;
-  // Public: ipc-server.ts's cron-mutation audit logging needs this to build
-  // a CTX_ROOT-aware BusPaths via resolvePaths() — see resolveAgentOrg's own
-  // visibility change below for the same reason.
-  ctxRoot: string;
+  // Public+readonly: ipc-server.ts's cron-mutation audit logging needs this
+  // to build a CTX_ROOT-aware BusPaths via resolvePaths() — see
+  // resolveAgentOrg's own visibility change below for the same reason.
+  // readonly because it's assigned exactly once (constructor) and every
+  // reference in this file only reads it — no write access is needed
+  // externally, so none is granted (infra's PR #166 review).
+  readonly ctxRoot: string;
   private frameworkRoot: string;
   private org: string;
 

@@ -110,6 +110,36 @@ describe('add-cron/remove-cron audit events', () => {
     expect(meta.schedule).toBe('4h');
   });
 
+  it('add-cron with a whitespace-padded schedule logs the TRIMMED value, matching what actually persisted', async () => {
+    // infra's PR #166 review: handleAddCron's fullDef.schedule applies
+    // .trim() before persisting to crons.json, but the audit log was
+    // reading the raw request value straight off request.data.definition —
+    // a whitespace-padded schedule would produce an audit trail that
+    // disagrees byte-for-byte with what's actually on disk, the exact
+    // failure class this PR exists to close.
+    writeEnabledAgents({ testagent: { enabled: true, org: 'testorg' } });
+    const { IPCServer } = await import('../../../src/daemon/ipc-server.js');
+    const { readCrons } = await import('../../../src/bus/crons.js');
+    const server = new IPCServer(fakeAgentManager('testorg') as never);
+
+    const request: IPCRequest = {
+      type: 'add-cron',
+      agent: 'testagent',
+      data: { definition: { name: 'padded-cron', schedule: '  4h  ', prompt: 'do the thing' } },
+    };
+    (server as unknown as { handleRequest: (r: IPCRequest, s: unknown) => void })
+      .handleRequest(request, fakeSocket());
+
+    const persisted = readCrons('testagent').find(c => c.name === 'padded-cron');
+    expect(persisted?.schedule).toBe('4h');
+
+    const events = readEvents('testagent');
+    const added = events.filter(e => e.event === 'cron_added');
+    const meta = added[0].metadata as Record<string, unknown>;
+    expect(meta.schedule).toBe('4h');
+    expect(meta.schedule).toBe(persisted?.schedule);
+  });
+
   it('remove-cron emits a cron_removed event carrying the OLD schedule', async () => {
     writeEnabledAgents({ testagent: { enabled: true, org: 'testorg' } });
     const { IPCServer } = await import('../../../src/daemon/ipc-server.js');
