@@ -2,7 +2,31 @@
 
 ## [Unreleased]
 
-### Fixed — `evaluate-experiment` silently overwrote `baseline_value`, destroying the historical baseline it was compared against
+### Fixed — `add-cron`/`remove-cron` mutated `crons.json` with no corresponding audit trail
+
+Theta-wave cycle #33 finding (task_1788142055347_87999645): a cron's disappearance from an
+agent's `crons.json` was unattributable from the artifact itself — analyst had to be handed the
+answer via bus-message archaeology (a peer quoting the original thread) rather than reading it off
+`crons.json` or an event log, even though the removal was a real, intentional, fully-documented
+action. `bus/crons.ts`'s `addCron`/`removeCron` write `crons.json` directly with no event emitted
+anywhere in that path.
+
+Both IPC handlers (`ipc-server.ts`'s `add-cron`/`remove-cron` cases — the single choke point both
+`bus add-cron`/`bus remove-cron` and any other caller reach the daemon through) now emit a
+best-effort `cron_added` / `cron_removed` event (category `action`) on successful mutation,
+carrying the agent, cron name, and schedule (`remove-cron` captures the *old* schedule by reading
+the cron's current definition immediately before the mutation, since it's gone from `crons.json`
+the instant the removal succeeds). Audit logging never blocks or rolls back the mutation itself —
+a failure to log is caught and warned, same discipline as `removeCron`'s own tombstone write.
+
+Required exposing two previously-`private` `AgentManager` members (`resolveAgentOrg`, `ctxRoot`)
+so the audit-log call site can build a `CTX_ROOT`-aware `BusPaths` via `resolvePaths()` — omitting
+the `ctxRootOverride` argument silently falls back to the real homedir per that function's own
+doc comment, so both were needed, not just one.
+
+Pairs with the cron-drift detector (analyst's `experiments/surfaces/cron-drift-detector/`,
+manifest-diff + roster-check): that surface answers "something changed"; this answers "who, when,
+what" once it does.
 
 Confirmed independently by 3 agents across 3+ weeks (pearl, murph, adoption; 4+ repro instances).
 On a `keep` decision, `evaluateExperiment` overwrote the completed record's `baseline_value` with

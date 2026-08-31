@@ -48,7 +48,10 @@ export class AgentManager {
   // the exact kill window that strands inbox .lock.d mutexes.
   private stoppingAll = false;
   private instanceId: string;
-  private ctxRoot: string;
+  // Public: ipc-server.ts's cron-mutation audit logging needs this to build
+  // a CTX_ROOT-aware BusPaths via resolvePaths() — see resolveAgentOrg's own
+  // visibility change below for the same reason.
+  ctxRoot: string;
   private frameworkRoot: string;
   private org: string;
 
@@ -296,7 +299,7 @@ export class AgentManager {
    * multi-org installs — agents in `lifeos` or `cointally` were invisible
    * to a daemon started with `CTX_ORG=testorg`.
    */
-  private resolveAgentOrg(name: string, explicitOrg?: string): string {
+  resolveAgentOrg(name: string, explicitOrg?: string): string {
     if (explicitOrg) return explicitOrg;
 
     const enabledAgents = this.readInstanceEnableList();
