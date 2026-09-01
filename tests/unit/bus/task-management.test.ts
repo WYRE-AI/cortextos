@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, checkStaleTasks, checkBatchStaleness, archiveTasks, checkHumanTasks } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, checkStaleTasks, checkBatchStaleness, STALE_IN_PROGRESS_MS, archiveTasks, checkHumanTasks } from '../../../src/bus/task';
 import { atomicWriteSync } from '../../../src/utils/atomic';
 import type { BusPaths, Task } from '../../../src/types';
 
@@ -153,6 +153,19 @@ describe('Advanced Task Management', () => {
       expect(report.stale_human.length).toBe(0);
       expect(report.overdue.length).toBe(0);
     });
+
+    it('agrees with checkBatchStaleness\'s default on the same in_progress task — single shared threshold, not two independently-typed literals', () => {
+      createBackdatedTask(paths, {
+        id: 'task_019_019',
+        title: 'Same task, two staleness checks',
+        status: 'in_progress',
+        project: 'cross-check-batch',
+        updated_at: hoursAgo(3), // past the shared 2h bar
+      });
+
+      expect(checkStaleTasks(paths).stale_in_progress.map(t => t.id)).toContain('task_019_019');
+      expect(checkBatchStaleness(paths, 'cross-check-batch').orphaned.map(t => t.id)).toEqual(['task_019_019']);
+    });
   });
 
   describe('checkBatchStaleness', () => {
@@ -174,7 +187,7 @@ describe('Advanced Task Management', () => {
 
       const report = checkBatchStaleness(paths, 'batch-1');
       expect(report.project).toBe('batch-1');
-      expect(report.stale_after_ms).toBe(7_200_000); // 2h default
+      expect(report.stale_after_ms).toBe(STALE_IN_PROGRESS_MS); // 2h default
       expect(report.total).toBe(2);
       expect(report.orphaned.map(t => t.id)).toEqual(['task_020_020']);
       expect(report.active.map(t => t.id)).toEqual(['task_021_021']);
@@ -239,7 +252,7 @@ describe('Advanced Task Management', () => {
       const report = checkBatchStaleness(paths, 'batch-does-not-exist');
       expect(report).toEqual({
         project: 'batch-does-not-exist',
-        stale_after_ms: 7_200_000,
+        stale_after_ms: STALE_IN_PROGRESS_MS,
         total: 0,
         orphaned: [],
         active: [],

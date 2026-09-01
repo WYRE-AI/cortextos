@@ -897,11 +897,20 @@ function readAllTasks(taskDir: string): Task[] {
 }
 
 /**
+ * Canonical "an in_progress task nobody has touched in this long is suspect"
+ * bar, in ms. Single source of truth for both {@link checkStaleTasks} (which
+ * needs it in seconds) and {@link checkBatchStaleness}'s default threshold,
+ * so the two can't silently drift apart the way two independently-typed
+ * literals would.
+ */
+export const STALE_IN_PROGRESS_MS = 7_200_000; // 2h
+
+/**
  * Check for stale tasks. Matches bash check-stale-tasks.sh behavior.
  */
 export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
   const nowEpoch = Math.floor(Date.now() / 1000);
-  const STALE_IN_PROGRESS = 7200;   // 2 hours
+  const STALE_IN_PROGRESS = STALE_IN_PROGRESS_MS / 1000;
   const STALE_PENDING = 86400;      // 24 hours
   const STALE_HUMAN = 86400;        // 24 hours
 
@@ -955,41 +964,21 @@ export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
 }
 
 /**
- * Default staleness threshold for {@link checkBatchStaleness}: 2 hours,
- * matching STALE_IN_PROGRESS above — an in_progress task nobody has touched
- * in that long is treated as suspect fleet-wide, so a batch item defaults to
- * the same bar rather than inventing a second number to reason about.
- */
-export const DEFAULT_BATCH_STALE_MS = 7_200_000; // 2h
-
-/**
- * Orphan-task-watchdog for a single dispatch-batch project
- * (task_1787921691733_11462336): a batch item sitting `in_progress` forever
- * because its assignee's session died mid-item is, from a plain
- * `list-tasks --project <id>` view, indistinguishable from one still
- * genuinely being worked — both just say "in_progress". This scans one
- * batch and separates the two explicitly instead of leaving the item in
- * silent limbo (the pattern is drawn from Hermes/NousResearch's A2A peering
- * model: attach a timeout to a pending state and transition it to an
- * explicit terminal/flagged state when it fires, rather than trusting
- * "still pending" forever — see task_1788300304747_69074594).
- *
- * Pure report, same posture as {@link checkStaleTasks} — this never mutates
- * a task's status; `orphaned` is a read, not a verdict, because a session
- * that is merely slow (not dead) looks identical until someone checks.
+ * Orphan-task-watchdog for one dispatch-batch project (task_1787921691733_11462336):
+ * flags in_progress items last updated more than `staleAfterMs` ago as
+ * `orphaned` rather than trusting "in_progress" forever. Pure report, same
+ * posture as {@link checkStaleTasks} — never mutates a task's status.
  */
 export function checkBatchStaleness(
   paths: BusPaths,
   project: string,
-  staleAfterMs: number = DEFAULT_BATCH_STALE_MS,
+  staleAfterMs: number = STALE_IN_PROGRESS_MS,
 ): BatchStalenessReport {
   const nowEpoch = Date.now();
-  const tasks = readAllTasks(paths.taskDir).filter(t => t.project === project);
-
   const report: BatchStalenessReport = {
     project,
     stale_after_ms: staleAfterMs,
-    total: tasks.length,
+    total: 0,
     orphaned: [],
     active: [],
     pending: [],
@@ -998,7 +987,10 @@ export function checkBatchStaleness(
     cancelled: 0,
   };
 
-  for (const task of tasks) {
+  for (const task of readAllTasks(paths.taskDir)) {
+    if (task.project !== project) continue;
+    report.total++;
+
     switch (task.status) {
       case 'in_progress': {
         const age = nowEpoch - new Date(task.updated_at).getTime();

@@ -47,6 +47,23 @@ reference — the same failure this feature exists to fix, from the opposite dir
 a generic "already resolved" cue, which is common enough in unrelated prose to risk hiding a
 genuinely still-open blocker.
 
+### Added — `bus check-batch-staleness` — orphan-task-watchdog for `dispatch-batch`
+
+A `dispatch-batch` (#160) item left `in_progress` because its assignee's session
+died mid-item was indistinguishable, from a plain `list-tasks` view, from one a
+live session was still genuinely working — both just say `in_progress`, with no
+way to tell "still working" from "stuck" short of manually cross-referencing the
+assignee's session activity (task_1787921691733_11462336).
+
+Added `bus check-batch-staleness <batch-id> [--stale-after <duration>]`: a pure,
+read-only report (never mutates task status) that scans one batch's tasks and
+separates `in_progress` items into `orphaned` (last updated longer than the
+threshold ago — default `2h`, matching `check-stale-tasks`' existing
+`STALE_IN_PROGRESS` constant) vs. `active`, alongside pending/completed/blocked/
+cancelled counts. The pattern — a timeout on a pending state that transitions it
+to an explicit terminal/flagged state instead of silent limbo — is drawn from
+researching Hermes/NousResearch's A2A peering model (task_1788300304747_69074594).
+
 ### Fixed — `evaluate-experiment` silently overwrote `baseline_value`, destroying the historical baseline it was compared against
 
 Confirmed independently by 3 agents across 3+ weeks (pearl, murph, adoption; 4+ repro instances).

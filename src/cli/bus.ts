@@ -398,18 +398,23 @@ busCommand
 
 busCommand
   .command('check-batch-staleness')
-  .description('Orphan-task-watchdog for a dispatch-batch project (task_1787921691733_11462336): report which in_progress items have gone stale (nobody visibly still working them) vs. genuinely active. Pure query — never mutates task status.')
+  .description('Orphan-task-watchdog for a dispatch-batch project: flag in_progress items gone stale vs. genuinely active (default 2h)')
   .argument('<batch-id>', 'The project id shared by every task in the batch (printed by dispatch-batch, or passed via its --project)')
-  .option('--stale-after <duration>', 'Threshold past which an in_progress item is flagged orphaned, e.g. "2h", "30m", "1d"', '2h')
-  .action((batchId: string, opts: { staleAfter: string }) => {
-    const staleAfterMs = parseDurationMs(opts.staleAfter);
-    if (Number.isNaN(staleAfterMs)) {
-      console.error(`Invalid --stale-after '${opts.staleAfter}' — expected a number followed by m/h/d/w, e.g. "2h"`);
-      process.exit(1);
+  .option('--stale-after <duration>', 'Threshold past which an in_progress item is flagged orphaned, e.g. "2h", "30m", "1d" (default: 2h)')
+  .action((batchId: string, opts: { staleAfter?: string }) => {
+    let staleAfterMs: number | undefined;
+    if (opts.staleAfter !== undefined) {
+      staleAfterMs = parseDurationMs(opts.staleAfter);
+      if (Number.isNaN(staleAfterMs)) {
+        console.error(`Invalid --stale-after '${opts.staleAfter}' — expected a number followed by m/h/d/w, e.g. "2h"`);
+        process.exit(1);
+      }
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
-    const report = checkBatchStaleness(paths, batchId, staleAfterMs);
+    const report = staleAfterMs === undefined
+      ? checkBatchStaleness(paths, batchId)
+      : checkBatchStaleness(paths, batchId, staleAfterMs);
     console.log(JSON.stringify(report));
   });
 

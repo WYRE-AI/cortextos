@@ -2,24 +2,12 @@
  * tests/unit/cli/check-batch-staleness.test.ts
  *
  * Covers `bus check-batch-staleness <batch-id>` — the orphan-task-watchdog
- * follow-up to dispatch-batch (#160, task_1787921691733_11462336). An
- * in_progress batch item whose assignee session died mid-item sits
- * indistinguishable from a genuinely active one under a plain
- * `list-tasks --project <id>` view; this command scans one batch and reports
- * which in_progress items have gone stale past a threshold instead of
- * trusting "in_progress" forever. Pattern drawn from Hermes/NousResearch's
- * A2A peering model: a timeout on a pending state should transition it to an
- * explicit terminal/flagged state, not leave it in silent limbo
- * (task_1788300304747_69074594).
- *
- * `checkBatchStaleness` is mocked, following dispatch-batch.test.ts's
- * approach: the pure report-building logic (bucketing, threshold math,
- * project scoping) already has direct coverage against a real tempdir
- * BusPaths in tests/unit/bus/task-management.test.ts. This file exercises
- * only the CLI wrapper's own logic — argument/option wiring, the
- * --stale-after default and override, invalid-duration handling, and that
- * the report is printed as a single JSON line (matching check-stale-tasks'
- * and archive-tasks' existing output convention).
+ * follow-up to dispatch-batch (#160, task_1787921691733_11462336). This file
+ * exercises only the CLI wrapper's own logic — argument/option wiring, the
+ * --stale-after default and override, invalid-duration handling, and the
+ * single-JSON-line output convention (matching check-stale-tasks'). The pure
+ * report-building logic (bucketing, threshold math, project scoping) has its
+ * own direct coverage in tests/unit/bus/task-management.test.ts.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -51,12 +39,6 @@ vi.mock('../../../src/bus/task.js', () => ({
   checkHumanTasks: vi.fn(),
 }));
 
-vi.mock('../../../src/bus/message.js', () => ({
-  sendMessage: vi.fn(),
-  checkInboxWithStatus: vi.fn(),
-  ackInbox: vi.fn(),
-}));
-
 import { busCommand } from '../../../src/cli/bus';
 
 function mockExit(): ReturnType<typeof vi.spyOn> {
@@ -79,20 +61,17 @@ beforeEach(() => {
 });
 
 describe('bus check-batch-staleness', () => {
-  it('forwards the batch id and the 2h default threshold when --stale-after is omitted', async () => {
-    vi.spyOn(console, 'log').mockImplementation(() => {});
-
+  it('forwards only the batch id when --stale-after is omitted, letting checkBatchStaleness apply its own default', async () => {
     await busCommand.parseAsync(['node', 'bus', 'check-batch-staleness', 'batch-123']);
 
     expect(checkBatchStalenessMock).toHaveBeenCalledTimes(1);
-    const [, project, staleAfterMs] = checkBatchStalenessMock.mock.calls[0];
-    expect(project).toBe('batch-123');
-    expect(staleAfterMs).toBe(7_200_000); // 2h
+    // No third argument — the CLI must not restate the 2h default as a second
+    // number; the default lives in exactly one place, checkBatchStaleness's
+    // own parameter default (STALE_IN_PROGRESS_MS).
+    expect(checkBatchStalenessMock.mock.calls[0]).toEqual([expect.anything(), 'batch-123']);
   });
 
   it('parses a custom --stale-after duration into milliseconds', async () => {
-    vi.spyOn(console, 'log').mockImplementation(() => {});
-
     await busCommand.parseAsync(['node', 'bus', 'check-batch-staleness', 'batch-123', '--stale-after', '30m']);
 
     const [, , staleAfterMs] = checkBatchStalenessMock.mock.calls[0];
@@ -111,10 +90,10 @@ describe('bus check-batch-staleness', () => {
       blocked: 0,
       cancelled: 0,
     } as never);
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
     await busCommand.parseAsync(['node', 'bus', 'check-batch-staleness', 'batch-123']);
 
+    const logSpy = vi.mocked(console.log);
     expect(logSpy).toHaveBeenCalledTimes(1);
     const parsed = JSON.parse(logSpy.mock.calls[0][0] as string);
     expect(parsed.project).toBe('batch-123');
@@ -122,7 +101,6 @@ describe('bus check-batch-staleness', () => {
   });
 
   it('error: an unparseable --stale-after exits 1 without calling checkBatchStaleness', async () => {
-    vi.spyOn(console, 'error').mockImplementation(() => {});
     const exitSpy = mockExit();
 
     await expect(
