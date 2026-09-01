@@ -314,12 +314,24 @@ const DISMISSAL_CUE_WINDOW = 120;
 //
 // Fix stays in the same "narrow explicit cue" register as the marker itself:
 // look at the ~20 chars immediately before each "tool artifact" match for a
-// negation word ending right at the match (optionally through a trailing
-// "a"/"an" article), and only count that occurrence as a genuine dismissal
-// if no negation precedes it. A window can contain multiple occurrences of
-// the marker phrase; one negated occurrence does not invalidate another,
-// genuinely un-negated one elsewhere in the same window.
-const NEGATION_CUE_REGEX = /\b(not|isn't|isnt|wasn't|wasnt|never|no longer)\b\s*(a\s+|an\s+)?$/i;
+// negation word ANYWHERE in that span (not anchored to sit directly against
+// the match), and only count that occurrence as a genuine dismissal if no
+// negation appears in its lookback. A window can contain multiple
+// occurrences of the marker phrase; one negated occurrence does not
+// invalidate another, genuinely un-negated one elsewhere in the same window.
+//
+// Deliberately NOT anchored to end immediately before the marker (e.g. via a
+// trailing `$` after the negation word) — grower's own follow-up review
+// found that an anchored version still missed "not really a tool artifact"
+// (task_1788276326374's sibling finding), because the intervening adverb
+// broke the adjacency. A short, unanchored lookback catches that case too,
+// and the risk of an unrelated earlier "not" (negating something else in the
+// same sentence) falsely suppressing a genuine dismissal is bounded by the
+// window staying short — verified against exactly that shape ("task is not
+// resolved, separately it is a tool artifact...") before choosing 20 chars:
+// the unrelated negation sits outside the window, the genuine marker still
+// counts as a dismissal.
+const NEGATION_CUE_REGEX = /\b(not|isn't|isnt|wasn't|wasnt|never|no longer)\b/i;
 const NEGATION_LOOKBACK = 20;
 
 function hasGenuineDismissalMarker(window: string): boolean {

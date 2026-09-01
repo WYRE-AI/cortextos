@@ -40,10 +40,10 @@ citation check's local window.
 ("tool artifact" — the specific phrase this org's own re-verify convention already uses for this
 exact case, verified to appear nowhere else in the live task corpus) near any occurrence of a
 given PR reference, and suppresses that reference entirely if found. The marker check is negation-
-aware (fast-follow, non-author review by grower): a negated mention like "this is NOT a tool
-artifact" no longer counts as a dismissal, which previously would have silently suppressed a
-genuinely still-open reference — the same failure this feature exists to fix, from the opposite
-direction. Deliberately narrower than
+aware (two fast-follow rounds, both from grower's review): a negated mention like "this is NOT a
+tool artifact" — including with an intervening adverb, "not really a tool artifact" — no longer
+counts as a dismissal, which previously would have silently suppressed a genuinely still-open
+reference — the same failure this feature exists to fix, from the opposite direction. Deliberately narrower than
 a generic "already resolved" cue, which is common enough in unrelated prose to risk hiding a
 genuinely still-open blocker.
 

@@ -478,6 +478,36 @@ describe('Bus System', () => {
       expect(report.entries).toHaveLength(0);
     });
 
+    // task_1788276326374's sibling finding (grower's delta review of the
+    // negation fix itself): an intervening adverb between the negation word
+    // and "a tool artifact" defeated an end-anchored negation check.
+    it('still flags a PR reference when an adverb intervenes ("not really a tool artifact")', () => {
+      writeTask('myorg', {
+        id: 'task_negated_adverb',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'This is not really a tool artifact, PR #67 is a genuine blocker.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    it('still suppresses a genuine dismissal even when an unrelated negation appears earlier in the same sentence, outside the lookback window', () => {
+      writeTask('myorg', {
+        id: 'task_unrelated_negation',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'Status update: task is not resolved, separately it is a tool artifact, PR #67 was closed.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
     it('does not flag a blocked task with no dependency signal at all, and does not count it as eligible', () => {
       writeTask('myorg', {
         id: 'task_plain',
