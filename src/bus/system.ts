@@ -275,6 +275,48 @@ const PRECEDENT_CITATION_CUE_REGEX =
 const PRECEDENT_CUE_WINDOW_BEFORE = 80;
 const PRECEDENT_CUE_WINDOW_AFTER = 40;
 
+// task_1788228644615 (grower's report, 2026-09-01): a PR reference that has
+// already been investigated and explicitly dismissed as a false positive
+// keeps re-flagging identically on every subsequent scan — grower's #1424
+// case hit this 6 times for zero new information, because each re-verify
+// note RE-MENTIONS the same "PR #NNNN" string right next to its dismissal
+// (e.g. "...same tool artifact (bare 'PR #1424' text match)"), and the
+// precedent-citation check above only looks at the window around the
+// ORIGINAL mention, not later re-mentions appended by the checker's own
+// follow-up notes.
+//
+// "tool artifact" is deliberately the only cue here, not a broader set like
+// "already resolved" — that phrase is common enough in ordinary prose that
+// using it as a suppression trigger risks silently hiding a genuinely still-
+// open reference that happens to share the wording. "tool artifact" is the
+// specific, narrow phrase this org's own re-verify convention already
+// converged on for exactly this dismissal (verified against the live task
+// corpus before adding: appears exactly twice across every task on disk,
+// both instances being this exact case) — same "narrow explicit cue over
+// broad heuristic" choice the precedent-citation regex already makes.
+//
+// Unlike isPrecedentCitation, this checks ALL occurrences of a given PR
+// reference in the full text, not just the one matchAll happened to find —
+// a dismissal note appended much later (often hundreds of characters past
+// the original mention) is exactly the shape that needs catching, and a
+// windowed check anchored only to the first occurrence would miss it.
+const DISMISSAL_MARKER_CUE_REGEX = /\btool artifact\b/i;
+const DISMISSAL_CUE_WINDOW = 120;
+
+function isDismissedElsewhere(text: string, prRef: string): boolean {
+  const escaped = prRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const mentionRegex = new RegExp(escaped, 'gi');
+  for (const m of text.matchAll(mentionRegex)) {
+    const matchIndex = m.index ?? 0;
+    const windowStart = Math.max(0, matchIndex - DISMISSAL_CUE_WINDOW);
+    const windowEnd = matchIndex + m[0].length + DISMISSAL_CUE_WINDOW;
+    if (DISMISSAL_MARKER_CUE_REGEX.test(text.slice(windowStart, windowEnd))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isPrecedentCitation(
   text: string,
   matchIndex: number,
@@ -381,7 +423,7 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
         }
         previousMatchEnd = matchIndex + m[0].length;
       }
-      const refs = [...new Set(keptRefs)];
+      const refs = [...new Set(keptRefs)].filter(ref => !isDismissedElsewhere(text, ref));
       if (refs.length > 0) {
         entries.push({
           task_id: task.id,

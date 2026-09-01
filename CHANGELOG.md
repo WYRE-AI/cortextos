@@ -28,6 +28,23 @@ Pairs with the cron-drift detector (analyst's `experiments/surfaces/cron-drift-d
 manifest-diff + roster-check): that surface answers "something changed"; this answers "who, when,
 what" once it does.
 
+### Fixed — `check-stale-blockers` re-flags a PR reference already dismissed elsewhere in the task text
+
+A blocked task's `unverified_external_ref` flag re-fired identically on every scan even after an
+agent had already investigated the cited PR and explicitly dismissed it as unrelated — real
+instance hit 6 times on the same string with zero new information each time, because the
+dismissal note is appended well after the original mention, outside the existing precedent-
+citation check's local window.
+
+`checkStaleBlockers` now also scans the full task text for a narrow, explicit dismissal marker
+("tool artifact" — the specific phrase this org's own re-verify convention already uses for this
+exact case, verified to appear nowhere else in the live task corpus) near any occurrence of a
+given PR reference, and suppresses that reference entirely if found. Deliberately narrower than
+a generic "already resolved" cue, which is common enough in unrelated prose to risk hiding a
+genuinely still-open blocker.
+
+### Fixed — `evaluate-experiment` silently overwrote `baseline_value`, destroying the historical baseline it was compared against
+
 Confirmed independently by 3 agents across 3+ weeks (pearl, murph, adoption; 4+ repro instances).
 On a `keep` decision, `evaluateExperiment` overwrote the completed record's `baseline_value` with
 the measured/scored result, so a reader auditing a completed experiment could no longer tell what
