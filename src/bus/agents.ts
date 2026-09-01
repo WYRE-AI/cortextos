@@ -236,7 +236,9 @@ function buildAgentInfo(
     }
   }
 
-  // Read config.json for model info
+  // Read config.json for model info + capability tags (see getAgentsWithCapability
+  // below, which filters on this instead of re-reading config.json itself).
+  let capabilities: string[] | undefined;
   const configFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT || process.env.CTX_PROJECT_ROOT || '';
   if (configFrameworkRoot) {
     const configPaths = [
@@ -248,6 +250,7 @@ function buildAgentInfo(
         try {
           const cfg: AgentConfig = JSON.parse(readFileSync(cfgPath, 'utf-8'));
           if (cfg.enabled !== undefined) enabled = cfg.enabled;
+          if (Array.isArray(cfg.capabilities)) capabilities = cfg.capabilities;
         } catch {
           // Skip
         }
@@ -266,6 +269,7 @@ function buildAgentInfo(
     last_heartbeat: lastHeartbeat,
     current_task: currentTask,
     mode,
+    ...(capabilities ? { capabilities } : {}),
   };
 }
 
@@ -313,50 +317,23 @@ export function notifyAgent(
  * config.json) lets `sendToCapability` fan a message out to all of them, so
  * the path survives any single tagged agent being down.
  *
+ * Built entirely on `listAgents()` rather than re-scanning `orgs/<org>/agents/`
+ * and re-parsing every config.json a second time — `buildAgentInfo` (above)
+ * already reads each agent's config.json once and carries `capabilities`
+ * on the resulting `AgentInfo`, so this is just a filter over that.
+ *
  * Disabled agents are excluded — fanning a message out to an agent nobody
- * expects to run defeats the point of failover. Scoped to top-level org
- * agents (`orgs/<org>/agents/*`), matching where a relay/bridge role would
- * actually be assigned; engineer-namespaced personal agents are not
- * considered relay candidates.
+ * expects to run defeats the point of failover. Engineer-namespaced personal
+ * agents are excluded too; a relay/bridge role is assigned to a shared org
+ * agent, not a personal one.
  */
 export function getAgentsWithCapability(ctxRoot: string, org: string, capability: string): string[] {
   validateOrgName(org);
   validateCapability(capability);
 
-  const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || process.env.CTX_PROJECT_ROOT || '';
-  if (!frameworkRoot) return [];
-
-  const enabledNames = new Set(
-    listAgents(ctxRoot, org)
-      .filter(a => a.enabled && !a.engineer)
-      .map(a => a.name),
-  );
-
-  const tagged: string[] = [];
-  const agentsDir = join(frameworkRoot, 'orgs', org, 'agents');
-  let agentDirs: string[];
-  try {
-    agentDirs = readdirSync(agentsDir);
-  } catch {
-    return [];
-  }
-
-  for (const agentName of agentDirs) {
-    if (!enabledNames.has(agentName)) continue;
-    const cfgPath = join(agentsDir, agentName, 'config.json');
-    if (!existsSync(cfgPath)) continue;
-    try {
-      const cfg: AgentConfig = JSON.parse(readFileSync(cfgPath, 'utf-8'));
-      if (Array.isArray(cfg.capabilities) && cfg.capabilities.includes(capability)) {
-        tagged.push(agentName);
-      }
-    } catch {
-      // Skip unreadable/corrupt config.json — never let a bad file on one
-      // agent hide a working relay on another.
-    }
-  }
-
-  return tagged;
+  return listAgents(ctxRoot, org)
+    .filter(a => a.enabled && !a.engineer && a.capabilities?.includes(capability))
+    .map(a => a.name);
 }
 
 /**

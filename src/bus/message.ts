@@ -7,6 +7,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { acquireLock, releaseLock } from '../utils/lock.js';
 import { randomString } from '../utils/random.js';
 import { validateAgentName, validatePriority } from '../utils/validate.js';
+import { resolvePaths } from '../utils/paths.js';
 
 // ---------------------------------------------------------------------------
 // Security (H10): HMAC-SHA256 message signing
@@ -284,6 +285,12 @@ export function ackInbox(paths: BusPaths, messageId: string): void {
  * scan of `inflight/`, so a backup relay that hasn't gotten to the message
  * yet simply never sees it once someone else has already handled it — kept
  * on disk rather than deleted, for audit.
+ *
+ * Paths are resolved via `resolvePaths` (same helper every other bus path
+ * comes from) rather than hand-joining `ctxRoot`/dirName/recipient — the
+ * instanceId/org arguments it also takes aren't needed for inbox/inflight
+ * (only ctxRoot + agent name determine those two), so 'default' is a safe
+ * placeholder here, never used to build the paths this function reads.
  */
 function cancelFanoutSiblings(
   ctxRoot: string,
@@ -293,28 +300,50 @@ function cancelFanoutSiblings(
 ): void {
   for (const recipient of recipients) {
     if (recipient === winner) continue;
-    for (const dirName of ['inbox', 'inflight'] as const) {
-      const dir = join(ctxRoot, dirName, recipient);
-      let siblingFiles: string[];
+    const siblingPaths = resolvePaths(recipient, 'default', undefined, ctxRoot);
+
+    // inbox/: protected by the SAME lock checkInboxWithStatus takes on this
+    // directory, so a concurrent poll of the sibling's own inbox can't race
+    // this cleanup. Best-effort — if the lock is held, skip this recipient's
+    // inbox rather than block or steal it; worst case the sibling processes
+    // one redundant copy, the same outcome first-ack-wins already tolerates.
+    if (acquireLock(siblingPaths.inbox)) {
       try {
-        siblingFiles = readdirSync(dir).filter(f => f.endsWith('.json'));
-      } catch {
-        continue;
+        supersedeFanoutCopies(siblingPaths.inbox, fanoutId);
+      } finally {
+        releaseLock(siblingPaths.inbox);
       }
-      for (const file of siblingFiles) {
-        const filePath = join(dir, file);
-        try {
-          const sibling = JSON.parse(readFileSync(filePath, 'utf-8'));
-          if (sibling?.fanout?.id === fanoutId) {
-            const supersededDir = join(dir, '.superseded');
-            ensureDir(supersededDir);
-            renameSync(filePath, join(supersededDir, file));
-          }
-        } catch {
-          // Corrupt/unreadable sibling file — leave it for its own recipient
-          // to sort out; never let cleanup throw.
-        }
+    }
+
+    // inflight/ has no lock anywhere in this codebase — only the owning
+    // agent's own session ever reads/writes its own inflight (see ackInbox
+    // above, which doesn't lock it either), so adding one here would be new,
+    // asymmetric protection for a directory nothing else protects. Scan it
+    // unlocked, same as every other inflight access.
+    supersedeFanoutCopies(siblingPaths.inflight, fanoutId);
+  }
+}
+
+/** Move every `*.json` in `dir` whose `fanout.id` matches into `dir/.superseded/`. */
+function supersedeFanoutCopies(dir: string, fanoutId: string): void {
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter(f => f.endsWith('.json'));
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const filePath = join(dir, file);
+    try {
+      const sibling = JSON.parse(readFileSync(filePath, 'utf-8'));
+      if (sibling?.fanout?.id === fanoutId) {
+        const supersededDir = join(dir, '.superseded');
+        ensureDir(supersededDir);
+        renameSync(filePath, join(supersededDir, file));
       }
+    } catch {
+      // Corrupt/unreadable sibling file — leave it for its own recipient
+      // to sort out; never let cleanup throw.
     }
   }
 }

@@ -902,6 +902,8 @@ export interface AgentInfo {
   mode: string | null;
   /** Engineer namespace for personal agents; absent for shared org agents. */
   engineer?: string;
+  /** Capability tags from config.json (see AgentConfig.capabilities). Absent = none. */
+  capabilities?: string[];
 }
 
 /**

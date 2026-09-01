@@ -16,42 +16,39 @@ export function validateTaskId(taskId: string): void {
   }
 }
 
-export function validateInstanceId(instanceId: string): void {
-  if (!instanceId || !AGENT_NAME_REGEX.test(instanceId)) {
+/**
+ * Shared check behind every `[a-z0-9_-]`-only identifier below (agent name,
+ * org name, instance id, capability tag) — same character class for all of
+ * them, for the same reason: no path traversal, no shell/glob metacharacters
+ * in anything that becomes part of a filesystem path or message payload.
+ * `label` only changes the error text, never the check.
+ */
+function validateIdentifier(value: string, label: string): void {
+  if (!value || !AGENT_NAME_REGEX.test(value)) {
     throw new Error(
-      `Invalid instance ID '${instanceId}'. Must contain only lowercase letters, numbers, underscores, and hyphens.`
+      `Invalid ${label} '${value}'. Must contain only lowercase letters, numbers, underscores, and hyphens.`
     );
   }
 }
 
+export function validateInstanceId(instanceId: string): void {
+  validateIdentifier(instanceId, 'instance ID');
+}
+
 export function validateAgentName(name: string): void {
-  if (!name || !AGENT_NAME_REGEX.test(name)) {
-    throw new Error(
-      `Invalid agent name '${name}'. Must contain only lowercase letters, numbers, underscores, and hyphens.`
-    );
-  }
+  validateIdentifier(name, 'agent name');
 }
 
 /**
  * Capability tags (e.g. "comms-relay") drive a filesystem lookup + fan-out
- * send in `sendToCapability` (src/bus/agents.ts) — same character class as
- * an agent name, for the same reason (no path traversal, no shell/glob
- * metacharacters in anything that becomes part of a message payload).
+ * send in `sendToCapability` (src/bus/agents.ts).
  */
 export function validateCapability(capability: string): void {
-  if (!capability || !AGENT_NAME_REGEX.test(capability)) {
-    throw new Error(
-      `Invalid capability '${capability}'. Must contain only lowercase letters, numbers, underscores, and hyphens.`
-    );
-  }
+  validateIdentifier(capability, 'capability');
 }
 
 export function validateOrgName(org: string): void {
-  if (!org || !AGENT_NAME_REGEX.test(org)) {
-    throw new Error(
-      `Invalid org name '${org}'. Must contain only lowercase letters, numbers, underscores, and hyphens.`
-    );
-  }
+  validateIdentifier(org, 'org name');
 }
 
 export function validatePriority(priority: string): asserts priority is Priority {
