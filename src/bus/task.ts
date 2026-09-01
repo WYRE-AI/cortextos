@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync } from 'fs';
 import { join } from 'path';
-import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport } from '../types/index.js';
+import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport, BatchStalenessReport } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
 import { validatePriority, validateTaskId } from '../utils/validate.js';
@@ -948,6 +948,75 @@ export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
       if (dueEpoch > 0 && nowEpoch > dueEpoch) {
         report.overdue.push(task);
       }
+    }
+  }
+
+  return report;
+}
+
+/**
+ * Default staleness threshold for {@link checkBatchStaleness}: 2 hours,
+ * matching STALE_IN_PROGRESS above — an in_progress task nobody has touched
+ * in that long is treated as suspect fleet-wide, so a batch item defaults to
+ * the same bar rather than inventing a second number to reason about.
+ */
+export const DEFAULT_BATCH_STALE_MS = 7_200_000; // 2h
+
+/**
+ * Orphan-task-watchdog for a single dispatch-batch project
+ * (task_1787921691733_11462336): a batch item sitting `in_progress` forever
+ * because its assignee's session died mid-item is, from a plain
+ * `list-tasks --project <id>` view, indistinguishable from one still
+ * genuinely being worked — both just say "in_progress". This scans one
+ * batch and separates the two explicitly instead of leaving the item in
+ * silent limbo (the pattern is drawn from Hermes/NousResearch's A2A peering
+ * model: attach a timeout to a pending state and transition it to an
+ * explicit terminal/flagged state when it fires, rather than trusting
+ * "still pending" forever — see task_1788300304747_69074594).
+ *
+ * Pure report, same posture as {@link checkStaleTasks} — this never mutates
+ * a task's status; `orphaned` is a read, not a verdict, because a session
+ * that is merely slow (not dead) looks identical until someone checks.
+ */
+export function checkBatchStaleness(
+  paths: BusPaths,
+  project: string,
+  staleAfterMs: number = DEFAULT_BATCH_STALE_MS,
+): BatchStalenessReport {
+  const nowEpoch = Date.now();
+  const tasks = readAllTasks(paths.taskDir).filter(t => t.project === project);
+
+  const report: BatchStalenessReport = {
+    project,
+    stale_after_ms: staleAfterMs,
+    total: tasks.length,
+    orphaned: [],
+    active: [],
+    pending: [],
+    completed: 0,
+    blocked: 0,
+    cancelled: 0,
+  };
+
+  for (const task of tasks) {
+    switch (task.status) {
+      case 'in_progress': {
+        const age = nowEpoch - new Date(task.updated_at).getTime();
+        (age > staleAfterMs ? report.orphaned : report.active).push(task);
+        break;
+      }
+      case 'pending':
+        report.pending.push(task);
+        break;
+      case 'completed':
+        report.completed++;
+        break;
+      case 'blocked':
+        report.blocked++;
+        break;
+      case 'cancelled':
+        report.cancelled++;
+        break;
     }
   }
 

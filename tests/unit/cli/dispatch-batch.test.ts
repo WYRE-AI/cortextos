@@ -44,6 +44,7 @@ vi.mock('../../../src/bus/task.js', () => ({
   compactTasks: vi.fn(),
   listTasks: vi.fn(),
   checkStaleTasks: vi.fn(),
+  checkBatchStaleness: vi.fn(),
   archiveTasks: vi.fn(),
   checkHumanTasks: vi.fn(),
 }));

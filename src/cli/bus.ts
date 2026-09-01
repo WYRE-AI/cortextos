@@ -9,7 +9,7 @@ import { sendToCapability } from '../bus/agents.js';
 import { validateAgentName, validateTaskId, validatePriority, validateCapability } from '../utils/validate.js';
 import { randomDigits } from '../utils/random.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, checkBatchStaleness, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus/heartbeat.js';
@@ -394,6 +394,23 @@ busCommand
         `the batch got done before the prior session ended).`,
       );
     }
+  });
+
+busCommand
+  .command('check-batch-staleness')
+  .description('Orphan-task-watchdog for a dispatch-batch project (task_1787921691733_11462336): report which in_progress items have gone stale (nobody visibly still working them) vs. genuinely active. Pure query — never mutates task status.')
+  .argument('<batch-id>', 'The project id shared by every task in the batch (printed by dispatch-batch, or passed via its --project)')
+  .option('--stale-after <duration>', 'Threshold past which an in_progress item is flagged orphaned, e.g. "2h", "30m", "1d"', '2h')
+  .action((batchId: string, opts: { staleAfter: string }) => {
+    const staleAfterMs = parseDurationMs(opts.staleAfter);
+    if (Number.isNaN(staleAfterMs)) {
+      console.error(`Invalid --stale-after '${opts.staleAfter}' — expected a number followed by m/h/d/w, e.g. "2h"`);
+      process.exit(1);
+    }
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
+    const report = checkBatchStaleness(paths, batchId, staleAfterMs);
+    console.log(JSON.stringify(report));
   });
 
 busCommand
