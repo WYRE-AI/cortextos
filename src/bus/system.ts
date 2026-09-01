@@ -324,13 +324,29 @@ const DISMISSAL_CUE_WINDOW = 120;
 // trailing `$` after the negation word) — grower's own follow-up review
 // found that an anchored version still missed "not really a tool artifact"
 // (task_1788276326374's sibling finding), because the intervening adverb
-// broke the adjacency. A short, unanchored lookback catches that case too,
-// and the risk of an unrelated earlier "not" (negating something else in the
-// same sentence) falsely suppressing a genuine dismissal is bounded by the
-// window staying short — verified against exactly that shape ("task is not
-// resolved, separately it is a tool artifact...") before choosing 20 chars:
-// the unrelated negation sits outside the window, the genuine marker still
-// counts as a dismissal.
+// broke the adjacency. A short, unanchored lookback catches that case too.
+//
+// KNOWN LIMITATION, not solved here (grower, 3rd-round review of this same
+// function): an UNRELATED negation elsewhere in the lookback can still be
+// wrongly attributed to the marker — "He is not here, this is a tool
+// artifact, PR #67 already dismissed." has "not" negating "here", landing
+// inside the 20-char window ahead of "tool artifact", so this occurrence is
+// wrongly read as negated and the genuine dismissal gets missed (the PR
+// re-flags despite already being resolved — the original #167 bug,
+// reintroduced in this one narrow shape). Two candidate fixes were tried and
+// both introduced a DIFFERENT regression when checked against the full test
+// matrix rather than just the new counterexample: a clause-boundary stop
+// (comma/period/`--`) fixes this case but breaks the "unrelated mention
+// elsewhere" test (a genuine dismissal for one PR reference bleeds across
+// and wrongly suppresses an unrelated one); a sentence-boundary-only variant
+// (period only) fixes that but reopens 3 other cases, including this one.
+// Conclusion: a punctuation-boundary heuristic cannot reliably disambiguate
+// "does this negation modify the marker, or something else nearby" — this
+// is a genuine natural-language-scoping problem, not a one-line fix waiting
+// to be found. Left as-is rather than shipping a narrower fix against an
+// ever-growing adversarial-example list; see task_1788305871620_29811457
+// for the full 8-case matrix both failed attempts were checked against, and
+// for whoever picks this up next.
 const NEGATION_CUE_REGEX = /\b(not|isn't|isnt|wasn't|wasnt|never|no longer)\b/i;
 const NEGATION_LOOKBACK = 20;
 
