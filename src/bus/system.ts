@@ -300,8 +300,39 @@ const PRECEDENT_CUE_WINDOW_AFTER = 40;
 // a dismissal note appended much later (often hundreds of characters past
 // the original mention) is exactly the shape that needs catching, and a
 // windowed check anchored only to the first occurrence would miss it.
-const DISMISSAL_MARKER_CUE_REGEX = /\btool artifact\b/i;
+const DISMISSAL_MARKER_CUE_REGEX = /\btool artifact\b/gi;
 const DISMISSAL_CUE_WINDOW = 120;
+
+// task_1788276323687 (grower, non-author review of the PR that introduced
+// isDismissedElsewhere): the marker check above had no negation awareness —
+// "this is NOT a tool artifact, PR #67 is a genuine still-open blocker"
+// matched the bare phrase and wrongly suppressed a real blocker, the exact
+// failure this whole mechanism exists to prevent, just from the opposite
+// direction (a false dismissal instead of a missing one). A negated mention
+// of the idiom is plausible prose for an agent re-verifying a genuinely open
+// reference while explicitly ruling the idiom out, not a contrived case.
+//
+// Fix stays in the same "narrow explicit cue" register as the marker itself:
+// look at the ~20 chars immediately before each "tool artifact" match for a
+// negation word ending right at the match (optionally through a trailing
+// "a"/"an" article), and only count that occurrence as a genuine dismissal
+// if no negation precedes it. A window can contain multiple occurrences of
+// the marker phrase; one negated occurrence does not invalidate another,
+// genuinely un-negated one elsewhere in the same window.
+const NEGATION_CUE_REGEX = /\b(not|isn't|isnt|wasn't|wasnt|never|no longer)\b\s*(a\s+|an\s+)?$/i;
+const NEGATION_LOOKBACK = 20;
+
+function hasGenuineDismissalMarker(window: string): boolean {
+  for (const m of window.matchAll(DISMISSAL_MARKER_CUE_REGEX)) {
+    const matchIndex = m.index ?? 0;
+    const precedingStart = Math.max(0, matchIndex - NEGATION_LOOKBACK);
+    const preceding = window.slice(precedingStart, matchIndex);
+    if (!NEGATION_CUE_REGEX.test(preceding)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function isDismissedElsewhere(text: string, prRef: string): boolean {
   const escaped = prRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -310,7 +341,7 @@ function isDismissedElsewhere(text: string, prRef: string): boolean {
     const matchIndex = m.index ?? 0;
     const windowStart = Math.max(0, matchIndex - DISMISSAL_CUE_WINDOW);
     const windowEnd = matchIndex + m[0].length + DISMISSAL_CUE_WINDOW;
-    if (DISMISSAL_MARKER_CUE_REGEX.test(text.slice(windowStart, windowEnd))) {
+    if (hasGenuineDismissalMarker(text.slice(windowStart, windowEnd))) {
       return true;
     }
   }

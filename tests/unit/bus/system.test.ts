@@ -445,6 +445,39 @@ describe('Bus System', () => {
       expect(report.entries[0].detail).toContain('PR #67');
     });
 
+    // task_1788276323687 (grower, non-author review of #167): a NEGATED
+    // mention of the dismissal idiom ("this is NOT a tool artifact") was
+    // wrongly treated as a genuine dismissal, silently suppressing a real
+    // still-open blocker — the exact failure #167 itself was fixing, from
+    // the opposite direction.
+    it('still flags a PR reference when "tool artifact" appears negated ("NOT a tool artifact")', () => {
+      writeTask('myorg', {
+        id: 'task_negated_dismissal',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'Checked carefully -- this is NOT a tool artifact, PR #67 is a genuine still-open blocker.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    it('still suppresses a genuinely dismissed reference when a DIFFERENT, non-negated "tool artifact" mention exists in the same window', () => {
+      writeTask('myorg', {
+        id: 'task_mixed_negation',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'Re-verify: this is NOT a tool artifact -- wait, actually on closer look it IS a tool artifact, PR #67 was already resolved elsewhere.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
     it('does not flag a blocked task with no dependency signal at all, and does not count it as eligible', () => {
       writeTask('myorg', {
         id: 'task_plain',
