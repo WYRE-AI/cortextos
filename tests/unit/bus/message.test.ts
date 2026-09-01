@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { sendMessage, checkInbox, checkInboxWithStatus, ackInbox } from '../../../src/bus/message';
@@ -157,6 +157,93 @@ describe('Message Bus', () => {
 
       expect(inflightFiles.length).toBe(0);
       expect(processedFiles.length).toBe(1);
+    });
+  });
+
+  // Capability-tagged relay fan-out, first-ack-wins (task_1788300871646_92090539
+  // — fix for the "angela-relay" single point of failure). The fan-out send
+  // itself lives in bus/agents.ts (sendToCapability); these tests exercise the
+  // lower-level pieces that live here: sendMessage's optional `fanout` tag and
+  // ackInbox's sibling-cancellation on the winning ack.
+  describe('fanout (first-ack-wins)', () => {
+    let backupPaths: BusPaths;
+
+    beforeEach(() => {
+      backupPaths = {
+        ...senderPaths,
+        inbox: join(testDir, 'inbox', 'backup'),
+        inflight: join(testDir, 'inflight', 'backup'),
+        processed: join(testDir, 'processed', 'backup'),
+        logDir: join(testDir, 'logs', 'backup'),
+        stateDir: join(testDir, 'state', 'backup'),
+      };
+    });
+
+    it('sendMessage writes the fanout tag onto the recipient copy', () => {
+      const fanout = { id: 'fanout-1', capability: 'comms-relay', recipients: ['receiver', 'backup'] };
+      sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'relay me', undefined, fanout);
+
+      const files = readdirSync(receiverPaths.inbox).filter(f => f.endsWith('.json'));
+      const content = JSON.parse(readFileSync(join(receiverPaths.inbox, files[0]), 'utf-8'));
+      expect(content.fanout).toEqual(fanout);
+    });
+
+    it('an ordinary (non-fanout) message has no fanout field', () => {
+      sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'plain');
+      const files = readdirSync(receiverPaths.inbox).filter(f => f.endsWith('.json'));
+      const content = JSON.parse(readFileSync(join(receiverPaths.inbox, files[0]), 'utf-8'));
+      expect(content.fanout).toBeUndefined();
+    });
+
+    it('acking the winning copy cancels a sibling still sitting unread in another recipient\'s inbox', () => {
+      const fanout = { id: 'fanout-2', capability: 'comms-relay', recipients: ['receiver', 'backup'] };
+      const winnerId = sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'relay me', undefined, fanout);
+      sendMessage(senderPaths, 'sender', 'backup', 'normal', 'relay me', undefined, fanout);
+
+      checkInbox(receiverPaths); // winner checks in first, moves to inflight
+      ackInbox(receiverPaths, winnerId);
+
+      // Backup's copy was never checked (still in inbox) — must be superseded, not left live.
+      const backupInboxFiles = readdirSync(backupPaths.inbox).filter(f => f.endsWith('.json'));
+      expect(backupInboxFiles.length).toBe(0);
+
+      const supersededDir = join(backupPaths.inbox, '.superseded');
+      const supersededFiles = readdirSync(supersededDir).filter(f => f.endsWith('.json'));
+      expect(supersededFiles.length).toBe(1);
+      const superseded = JSON.parse(readFileSync(join(supersededDir, supersededFiles[0]), 'utf-8'));
+      expect(superseded.fanout.id).toBe('fanout-2');
+    });
+
+    it('acking the winning copy cancels a sibling already sitting in another recipient\'s inflight', () => {
+      const fanout = { id: 'fanout-3', capability: 'comms-relay', recipients: ['receiver', 'backup'] };
+      const winnerId = sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'relay me', undefined, fanout);
+      sendMessage(senderPaths, 'sender', 'backup', 'normal', 'relay me', undefined, fanout);
+
+      // Backup already polled and moved its copy to inflight before receiver acks.
+      checkInbox(backupPaths);
+      checkInbox(receiverPaths);
+      ackInbox(receiverPaths, winnerId);
+
+      const backupInflightFiles = readdirSync(backupPaths.inflight).filter(f => f.endsWith('.json'));
+      expect(backupInflightFiles.length).toBe(0);
+
+      const supersededDir = join(backupPaths.inflight, '.superseded');
+      const supersededFiles = readdirSync(supersededDir).filter(f => f.endsWith('.json'));
+      expect(supersededFiles.length).toBe(1);
+    });
+
+    it('acking a non-fanout message never touches another agent\'s inbox', () => {
+      sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'plain');
+      sendMessage(senderPaths, 'sender', 'backup', 'normal', 'unrelated');
+      checkInbox(receiverPaths);
+      const inflightFiles = readdirSync(receiverPaths.inflight).filter(f => f.endsWith('.json'));
+      const queued = JSON.parse(readFileSync(join(receiverPaths.inflight, inflightFiles[0]), 'utf-8'));
+      ackInbox(receiverPaths, queued.id);
+
+      // backup's unrelated message is untouched, and no .superseded dir was created for it.
+      const backupInboxFiles = readdirSync(backupPaths.inbox).filter(f => f.endsWith('.json'));
+      expect(backupInboxFiles.length).toBe(1);
+      expect(existsSync(join(backupPaths.inbox, '.superseded'))).toBe(false);
     });
   });
 });

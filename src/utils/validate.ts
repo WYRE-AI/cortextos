@@ -32,6 +32,20 @@ export function validateAgentName(name: string): void {
   }
 }
 
+/**
+ * Capability tags (e.g. "comms-relay") drive a filesystem lookup + fan-out
+ * send in `sendToCapability` (src/bus/agents.ts) — same character class as
+ * an agent name, for the same reason (no path traversal, no shell/glob
+ * metacharacters in anything that becomes part of a message payload).
+ */
+export function validateCapability(capability: string): void {
+  if (!capability || !AGENT_NAME_REGEX.test(capability)) {
+    throw new Error(
+      `Invalid capability '${capability}'. Must contain only lowercase letters, numbers, underscores, and hyphens.`
+    );
+  }
+}
+
 export function validateOrgName(org: string): void {
   if (!org || !AGENT_NAME_REGEX.test(org)) {
     throw new Error(

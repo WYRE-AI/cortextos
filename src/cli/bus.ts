@@ -5,7 +5,8 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInboxWithStatus, ackInbox } from '../bus/message.js';
-import { validateAgentName, validateTaskId, validatePriority } from '../utils/validate.js';
+import { sendToCapability } from '../bus/agents.js';
+import { validateAgentName, validateTaskId, validatePriority, validateCapability } from '../utils/validate.js';
 import { randomDigits } from '../utils/random.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
@@ -159,6 +160,63 @@ busCommand
       logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
     } catch { /* non-fatal */ }
     console.log(msgId);
+  });
+
+busCommand
+  .command('send-relay')
+  .description('Fan a message out to every enabled agent tagged with a capability instead of addressing one hardcoded agent name. First recipient to run ack-inbox on it wins -- the other tagged agents\' pending copies get cancelled. Fix for the "angela-relay" single point of failure (task_1788300871646_92090539); modeled on Hermes\'s a2a_orchestrate(mode="first") (task_1788300304747_69074594).')
+  .argument('<capability>', 'Capability tag (see "capabilities" in an agent\'s config.json) -- fans out to every enabled agent carrying this tag')
+  .argument('<priority>', 'Message priority (urgent, high, normal, low)')
+  .argument('[text]', 'Message text. Omit the argument, or pass "-", to read the body from stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical.')
+  .argument('[reply-to]', 'Reply to message ID (optional positional form)')
+  .option('--reply-to <id>', 'Reply to message ID')
+  .option('--body-file <path>', 'Read the message body from a file instead of the shell argument or stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical')
+  .action((capability: string, priority: string, text: string | undefined, replyToArg: string | undefined, opts: { replyTo?: string; bodyFile?: string }) => {
+    const effectiveReplyTo = opts.replyTo ?? replyToArg;
+    const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
+    if (!validPriorities.includes(priority as Priority)) {
+      console.error(`Invalid priority '${priority}'. Must be one of: ${validPriorities.join(', ')}`);
+      process.exit(1);
+    }
+    let resolvedText: string;
+    try {
+      resolvedText = resolveMessageBody({ inlineText: text, bodyFile: opts.bodyFile });
+    } catch (err) {
+      if (err instanceof UnsafeInlineBodyError) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      throw err;
+    }
+    text = resolvedText;
+    try {
+      validateCapability(capability);
+    } catch (err) {
+      console.error(String(err));
+      process.exit(1);
+    }
+
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
+
+    let result;
+    try {
+      result = sendToCapability(paths, env.agentName, env.org, capability, priority as Priority, text, effectiveReplyTo);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+      return;
+    }
+    try {
+      logEvent(paths, env.agentName, env.org, 'message', 'agent_relay_sent', 'info', JSON.stringify({
+        capability,
+        priority,
+        recipients: result.recipients,
+        fanout_id: result.fanoutId,
+        reply_to: effectiveReplyTo ?? null,
+      }));
+    } catch { /* non-fatal */ }
+    console.log(JSON.stringify({ fanout_id: result.fanoutId, recipients: result.recipients, msg_ids: result.msgIds }));
   });
 
 busCommand

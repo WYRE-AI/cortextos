@@ -23,6 +23,21 @@ export interface InboxMessage {
   text: string;
   reply_to: string | null;
   sig?: string; // Security (H10): HMAC-SHA256 signature — optional for backwards compat
+  /**
+   * Present when this message is one copy of a capability-tagged fan-out
+   * (see `sendToCapability` in src/bus/agents.ts). `id` is shared across
+   * every recipient's copy of the same logical send; `recipients` lists
+   * every agent the fan-out was sent to (including this copy's own `to`).
+   * First-ack-wins: `ackInbox` (src/bus/message.ts), on acking a message
+   * that carries `fanout`, cancels the sibling copies still sitting in the
+   * other recipients' inbox/inflight — so only the first agent to respond
+   * processes it. Absent on every ordinary (non-relay) message.
+   */
+  fanout?: {
+    id: string;
+    capability: string;
+    recipients: string[];
+  };
 }
 
 // Task Types
@@ -260,6 +275,16 @@ export interface AgentConfig {
    * poller will be skipped regardless.
    */
   telegram_polling?: boolean;
+  /**
+   * Capability tags this agent advertises (e.g. "comms-relay"). Used by
+   * `sendToCapability`/`bus send-relay` (src/bus/agents.ts) to fan a message
+   * out to every enabled agent carrying a given tag instead of addressing a
+   * single hardcoded agent name — the fix for the "angela-relay" single
+   * point of failure (task_1788300871646_92090539): any agent tagged
+   * "comms-relay" can pick up a cross-boundary message, and whichever one
+   * acks first wins (see InboxMessage.fanout). Absent = advertises nothing.
+   */
+  capabilities?: string[];
 }
 
 export interface CronEntry {
@@ -877,6 +902,18 @@ export interface AgentInfo {
   mode: string | null;
   /** Engineer namespace for personal agents; absent for shared org agents. */
   engineer?: string;
+}
+
+/**
+ * Result of `sendToCapability` (src/bus/agents.ts) — a capability-tagged
+ * fan-out send. One InboxMessage is written per recipient (see
+ * InboxMessage.fanout); `msgIds[i]` corresponds to `recipients[i]`.
+ */
+export interface RelayFanoutResult {
+  fanoutId: string;
+  capability: string;
+  recipients: string[];
+  msgIds: string[];
 }
 
 // Agent Status (returned by daemon)

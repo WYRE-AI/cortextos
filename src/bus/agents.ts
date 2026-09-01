@@ -1,9 +1,11 @@
 import { existsSync, readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
-import type { AgentInfo, AgentConfig, BusPaths } from '../types/index.js';
+import type { AgentInfo, AgentConfig, BusPaths, Priority, RelayFanoutResult } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { sendMessage } from './message.js';
 import { resolveAgentDir, parseQualifiedName } from '../utils/agent-dir.js';
+import { randomString } from '../utils/random.js';
+import { validateCapability, validateOrgName } from '../utils/validate.js';
 
 /**
  * List all agents in the system.
@@ -297,4 +299,101 @@ export function notifyAgent(
   } catch {
     // Ignore bus send failures - signal file is the primary mechanism
   }
+}
+
+/**
+ * Return the names of every ENABLED agent in `org` whose config.json lists
+ * `capability` in its `capabilities` array.
+ *
+ * Fix for the "angela-relay" single point of failure (task_1788300871646_92090539,
+ * modeled on Hermes's `a2a_orchestrate(capability, mode="first")` —
+ * task_1788300304747_69074594): a cross-boundary comms path used to require
+ * hardcoding one specific agent's name as the sole handler. Tagging N agents
+ * with the same capability (e.g. `"capabilities": ["comms-relay"]` in
+ * config.json) lets `sendToCapability` fan a message out to all of them, so
+ * the path survives any single tagged agent being down.
+ *
+ * Disabled agents are excluded — fanning a message out to an agent nobody
+ * expects to run defeats the point of failover. Scoped to top-level org
+ * agents (`orgs/<org>/agents/*`), matching where a relay/bridge role would
+ * actually be assigned; engineer-namespaced personal agents are not
+ * considered relay candidates.
+ */
+export function getAgentsWithCapability(ctxRoot: string, org: string, capability: string): string[] {
+  validateOrgName(org);
+  validateCapability(capability);
+
+  const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || process.env.CTX_PROJECT_ROOT || '';
+  if (!frameworkRoot) return [];
+
+  const enabledNames = new Set(
+    listAgents(ctxRoot, org)
+      .filter(a => a.enabled && !a.engineer)
+      .map(a => a.name),
+  );
+
+  const tagged: string[] = [];
+  const agentsDir = join(frameworkRoot, 'orgs', org, 'agents');
+  let agentDirs: string[];
+  try {
+    agentDirs = readdirSync(agentsDir);
+  } catch {
+    return [];
+  }
+
+  for (const agentName of agentDirs) {
+    if (!enabledNames.has(agentName)) continue;
+    const cfgPath = join(agentsDir, agentName, 'config.json');
+    if (!existsSync(cfgPath)) continue;
+    try {
+      const cfg: AgentConfig = JSON.parse(readFileSync(cfgPath, 'utf-8'));
+      if (Array.isArray(cfg.capabilities) && cfg.capabilities.includes(capability)) {
+        tagged.push(agentName);
+      }
+    } catch {
+      // Skip unreadable/corrupt config.json — never let a bad file on one
+      // agent hide a working relay on another.
+    }
+  }
+
+  return tagged;
+}
+
+/**
+ * Fan a message out to every enabled agent tagged with `capability` instead
+ * of addressing one hardcoded agent name — the bus-level fix for the
+ * "angela-relay" SPOF (task_1788300871646_92090539). Each tagged agent gets
+ * its own copy in its own inbox (via `sendMessage`), all sharing one
+ * `fanout.id`. First-ack-wins: whichever recipient calls `ack-inbox` first
+ * has `ackInbox` (bus/message.ts) cancel the others' still-pending copies —
+ * modeled on Hermes's `a2a_orchestrate(mode="first")`
+ * (task_1788300304747_69074594).
+ *
+ * Throws if no enabled agent currently carries the capability — a silent
+ * no-op fan-out (0 recipients) would be worse than the SPOF it replaces,
+ * since it fails without ever reaching anyone.
+ */
+export function sendToCapability(
+  paths: BusPaths,
+  from: string,
+  org: string,
+  capability: string,
+  priority: Priority,
+  text: string,
+  replyTo?: string,
+): RelayFanoutResult {
+  const recipients = getAgentsWithCapability(paths.ctxRoot, org, capability);
+  if (recipients.length === 0) {
+    throw new Error(
+      `No enabled agent in org '${org}' is tagged with capability '${capability}' — nothing to relay to. ` +
+      `Tag at least one agent by adding "capabilities": ["${capability}"] to its config.json.`
+    );
+  }
+
+  const fanoutId = `fanout-${Date.now()}-${randomString(6)}`;
+  const msgIds = recipients.map(to =>
+    sendMessage(paths, from, to, priority, text, replyTo, { id: fanoutId, capability, recipients }),
+  );
+
+  return { fanoutId, capability, recipients, msgIds };
 }
