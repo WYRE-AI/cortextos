@@ -3,12 +3,13 @@ import { existsSync, unlinkSync, chmodSync, readFileSync } from 'fs';
 import { join, resolve as pathResolve } from 'path';
 import type { IPCRequest, IPCResponse, CronSummaryRow, CronDefinition } from '../types/index.js';
 import { AgentManager } from './agent-manager.js';
-import { getIpcPath } from '../utils/paths.js';
+import { getIpcPath, resolvePaths } from '../utils/paths.js';
 import { readCrons, getExecutionLog, getExecutionLogPage, addCron, updateCron, removeCron, getCronByName } from '../bus/crons.js';
 import type { ExecutionLogStatusFilter } from '../bus/crons.js';
 import { nextFireFromCron, computeReferenceMs } from './cron-scheduler.js';
 import { parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { computeHealth, aggregateFleetHealth } from '../utils/cron-health.js';
+import { logEvent } from '../bus/event.js';
 
 const WORKER_NAME_REGEX = /^[a-z0-9_-]+$/;
 
@@ -508,10 +509,38 @@ export class IPCServer {
   private server: Server | null = null;
   private socketPath: string;
   private agentManager: AgentManager;
+  private instanceId: string;
 
   constructor(agentManager: AgentManager, instanceId: string = 'default') {
     this.agentManager = agentManager;
+    this.instanceId = instanceId;
     this.socketPath = getIpcPath(instanceId);
+  }
+
+  /**
+   * Best-effort audit log for a cron mutation reaching this daemon (add-cron
+   * or remove-cron). Both CLI paths converge here, so this is the one choke
+   * point that covers every mutation regardless of caller.
+   *
+   * Never throws — a failure to log the audit trail must not fail (or roll
+   * back) a mutation that already succeeded on disk. Same discipline as
+   * removeCron's own tombstone write in bus/crons.ts.
+   */
+  private logCronMutation(
+    agent: string,
+    eventName: 'cron_added' | 'cron_removed',
+    metadata: Record<string, unknown>,
+  ): void {
+    try {
+      const org = this.agentManager.resolveAgentOrg(agent);
+      const paths = resolvePaths(agent, this.instanceId, org, this.agentManager.ctxRoot);
+      logEvent(paths, agent, org, 'action', eventName, 'info', metadata);
+    } catch (err) {
+      console.warn(
+        `[ipc-server] failed to log ${eventName} audit event for agent '${agent}': ` +
+        `${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 
   /**
@@ -838,13 +867,23 @@ export class IPCServer {
         }
 
         case 'add-cron': {
-          const result = handleAddCron(
-            request.agent,
-            request.data?.definition as Partial<CronDefinition> | undefined,
-          );
+          const addDef = request.data?.definition as Partial<CronDefinition> | undefined;
+          const result = handleAddCron(request.agent, addDef);
           if (result.ok) {
             // Trigger scheduler reload for this agent
             if (request.agent) this.agentManager.reloadCrons(request.agent);
+            if (request.agent && addDef?.name) {
+              // .trim() here matches handleAddCron's own fullDef.schedule
+              // (schedule.trim()) — without it, a caller passing a
+              // whitespace-padded schedule would log an audit trail that
+              // disagrees byte-for-byte with what actually landed in
+              // crons.json, the exact failure class this PR exists to close
+              // (infra's PR #166 review).
+              this.logCronMutation(request.agent, 'cron_added', {
+                cron: addDef.name,
+                schedule: addDef.schedule?.trim(),
+              });
+            }
             response = { success: true, data: { ok: true } };
           } else {
             response = { success: false, error: result.error ?? 'add-cron failed', data: result };
@@ -868,12 +907,22 @@ export class IPCServer {
         }
 
         case 'remove-cron': {
-          const result = handleRemoveCron(
-            request.agent,
-            request.data?.name as string | undefined,
-          );
+          const removeName = request.data?.name as string | undefined;
+          // Captured BEFORE the mutation — the cron is gone from crons.json
+          // (and from getCronByName) the instant handleRemoveCron succeeds,
+          // so this is the only point the old schedule is still readable.
+          const removed = request.agent && removeName
+            ? getCronByName(request.agent, removeName)
+            : undefined;
+          const result = handleRemoveCron(request.agent, removeName);
           if (result.ok) {
             if (request.agent) this.agentManager.reloadCrons(request.agent);
+            if (request.agent && removeName) {
+              this.logCronMutation(request.agent, 'cron_removed', {
+                cron: removeName,
+                old_schedule: removed?.schedule,
+              });
+            }
             response = { success: true, data: { ok: true } };
           } else {
             response = { success: false, error: result.error ?? 'remove-cron failed', data: result };
