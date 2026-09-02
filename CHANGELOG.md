@@ -159,6 +159,22 @@ field from `EcosystemConfig`, and all template/doc references (`analyst`'s
 untouched — it had already independently diverged from `templates/` and
 fixing that drift is separate, lower-urgency follow-up work.
 
+### Fixed — HEARTBEAT.md's KB-ingest log path collided across concurrent agents
+
+The canonical Step 10 background-ingest command wrote its log to
+`/tmp/kb-ingest-$$-<file>.log`, keyed only on the calling shell's PID. On a
+host running many agent sessions concurrently, `$$` is not unique across
+processes closely spaced in time — a single agent's heartbeat ingest log
+was observed interleaved with output from 7+ other agents' concurrent
+ingests, all writing to the same filename. The mandated completion check
+("the only valid signal is the literal text `Ingest complete` in that log")
+could therefore read a different agent's success or failure as its own.
+
+Namespaced the log filename by `$CTX_AGENT_NAME`:
+`/tmp/kb-ingest-${CTX_AGENT_NAME}-$$-<file>.log`. Template-only change; each
+live agent's own copy of HEARTBEAT.md still needs the same one-line edit
+applied separately (tracked in task_1787680328160_73134933).
+
 ### Added — `bus update-task --append-desc` — a task description can now be corrected without churning its ID
 
 A task description had no edit path after creation: `update-task` only
