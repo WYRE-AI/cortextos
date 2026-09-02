@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, checkStaleTasks, archiveTasks, checkHumanTasks } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, checkStaleTasks, checkBatchStaleness, STALE_IN_PROGRESS_MS, archiveTasks, checkHumanTasks } from '../../../src/bus/task';
 import { atomicWriteSync } from '../../../src/utils/atomic';
 import type { BusPaths, Task } from '../../../src/types';
 
@@ -152,6 +152,115 @@ describe('Advanced Task Management', () => {
       expect(report.stale_pending.length).toBe(0);
       expect(report.stale_human.length).toBe(0);
       expect(report.overdue.length).toBe(0);
+    });
+
+    it('agrees with checkBatchStaleness\'s default on the same in_progress task — single shared threshold, not two independently-typed literals', () => {
+      createBackdatedTask(paths, {
+        id: 'task_019_019',
+        title: 'Same task, two staleness checks',
+        status: 'in_progress',
+        project: 'cross-check-batch',
+        updated_at: hoursAgo(3), // past the shared 2h bar
+      });
+
+      expect(checkStaleTasks(paths).stale_in_progress.map(t => t.id)).toContain('task_019_019');
+      expect(checkBatchStaleness(paths, 'cross-check-batch').orphaned.map(t => t.id)).toEqual(['task_019_019']);
+    });
+  });
+
+  describe('checkBatchStaleness', () => {
+    it('flags an in_progress item past the default 2h threshold as orphaned, leaves a fresher one active', () => {
+      createBackdatedTask(paths, {
+        id: 'task_020_020',
+        title: 'Orphaned item',
+        status: 'in_progress',
+        project: 'batch-1',
+        updated_at: hoursAgo(3),
+      });
+      createBackdatedTask(paths, {
+        id: 'task_021_021',
+        title: 'Still being worked',
+        status: 'in_progress',
+        project: 'batch-1',
+        updated_at: hoursAgo(1),
+      });
+
+      const report = checkBatchStaleness(paths, 'batch-1');
+      expect(report.project).toBe('batch-1');
+      expect(report.stale_after_ms).toBe(STALE_IN_PROGRESS_MS); // 2h default
+      expect(report.total).toBe(2);
+      expect(report.orphaned.map(t => t.id)).toEqual(['task_020_020']);
+      expect(report.active.map(t => t.id)).toEqual(['task_021_021']);
+    });
+
+    it('buckets pending/completed/blocked/cancelled separately from the orphaned/active view', () => {
+      createBackdatedTask(paths, { id: 'task_022_022', status: 'pending', project: 'batch-2' });
+      createBackdatedTask(paths, { id: 'task_023_023', status: 'completed', project: 'batch-2' });
+      createBackdatedTask(paths, { id: 'task_024_024', status: 'blocked', project: 'batch-2' });
+      createBackdatedTask(paths, { id: 'task_025_025', status: 'cancelled', project: 'batch-2' });
+
+      const report = checkBatchStaleness(paths, 'batch-2');
+      expect(report.total).toBe(4);
+      expect(report.pending.map(t => t.id)).toEqual(['task_022_022']);
+      expect(report.completed).toBe(1);
+      expect(report.blocked).toBe(1);
+      expect(report.cancelled).toBe(1);
+      expect(report.orphaned).toEqual([]);
+      expect(report.active).toEqual([]);
+    });
+
+    it('scopes strictly to the given project id — a task under a different batch is invisible', () => {
+      createBackdatedTask(paths, {
+        id: 'task_026_026',
+        status: 'in_progress',
+        project: 'batch-3',
+        updated_at: hoursAgo(5),
+      });
+      createBackdatedTask(paths, {
+        id: 'task_027_027',
+        status: 'in_progress',
+        project: 'batch-other',
+        updated_at: hoursAgo(5),
+      });
+
+      const report = checkBatchStaleness(paths, 'batch-3');
+      expect(report.total).toBe(1);
+      expect(report.orphaned.map(t => t.id)).toEqual(['task_026_026']);
+    });
+
+    it('respects a custom --stale-after threshold instead of the 2h default', () => {
+      createBackdatedTask(paths, {
+        id: 'task_028_028',
+        status: 'in_progress',
+        project: 'batch-4',
+        updated_at: hoursAgo(0.75), // 45 min ago
+      });
+
+      // Under the 2h default this item is still "active".
+      const defaultReport = checkBatchStaleness(paths, 'batch-4');
+      expect(defaultReport.orphaned).toEqual([]);
+      expect(defaultReport.active.map(t => t.id)).toEqual(['task_028_028']);
+
+      // A tighter 30-minute threshold flags the same item as orphaned.
+      const tightReport = checkBatchStaleness(paths, 'batch-4', 30 * 60 * 1000);
+      expect(tightReport.stale_after_ms).toBe(1_800_000);
+      expect(tightReport.orphaned.map(t => t.id)).toEqual(['task_028_028']);
+      expect(tightReport.active).toEqual([]);
+    });
+
+    it('returns a well-shaped empty report for a batch id with no matching tasks', () => {
+      const report = checkBatchStaleness(paths, 'batch-does-not-exist');
+      expect(report).toEqual({
+        project: 'batch-does-not-exist',
+        stale_after_ms: STALE_IN_PROGRESS_MS,
+        total: 0,
+        orphaned: [],
+        active: [],
+        pending: [],
+        completed: 0,
+        blocked: 0,
+        cancelled: 0,
+      });
     });
   });
 

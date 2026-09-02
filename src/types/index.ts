@@ -700,6 +700,28 @@ export interface ArchiveReport {
   dry_run: boolean;
 }
 
+/**
+ * Health report for one dispatch-batch project (task_1787921691733_11462336) —
+ * the orphan-task-watchdog pattern: an `in_progress` item whose `updated_at`
+ * has gone stale is flagged explicitly as `orphaned` rather than left
+ * indistinguishable from one a live session is still genuinely working.
+ * Pure report, same posture as StaleTaskReport — never mutates task status.
+ */
+export interface BatchStalenessReport {
+  project: string;
+  stale_after_ms: number;
+  total: number;
+  /** in_progress, last updated longer than stale_after_ms ago — likely orphaned by a dead session. */
+  orphaned: Task[];
+  /** in_progress, still within the threshold — genuinely still being worked. */
+  active: Task[];
+  /** Not yet started. */
+  pending: Task[];
+  completed: number;
+  blocked: number;
+  cancelled: number;
+}
+
 // Environment / Context Types
 
 export interface CtxEnv {

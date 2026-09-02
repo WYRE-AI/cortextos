@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync } from 'fs';
 import { join } from 'path';
-import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport } from '../types/index.js';
+import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport, BatchStalenessReport } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
 import { validatePriority, validateTaskId } from '../utils/validate.js';
@@ -897,11 +897,20 @@ function readAllTasks(taskDir: string): Task[] {
 }
 
 /**
+ * Canonical "an in_progress task nobody has touched in this long is suspect"
+ * bar, in ms. Single source of truth for both {@link checkStaleTasks} (which
+ * needs it in seconds) and {@link checkBatchStaleness}'s default threshold,
+ * so the two can't silently drift apart the way two independently-typed
+ * literals would.
+ */
+export const STALE_IN_PROGRESS_MS = 7_200_000; // 2h
+
+/**
  * Check for stale tasks. Matches bash check-stale-tasks.sh behavior.
  */
 export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
   const nowEpoch = Math.floor(Date.now() / 1000);
-  const STALE_IN_PROGRESS = 7200;   // 2 hours
+  const STALE_IN_PROGRESS = STALE_IN_PROGRESS_MS / 1000;
   const STALE_PENDING = 86400;      // 24 hours
   const STALE_HUMAN = 86400;        // 24 hours
 
@@ -948,6 +957,58 @@ export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
       if (dueEpoch > 0 && nowEpoch > dueEpoch) {
         report.overdue.push(task);
       }
+    }
+  }
+
+  return report;
+}
+
+/**
+ * Orphan-task-watchdog for one dispatch-batch project (task_1787921691733_11462336):
+ * flags in_progress items last updated more than `staleAfterMs` ago as
+ * `orphaned` rather than trusting "in_progress" forever. Pure report, same
+ * posture as {@link checkStaleTasks} — never mutates a task's status.
+ */
+export function checkBatchStaleness(
+  paths: BusPaths,
+  project: string,
+  staleAfterMs: number = STALE_IN_PROGRESS_MS,
+): BatchStalenessReport {
+  const nowEpoch = Date.now();
+  const report: BatchStalenessReport = {
+    project,
+    stale_after_ms: staleAfterMs,
+    total: 0,
+    orphaned: [],
+    active: [],
+    pending: [],
+    completed: 0,
+    blocked: 0,
+    cancelled: 0,
+  };
+
+  for (const task of readAllTasks(paths.taskDir)) {
+    if (task.project !== project) continue;
+    report.total++;
+
+    switch (task.status) {
+      case 'in_progress': {
+        const age = nowEpoch - new Date(task.updated_at).getTime();
+        (age > staleAfterMs ? report.orphaned : report.active).push(task);
+        break;
+      }
+      case 'pending':
+        report.pending.push(task);
+        break;
+      case 'completed':
+        report.completed++;
+        break;
+      case 'blocked':
+        report.blocked++;
+        break;
+      case 'cancelled':
+        report.cancelled++;
+        break;
     }
   }
 
