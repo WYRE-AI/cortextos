@@ -275,6 +275,107 @@ const PRECEDENT_CITATION_CUE_REGEX =
 const PRECEDENT_CUE_WINDOW_BEFORE = 80;
 const PRECEDENT_CUE_WINDOW_AFTER = 40;
 
+// task_1788228644615 (grower's report, 2026-09-01): a PR reference that has
+// already been investigated and explicitly dismissed as a false positive
+// keeps re-flagging identically on every subsequent scan — grower's #1424
+// case hit this 6 times for zero new information, because each re-verify
+// note RE-MENTIONS the same "PR #NNNN" string right next to its dismissal
+// (e.g. "...same tool artifact (bare 'PR #1424' text match)"), and the
+// precedent-citation check above only looks at the window around the
+// ORIGINAL mention, not later re-mentions appended by the checker's own
+// follow-up notes.
+//
+// "tool artifact" is deliberately the only cue here, not a broader set like
+// "already resolved" — that phrase is common enough in ordinary prose that
+// using it as a suppression trigger risks silently hiding a genuinely still-
+// open reference that happens to share the wording. "tool artifact" is the
+// specific, narrow phrase this org's own re-verify convention already
+// converged on for exactly this dismissal (verified against the live task
+// corpus before adding: appears exactly twice across every task on disk,
+// both instances being this exact case) — same "narrow explicit cue over
+// broad heuristic" choice the precedent-citation regex already makes.
+//
+// Unlike isPrecedentCitation, this checks ALL occurrences of a given PR
+// reference in the full text, not just the one matchAll happened to find —
+// a dismissal note appended much later (often hundreds of characters past
+// the original mention) is exactly the shape that needs catching, and a
+// windowed check anchored only to the first occurrence would miss it.
+const DISMISSAL_MARKER_CUE_REGEX = /\btool artifact\b/gi;
+const DISMISSAL_CUE_WINDOW = 120;
+
+// task_1788276323687 (grower, non-author review of the PR that introduced
+// isDismissedElsewhere): the marker check above had no negation awareness —
+// "this is NOT a tool artifact, PR #67 is a genuine still-open blocker"
+// matched the bare phrase and wrongly suppressed a real blocker, the exact
+// failure this whole mechanism exists to prevent, just from the opposite
+// direction (a false dismissal instead of a missing one). A negated mention
+// of the idiom is plausible prose for an agent re-verifying a genuinely open
+// reference while explicitly ruling the idiom out, not a contrived case.
+//
+// Fix stays in the same "narrow explicit cue" register as the marker itself:
+// look at the ~20 chars immediately before each "tool artifact" match for a
+// negation word ANYWHERE in that span (not anchored to sit directly against
+// the match), and only count that occurrence as a genuine dismissal if no
+// negation appears in its lookback. A window can contain multiple
+// occurrences of the marker phrase; one negated occurrence does not
+// invalidate another, genuinely un-negated one elsewhere in the same window.
+//
+// Deliberately NOT anchored to end immediately before the marker (e.g. via a
+// trailing `$` after the negation word) — grower's own follow-up review
+// found that an anchored version still missed "not really a tool artifact"
+// (task_1788276326374's sibling finding), because the intervening adverb
+// broke the adjacency. A short, unanchored lookback catches that case too.
+//
+// KNOWN LIMITATION, not solved here (grower, 3rd-round review of this same
+// function): an UNRELATED negation elsewhere in the lookback can still be
+// wrongly attributed to the marker — "He is not here, this is a tool
+// artifact, PR #67 already dismissed." has "not" negating "here", landing
+// inside the 20-char window ahead of "tool artifact", so this occurrence is
+// wrongly read as negated and the genuine dismissal gets missed (the PR
+// re-flags despite already being resolved — the original #167 bug,
+// reintroduced in this one narrow shape). Two candidate fixes were tried and
+// both introduced a DIFFERENT regression when checked against the full test
+// matrix rather than just the new counterexample: a clause-boundary stop
+// (comma/period/`--`) fixes this case but breaks the "unrelated mention
+// elsewhere" test (a genuine dismissal for one PR reference bleeds across
+// and wrongly suppresses an unrelated one); a sentence-boundary-only variant
+// (period only) fixes that but reopens 3 other cases, including this one.
+// Conclusion: a punctuation-boundary heuristic cannot reliably disambiguate
+// "does this negation modify the marker, or something else nearby" — this
+// is a genuine natural-language-scoping problem, not a one-line fix waiting
+// to be found. Left as-is rather than shipping a narrower fix against an
+// ever-growing adversarial-example list; see task_1788305871620_29811457
+// for the full 8-case matrix both failed attempts were checked against, and
+// for whoever picks this up next.
+const NEGATION_CUE_REGEX = /\b(not|isn't|isnt|wasn't|wasnt|never|no longer)\b/i;
+const NEGATION_LOOKBACK = 20;
+
+function hasGenuineDismissalMarker(window: string): boolean {
+  for (const m of window.matchAll(DISMISSAL_MARKER_CUE_REGEX)) {
+    const matchIndex = m.index ?? 0;
+    const precedingStart = Math.max(0, matchIndex - NEGATION_LOOKBACK);
+    const preceding = window.slice(precedingStart, matchIndex);
+    if (!NEGATION_CUE_REGEX.test(preceding)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isDismissedElsewhere(text: string, prRef: string): boolean {
+  const escaped = prRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const mentionRegex = new RegExp(escaped, 'gi');
+  for (const m of text.matchAll(mentionRegex)) {
+    const matchIndex = m.index ?? 0;
+    const windowStart = Math.max(0, matchIndex - DISMISSAL_CUE_WINDOW);
+    const windowEnd = matchIndex + m[0].length + DISMISSAL_CUE_WINDOW;
+    if (hasGenuineDismissalMarker(text.slice(windowStart, windowEnd))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isPrecedentCitation(
   text: string,
   matchIndex: number,
@@ -381,7 +482,7 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
         }
         previousMatchEnd = matchIndex + m[0].length;
       }
-      const refs = [...new Set(keptRefs)];
+      const refs = [...new Set(keptRefs)].filter(ref => !isDismissedElsewhere(text, ref));
       if (refs.length > 0) {
         entries.push({
           task_id: task.id,

@@ -392,6 +392,122 @@ describe('Bus System', () => {
       expect(report.entries).toHaveLength(0);
     });
 
+    // task_1788228644615 (grower's report, 2026-09-01): a real-world
+    // reproduction — grower's task re-mentioned "PR #1424" in every
+    // check-stale-blockers re-verify note explaining why it was already
+    // dismissed, and kept re-flagging identically 6 times for zero new
+    // information because the dismissal note sits far past the original
+    // mention, outside the precedent-citation window.
+    it('does not re-flag a PR reference already dismissed elsewhere in the text as a "tool artifact"', () => {
+      writeTask('myorg', {
+        id: 'task_dismissed',
+        title: 'Trialing rows with NULL current_period_end',
+        status: 'blocked',
+        description:
+          'Related: documented in-code by conduit PR #1424 as 13 verified against prod. ' +
+          '--- APPENDED later ---\n' +
+          "re-verify: already resolved 3x -- re-flag is a tool artifact of the bare 'PR #1424' text, not new info.",
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('still flags a genuine PR reference when "tool artifact" appears but not near that PR number', () => {
+      writeTask('myorg', {
+        id: 'task_unrelated_dismissal',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'A prior finding here (PR #55) was a tool artifact of an unrelated regex bug, already fixed. ' +
+          'This task itself is genuinely blocked on PR#67 merging.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+      expect(report.entries[0].detail).not.toContain('PR #55');
+    });
+
+    it('does not suppress a PR reference on the generic word "resolved" alone, only the narrow "tool artifact" cue', () => {
+      writeTask('myorg', {
+        id: 'task_generic_resolved',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'Still blocked on PR #67 — the upstream discussion was resolved but the merge has not happened.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    // task_1788276323687 (grower, non-author review of #167): a NEGATED
+    // mention of the dismissal idiom ("this is NOT a tool artifact") was
+    // wrongly treated as a genuine dismissal, silently suppressing a real
+    // still-open blocker — the exact failure #167 itself was fixing, from
+    // the opposite direction.
+    it('still flags a PR reference when "tool artifact" appears negated ("NOT a tool artifact")', () => {
+      writeTask('myorg', {
+        id: 'task_negated_dismissal',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'Checked carefully -- this is NOT a tool artifact, PR #67 is a genuine still-open blocker.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    it('still suppresses a genuinely dismissed reference when a DIFFERENT, non-negated "tool artifact" mention exists in the same window', () => {
+      writeTask('myorg', {
+        id: 'task_mixed_negation',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'Re-verify: this is NOT a tool artifact -- wait, actually on closer look it IS a tool artifact, PR #67 was already resolved elsewhere.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    // task_1788276326374's sibling finding (grower's delta review of the
+    // negation fix itself): an intervening adverb between the negation word
+    // and "a tool artifact" defeated an end-anchored negation check.
+    it('still flags a PR reference when an adverb intervenes ("not really a tool artifact")', () => {
+      writeTask('myorg', {
+        id: 'task_negated_adverb',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'This is not really a tool artifact, PR #67 is a genuine blocker.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    it('still suppresses a genuine dismissal even when an unrelated negation appears earlier in the same sentence, outside the lookback window', () => {
+      writeTask('myorg', {
+        id: 'task_unrelated_negation',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'Status update: task is not resolved, separately it is a tool artifact, PR #67 was closed.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
     it('does not flag a blocked task with no dependency signal at all, and does not count it as eligible', () => {
       writeTask('myorg', {
         id: 'task_plain',
