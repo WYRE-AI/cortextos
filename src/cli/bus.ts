@@ -5,7 +5,8 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInboxWithStatus, ackInbox } from '../bus/message.js';
-import { validateAgentName, validateTaskId, validatePriority } from '../utils/validate.js';
+import { sendToCapability } from '../bus/agents.js';
+import { validateAgentName, validateTaskId, validatePriority, validateCapability } from '../utils/validate.js';
 import { randomDigits } from '../utils/random.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
@@ -86,6 +87,38 @@ function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org:
   return null;
 }
 
+/**
+ * Shared preamble for `send-message` and `send-relay`: validate `priority`
+ * against the fixed priority list and resolve the message body (inline arg,
+ * "-"/stdin, or --body-file) with the same fail-closed handling both commands
+ * need (2026-08-15 fleet incidents — see src/utils/resolve-message-body.ts:
+ * an inline body containing a surviving backtick/$( is rejected loud rather
+ * than sent with silently-substituted holes in it). Exits the process on
+ * either failure, matching both commands' pre-existing behavior.
+ */
+function resolveSendPriorityAndBody(
+  priority: string,
+  text: string | undefined,
+  opts: { bodyFile?: string },
+): { priority: Priority; text: string } {
+  const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
+  if (!validPriorities.includes(priority as Priority)) {
+    console.error(`Invalid priority '${priority}'. Must be one of: ${validPriorities.join(', ')}`);
+    process.exit(1);
+  }
+  let resolvedText: string;
+  try {
+    resolvedText = resolveMessageBody({ inlineText: text, bodyFile: opts.bodyFile });
+  } catch (err) {
+    if (err instanceof UnsafeInlineBodyError) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
+  return { priority: priority as Priority, text: resolvedText };
+}
+
 export const busCommand = new Command('bus')
   .description('Bus commands for agent messaging, tasks, and events');
 
@@ -100,26 +133,7 @@ busCommand
   .action((to: string, priority: string, text: string | undefined, replyToArg: string | undefined, opts: { replyTo?: string; bodyFile?: string }) => {
     // Accept reply-to as either positional arg or --reply-to flag (P2 fix #9)
     const effectiveReplyTo = opts.replyTo ?? replyToArg;
-    const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
-    if (!validPriorities.includes(priority as Priority)) {
-      console.error(`Invalid priority '${priority}'. Must be one of: ${validPriorities.join(', ')}`);
-      process.exit(1);
-    }
-    // Fail-closed body resolution (2026-08-15 fleet incidents — see
-    // src/utils/resolve-message-body.ts): --body-file/stdin are the safe
-    // default path; an inline body containing a surviving backtick/$( is
-    // rejected loud rather than sent with silently-substituted holes in it.
-    let resolvedText: string;
-    try {
-      resolvedText = resolveMessageBody({ inlineText: text, bodyFile: opts.bodyFile });
-    } catch (err) {
-      if (err instanceof UnsafeInlineBodyError) {
-        console.error(err.message);
-        process.exit(1);
-      }
-      throw err;
-    }
-    text = resolvedText;
+    const resolved = resolveSendPriorityAndBody(priority, text, opts);
     // Security (H9): Validate agent name (bare or qualified) before any filesystem access.
     // parseQualifiedName accepts both "boss" and "aaron/dev" forms, validating each segment.
     try {
@@ -154,11 +168,53 @@ busCommand
       console.error(`Warning: agent '${to}' not found in project. Message will be queued but may never be read.`);
     }
 
-    const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
+    const msgId = sendMessage(paths, env.agentName, to, resolved.priority, resolved.text, effectiveReplyTo);
     try {
-      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
+      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority: resolved.priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
     } catch { /* non-fatal */ }
     console.log(msgId);
+  });
+
+busCommand
+  .command('send-relay')
+  .description('Fan a message out to every enabled agent tagged with a capability instead of addressing one hardcoded agent name. First recipient to run ack-inbox on it wins -- the other tagged agents\' pending copies get cancelled. Fix for the "angela-relay" single point of failure (task_1788300871646_92090539); modeled on Hermes\'s a2a_orchestrate(mode="first") (task_1788300304747_69074594).')
+  .argument('<capability>', 'Capability tag (see "capabilities" in an agent\'s config.json) -- fans out to every enabled agent carrying this tag')
+  .argument('<priority>', 'Message priority (urgent, high, normal, low)')
+  .argument('[text]', 'Message text. Omit the argument, or pass "-", to read the body from stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical.')
+  .argument('[reply-to]', 'Reply to message ID (optional positional form)')
+  .option('--reply-to <id>', 'Reply to message ID')
+  .option('--body-file <path>', 'Read the message body from a file instead of the shell argument or stdin — the safe way to send a body containing backticks, $(, or apostrophes byte-identical')
+  .action((capability: string, priority: string, text: string | undefined, replyToArg: string | undefined, opts: { replyTo?: string; bodyFile?: string }) => {
+    const effectiveReplyTo = opts.replyTo ?? replyToArg;
+    const resolved = resolveSendPriorityAndBody(priority, text, opts);
+    try {
+      validateCapability(capability);
+    } catch (err) {
+      console.error(String(err));
+      process.exit(1);
+    }
+
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
+
+    let result;
+    try {
+      result = sendToCapability(paths, env.agentName, env.org, capability, resolved.priority, resolved.text, effectiveReplyTo);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+      return;
+    }
+    try {
+      logEvent(paths, env.agentName, env.org, 'message', 'agent_relay_sent', 'info', JSON.stringify({
+        capability,
+        priority: resolved.priority,
+        recipients: result.recipients,
+        fanout_id: result.fanoutId,
+        reply_to: effectiveReplyTo ?? null,
+      }));
+    } catch { /* non-fatal */ }
+    console.log(JSON.stringify({ fanout_id: result.fanoutId, recipients: result.recipients, msg_ids: result.msgIds }));
   });
 
 busCommand

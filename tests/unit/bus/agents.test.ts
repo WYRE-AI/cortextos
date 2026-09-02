@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { listAgents, notifyAgent } from '../../../src/bus/agents';
+import { listAgents, notifyAgent, getAgentsWithCapability, sendToCapability } from '../../../src/bus/agents';
+import { checkInbox } from '../../../src/bus/message';
 import type { BusPaths } from '../../../src/types';
 
 describe('Agent Discovery', () => {
@@ -252,6 +253,137 @@ describe('Agent Discovery', () => {
       notifyAgent(paths, 'sender', 'newagent', 'Hello', ctxRoot);
 
       expect(existsSync(stateDir)).toBe(true);
+    });
+  });
+});
+
+// Capability-tagged relay fan-out (task_1788300871646_92090539 — fix for the
+// "angela-relay" single point of failure). Modeled on Hermes's
+// a2a_orchestrate(capability, mode="first") (task_1788300304747_69074594).
+describe('getAgentsWithCapability / sendToCapability', () => {
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-relay-test-'));
+    ctxRoot = testDir;
+    frameworkRoot = join(testDir, 'framework');
+    process.env.CTX_FRAMEWORK_ROOT = frameworkRoot;
+    delete process.env.CTX_PROJECT_ROOT;
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+    delete process.env.CTX_FRAMEWORK_ROOT;
+    delete process.env.CTX_PROJECT_ROOT;
+  });
+
+  function writeAgentConfig(org: string, name: string, config: Record<string, unknown>): void {
+    const dir = join(frameworkRoot, 'orgs', org, 'agents', name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'config.json'), JSON.stringify(config));
+  }
+
+  function pathsFor(agent: string): BusPaths {
+    return {
+      ctxRoot,
+      inbox: join(ctxRoot, 'inbox', agent),
+      inflight: join(ctxRoot, 'inflight', agent),
+      processed: join(ctxRoot, 'processed', agent),
+      logDir: join(ctxRoot, 'logs', agent),
+      stateDir: join(ctxRoot, 'state', agent),
+      taskDir: join(ctxRoot, 'orgs', 'acme', 'tasks'),
+      approvalDir: join(ctxRoot, 'orgs', 'acme', 'approvals'),
+      analyticsDir: join(ctxRoot, 'orgs', 'acme', 'analytics'),
+      deliverablesDir: join(ctxRoot, 'orgs', 'acme', 'deliverables'),
+    };
+  }
+
+  describe('getAgentsWithCapability', () => {
+    it('returns only enabled agents tagged with the capability', () => {
+      writeAgentConfig('acme', 'boss', { capabilities: ['comms-relay'] });
+      writeAgentConfig('acme', 'backup', { capabilities: ['comms-relay'] });
+      writeAgentConfig('acme', 'worker', { capabilities: ['other-tag'] });
+      writeAgentConfig('acme', 'untagged', {});
+
+      const tagged = getAgentsWithCapability(ctxRoot, 'acme', 'comms-relay');
+      expect(tagged.sort()).toEqual(['backup', 'boss']);
+    });
+
+    it('excludes a tagged agent explicitly disabled via enabled-agents.json', () => {
+      writeAgentConfig('acme', 'boss', { capabilities: ['comms-relay'] });
+      writeAgentConfig('acme', 'backup', { capabilities: ['comms-relay'] });
+      const configDir = join(ctxRoot, 'config');
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(
+        join(configDir, 'enabled-agents.json'),
+        JSON.stringify({ boss: { org: 'acme', enabled: false } }),
+      );
+
+      // A disabled relay candidate must not receive fan-out traffic nobody
+      // expects it to process.
+      expect(getAgentsWithCapability(ctxRoot, 'acme', 'comms-relay')).toEqual(['backup']);
+    });
+
+    it('returns an empty array when no agent carries the capability', () => {
+      writeAgentConfig('acme', 'boss', { capabilities: ['other-tag'] });
+      expect(getAgentsWithCapability(ctxRoot, 'acme', 'comms-relay')).toEqual([]);
+    });
+
+    it('skips a corrupt config.json rather than hiding every other candidate', () => {
+      const brokenDir = join(frameworkRoot, 'orgs', 'acme', 'agents', 'broken');
+      mkdirSync(brokenDir, { recursive: true });
+      writeFileSync(join(brokenDir, 'config.json'), '{not json');
+      writeAgentConfig('acme', 'boss', { capabilities: ['comms-relay'] });
+
+      expect(getAgentsWithCapability(ctxRoot, 'acme', 'comms-relay')).toEqual(['boss']);
+    });
+
+    it('rejects an invalid capability tag', () => {
+      expect(() => getAgentsWithCapability(ctxRoot, 'acme', 'Not Valid!')).toThrow();
+    });
+  });
+
+  describe('sendToCapability', () => {
+    it('fans a message out to every tagged agent, sharing one fanout id', () => {
+      writeAgentConfig('acme', 'boss', { capabilities: ['comms-relay'] });
+      writeAgentConfig('acme', 'backup', { capabilities: ['comms-relay'] });
+
+      const result = sendToCapability(
+        pathsFor('sender'), 'sender', 'acme', 'comms-relay', 'high', 'cross-boundary msg',
+      );
+
+      expect(result.capability).toBe('comms-relay');
+      expect(result.recipients.sort()).toEqual(['backup', 'boss']);
+      expect(result.msgIds.length).toBe(2);
+
+      const bossInbox = readdirSync(join(ctxRoot, 'inbox', 'boss')).filter(f => f.endsWith('.json'));
+      const backupInbox = readdirSync(join(ctxRoot, 'inbox', 'backup')).filter(f => f.endsWith('.json'));
+      expect(bossInbox.length).toBe(1);
+      expect(backupInbox.length).toBe(1);
+
+      const bossMsg = JSON.parse(readFileSync(join(ctxRoot, 'inbox', 'boss', bossInbox[0]), 'utf-8'));
+      const backupMsg = JSON.parse(readFileSync(join(ctxRoot, 'inbox', 'backup', backupInbox[0]), 'utf-8'));
+      expect(bossMsg.fanout.id).toBe(result.fanoutId);
+      expect(bossMsg.fanout.id).toBe(backupMsg.fanout.id);
+      expect(bossMsg.text).toBe('cross-boundary msg');
+    });
+
+    it('throws when no agent carries the capability, instead of silently reaching nobody', () => {
+      expect(() =>
+        sendToCapability(pathsFor('sender'), 'sender', 'acme', 'comms-relay', 'normal', 'hello'),
+      ).toThrow(/No enabled agent/);
+    });
+
+    it('checkInbox on a tagged recipient finds its own copy', () => {
+      writeAgentConfig('acme', 'boss', { capabilities: ['comms-relay'] });
+      writeAgentConfig('acme', 'backup', { capabilities: ['comms-relay'] });
+      sendToCapability(pathsFor('sender'), 'sender', 'acme', 'comms-relay', 'normal', 'hi');
+
+      const bossMessages = checkInbox(pathsFor('boss'));
+      expect(bossMessages.length).toBe(1);
+      expect(bossMessages[0].text).toBe('hi');
     });
   });
 });

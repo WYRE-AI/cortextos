@@ -7,6 +7,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { acquireLock, releaseLock } from '../utils/lock.js';
 import { randomString } from '../utils/random.js';
 import { validateAgentName, validatePriority } from '../utils/validate.js';
+import { resolvePaths } from '../utils/paths.js';
 
 // ---------------------------------------------------------------------------
 // Security (H10): HMAC-SHA256 message signing
@@ -47,6 +48,10 @@ function signPayload(msgId: string, from: string, to: string, text: string): str
  * Send a message to another agent's inbox.
  * Creates a JSON file with format: {pnum}-{epochMs}-from-{sender}-{rand5}.json
  * Identical to bash send-message.sh output.
+ *
+ * @param fanout Internal — set by `sendToCapability` (src/bus/agents.ts) to
+ *   tag this message as one copy of a capability-tagged fan-out. Do not set
+ *   this from a normal single-recipient send; see InboxMessage.fanout.
  */
 export function sendMessage(
   paths: BusPaths,
@@ -55,6 +60,7 @@ export function sendMessage(
   priority: Priority,
   text: string,
   replyTo?: string,
+  fanout?: { id: string; capability: string; recipients: string[] },
 ): string {
   validateAgentName(from);
   validateAgentName(to);
@@ -77,6 +83,7 @@ export function sendMessage(
     text,
     reply_to: replyTo || null,
     ...(signingKey ? { sig: hmacSign(signingKey, signPayload(msgId, from, to, text)) } : {}),
+    ...(fanout ? { fanout } : {}),
   };
 
   // Write to target agent's inbox
@@ -223,6 +230,13 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
 /**
  * Acknowledge a message by moving it from inflight to processed.
  * Identical to bash ack-inbox.sh behavior.
+ *
+ * First-ack-wins: if the acked message is one copy of a capability-tagged
+ * fan-out (InboxMessage.fanout — see `sendToCapability` in bus/agents.ts),
+ * this also cancels the sibling copies still sitting in the OTHER tagged
+ * recipients' inbox/inflight, so only the first agent to ack processes it.
+ * Cleanup is best-effort: a failure there never undoes the ack that already
+ * succeeded.
  */
 export function ackInbox(paths: BusPaths, messageId: string): void {
   const { inflight, processed } = paths;
@@ -243,10 +257,93 @@ export function ackInbox(paths: BusPaths, messageId: string): void {
       const msg = JSON.parse(content);
       if (msg.id === messageId) {
         renameSync(filePath, join(processed, file));
+        if (msg.fanout?.id && Array.isArray(msg.fanout.recipients)) {
+          try {
+            cancelFanoutSiblings(paths.ctxRoot, msg.fanout.id, msg.fanout.recipients, msg.to);
+          } catch {
+            // Best-effort — the ack itself already succeeded.
+          }
+        }
         return;
       }
     } catch {
       // Skip corrupt files
+    }
+  }
+}
+
+/**
+ * First-ack-wins cleanup for a capability-tagged fan-out (Gap 4 /
+ * "angela-relay SPOF" fix — task_1788300871646_92090539). Called from
+ * `ackInbox` once the winning copy has been acked: for every OTHER tagged
+ * recipient, finds their still-pending copy of the SAME fan-out (matched by
+ * `fanout.id`) in either `inbox/` (never checked) or `inflight/` (checked
+ * but not yet acked) and moves it to a `.superseded/` quarantine dir —
+ * mirroring the `.errors/` pattern `checkInboxWithStatus` already uses for
+ * rejected messages. `.superseded/` is invisible to both `checkInboxWithStatus`
+ * (only reads plain `*.json` directly under `inbox/`) and a later `ackInbox`
+ * scan of `inflight/`, so a backup relay that hasn't gotten to the message
+ * yet simply never sees it once someone else has already handled it — kept
+ * on disk rather than deleted, for audit.
+ *
+ * Paths are resolved via `resolvePaths` (same helper every other bus path
+ * comes from) rather than hand-joining `ctxRoot`/dirName/recipient — the
+ * instanceId/org arguments it also takes aren't needed for inbox/inflight
+ * (only ctxRoot + agent name determine those two), so 'default' is a safe
+ * placeholder here, never used to build the paths this function reads.
+ */
+function cancelFanoutSiblings(
+  ctxRoot: string,
+  fanoutId: string,
+  recipients: string[],
+  winner: string,
+): void {
+  for (const recipient of recipients) {
+    if (recipient === winner) continue;
+    const siblingPaths = resolvePaths(recipient, 'default', undefined, ctxRoot);
+
+    // inbox/: protected by the SAME lock checkInboxWithStatus takes on this
+    // directory, so a concurrent poll of the sibling's own inbox can't race
+    // this cleanup. Best-effort — if the lock is held, skip this recipient's
+    // inbox rather than block or steal it; worst case the sibling processes
+    // one redundant copy, the same outcome first-ack-wins already tolerates.
+    if (acquireLock(siblingPaths.inbox)) {
+      try {
+        supersedeFanoutCopies(siblingPaths.inbox, fanoutId);
+      } finally {
+        releaseLock(siblingPaths.inbox);
+      }
+    }
+
+    // inflight/ has no lock anywhere in this codebase — only the owning
+    // agent's own session ever reads/writes its own inflight (see ackInbox
+    // above, which doesn't lock it either), so adding one here would be new,
+    // asymmetric protection for a directory nothing else protects. Scan it
+    // unlocked, same as every other inflight access.
+    supersedeFanoutCopies(siblingPaths.inflight, fanoutId);
+  }
+}
+
+/** Move every `*.json` in `dir` whose `fanout.id` matches into `dir/.superseded/`. */
+function supersedeFanoutCopies(dir: string, fanoutId: string): void {
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter(f => f.endsWith('.json'));
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const filePath = join(dir, file);
+    try {
+      const sibling = JSON.parse(readFileSync(filePath, 'utf-8'));
+      if (sibling?.fanout?.id === fanoutId) {
+        const supersededDir = join(dir, '.superseded');
+        ensureDir(supersededDir);
+        renameSync(filePath, join(supersededDir, file));
+      }
+    } catch {
+      // Corrupt/unreadable sibling file — leave it for its own recipient
+      // to sort out; never let cleanup throw.
     }
   }
 }
