@@ -292,13 +292,51 @@ def _retry_generate_content(client, *, model, contents, backoffs=(5, 15, 45)):
     raise last_err if last_err else RuntimeError("retry loop completed without response or error")
 
 
+def _retry_embed_content(client, *, model, contents, embed_config, backoffs=(5, 15, 45)):
+    """Call client.models.embed_content with bounded retries on transient APIErrors.
+
+    Mirrors _retry_generate_content above (same TRANSIENT_HTTP_CODES/TRANSIENT_STATUS_NAMES
+    classification, same default backoff shape) — added 2026-09-03 (task_1788420454462_38838015)
+    because embed_content had NO retry at all, unlike generate_content. This matters specifically
+    for a large text file: chunk_text() on a file the size of MEMORY.md produces 200+ chunks
+    embedded back-to-back in a tight loop with zero pacing, so a 429 tripped by the file's OWN
+    chunk volume (confirmed 2026-09-03: a 2nd chunk-sized embed_content call 429'd with ZERO other
+    agents contending) previously killed the entire rest of that ingest run — every subsequent
+    chunk in the same loop also 429'd, since nothing paused for the quota to recover. adoption's
+    MEMORY.md failed 5 consecutive ingests across 3 already-staggered heartbeat cycles, proving
+    stagger alone does not fix an intra-file burst. This does not fix that structural gap either
+    (it still bails after backoffs is exhausted) — it turns "the rest of this file's chunks are all
+    doomed once one 429s" into "this one chunk pauses and retries", which is a materially different
+    and much better failure mode for a multi-hundred-chunk file. Verify empirically against
+    adoption's next MEMORY.md ingest attempts; this backoff shape is inherited from
+    _retry_generate_content, not independently tuned for embedding's burst characteristics.
+    """
+    from google.genai import errors as _genai_errors
+    last_err = None
+    for attempt, backoff in enumerate(backoffs, start=1):
+        try:
+            return client.models.embed_content(model=model, contents=contents, config=embed_config)
+        except _genai_errors.APIError as e:
+            last_err = e
+            is_transient = (e.code in TRANSIENT_HTTP_CODES) or (e.status in TRANSIENT_STATUS_NAMES)
+            if not is_transient:
+                raise
+            if attempt < len(backoffs):
+                print(f"    Transient error (HTTP {e.code} {e.status or ''}) on embed_content; retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
+                time.sleep(backoff)
+            else:
+                print(f"    Exhausted retries on transient embed_content error: HTTP {e.code} {e.status or ''}")
+    raise last_err if last_err else RuntimeError("retry loop completed without response or error")
+
+
 def embed_content(client, config, content, task_type="RETRIEVAL_DOCUMENT"):
     """Embed content using Gemini Embedding 2. Content can be text string or list of Parts."""
     from google.genai import types
-    result = client.models.embed_content(
+    result = _retry_embed_content(
+        client,
         model=config.get("embedding_model", "gemini-embedding-2-preview"),
         contents=content,
-        config=types.EmbedContentConfig(
+        embed_config=types.EmbedContentConfig(
             output_dimensionality=config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS),
             task_type=task_type,
         ),
