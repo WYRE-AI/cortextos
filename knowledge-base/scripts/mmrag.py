@@ -264,82 +264,53 @@ def get_genai_client(api_key):
     return genai.Client(api_key=api_key)
 
 
-def _retry_generate_content(client, *, model, contents, backoffs=(5, 15, 45)):
-    """Call client.models.generate_content with bounded retries on transient APIErrors.
+def _retry_with_backoff(fn, *, label, backoffs=(5, 15, 45)):
+    """Call the zero-arg `fn` with bounded retries on transient APIErrors.
 
     Retries on HTTP code in TRANSIENT_HTTP_CODES or status name in
     TRANSIENT_STATUS_NAMES; re-raises immediately on any other APIError (auth,
     malformed request, etc.); re-raises last_err after all attempts exhausted.
+    `label` is used only in log lines, to say which call is retrying.
 
     backoffs is a tuple of sleep seconds between attempts. len(backoffs) is the
     attempt count. Tests pass (0, 0, 0) to skip sleeps.
+
+    Single implementation shared by generate_content and embed_content (was two
+    near-identical ~25-line copies until 2026-09-03, task_1788420454462_38838015
+    — embed_content had no retry at all, generate_content already did; adding a
+    second copy for embed_content was caught in review as the wrong depth for
+    the fix and collapsed into this shared version instead. A third API surface
+    needing retry needs only a `fn` callable, not a third copy of this loop).
     """
     from google.genai import errors as _genai_errors
     last_err = None
     for attempt, backoff in enumerate(backoffs, start=1):
         try:
-            return client.models.generate_content(model=model, contents=contents)
+            return fn()
         except _genai_errors.APIError as e:
             last_err = e
             is_transient = (e.code in TRANSIENT_HTTP_CODES) or (e.status in TRANSIENT_STATUS_NAMES)
             if not is_transient:
                 raise
             if attempt < len(backoffs):
-                print(f"    Transient error (HTTP {e.code} {e.status or ''}); retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
+                print(f"    Transient error (HTTP {e.code} {e.status or ''}) on {label}; retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
                 time.sleep(backoff)
             else:
-                print(f"    Exhausted retries on transient error: HTTP {e.code} {e.status or ''}")
-    raise last_err if last_err else RuntimeError("retry loop completed without response or error")
-
-
-def _retry_embed_content(client, *, model, contents, embed_config, backoffs=(5, 15, 45)):
-    """Call client.models.embed_content with bounded retries on transient APIErrors.
-
-    Mirrors _retry_generate_content above (same TRANSIENT_HTTP_CODES/TRANSIENT_STATUS_NAMES
-    classification, same default backoff shape) — added 2026-09-03 (task_1788420454462_38838015)
-    because embed_content had NO retry at all, unlike generate_content. This matters specifically
-    for a large text file: chunk_text() on a file the size of MEMORY.md produces 200+ chunks
-    embedded back-to-back in a tight loop with zero pacing, so a 429 tripped by the file's OWN
-    chunk volume (confirmed 2026-09-03: a 2nd chunk-sized embed_content call 429'd with ZERO other
-    agents contending) previously killed the entire rest of that ingest run — every subsequent
-    chunk in the same loop also 429'd, since nothing paused for the quota to recover. adoption's
-    MEMORY.md failed 5 consecutive ingests across 3 already-staggered heartbeat cycles, proving
-    stagger alone does not fix an intra-file burst. This does not fix that structural gap either
-    (it still bails after backoffs is exhausted) — it turns "the rest of this file's chunks are all
-    doomed once one 429s" into "this one chunk pauses and retries", which is a materially different
-    and much better failure mode for a multi-hundred-chunk file. Verify empirically against
-    adoption's next MEMORY.md ingest attempts; this backoff shape is inherited from
-    _retry_generate_content, not independently tuned for embedding's burst characteristics.
-    """
-    from google.genai import errors as _genai_errors
-    last_err = None
-    for attempt, backoff in enumerate(backoffs, start=1):
-        try:
-            return client.models.embed_content(model=model, contents=contents, config=embed_config)
-        except _genai_errors.APIError as e:
-            last_err = e
-            is_transient = (e.code in TRANSIENT_HTTP_CODES) or (e.status in TRANSIENT_STATUS_NAMES)
-            if not is_transient:
-                raise
-            if attempt < len(backoffs):
-                print(f"    Transient error (HTTP {e.code} {e.status or ''}) on embed_content; retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
-                time.sleep(backoff)
-            else:
-                print(f"    Exhausted retries on transient embed_content error: HTTP {e.code} {e.status or ''}")
+                print(f"    Exhausted retries on transient {label} error: HTTP {e.code} {e.status or ''}")
     raise last_err if last_err else RuntimeError("retry loop completed without response or error")
 
 
 def embed_content(client, config, content, task_type="RETRIEVAL_DOCUMENT"):
     """Embed content using Gemini Embedding 2. Content can be text string or list of Parts."""
     from google.genai import types
-    result = _retry_embed_content(
-        client,
-        model=config.get("embedding_model", "gemini-embedding-2-preview"),
-        contents=content,
-        embed_config=types.EmbedContentConfig(
-            output_dimensionality=config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS),
-            task_type=task_type,
-        ),
+    model = config.get("embedding_model", "gemini-embedding-2-preview")
+    embed_config = types.EmbedContentConfig(
+        output_dimensionality=config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS),
+        task_type=task_type,
+    )
+    result = _retry_with_backoff(
+        lambda: client.models.embed_content(model=model, contents=content, config=embed_config),
+        label="embed_content",
     )
     if _tracker:
         _tracker.track_embedding(content)
@@ -898,13 +869,14 @@ def ingest_pdf(client, config, collection, file_path):
         "Separate each page's content with '=== PAGE N ===' markers.\n"
         "Be thorough - this will be used for search and retrieval."
     )
-    response = _retry_generate_content(
-        client,
-        model=config.get("gemini_model", "gemini-2.5-flash"),
-        contents=[
-            types.Part.from_bytes(data=data, mime_type="application/pdf"),
-            extraction_prompt,
-        ],
+    gen_model = config.get("gemini_model", "gemini-2.5-flash")
+    gen_contents = [
+        types.Part.from_bytes(data=data, mime_type="application/pdf"),
+        extraction_prompt,
+    ]
+    response = _retry_with_backoff(
+        lambda: client.models.generate_content(model=gen_model, contents=gen_contents),
+        label="generate_content",
     )
     if _tracker:
         _tracker.track_generation(response)
