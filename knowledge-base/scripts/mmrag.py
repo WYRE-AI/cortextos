@@ -857,7 +857,7 @@ def ingest_pdf(client, config, collection, file_path):
     print(f"  Analyzing PDF: {file_path.name}...")
 
     # Gemini Flash returns 503 UNAVAILABLE during high-demand windows. Without
-    # retries, a single 503 kills the ingest. _retry_generate_content wraps the
+    # retries, a single 503 kills the ingest. _retry_with_backoff wraps the
     # call with bounded retries on transient SDK conditions (HTTP 429/500/503,
     # status UNAVAILABLE/RESOURCE_EXHAUSTED) and fails fast on everything else.
     extraction_prompt = (

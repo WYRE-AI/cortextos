@@ -1,4 +1,4 @@
-"""Fault-injecting Gemini client for testing mmrag._retry_generate_content.
+"""Fault-injecting Gemini client for testing mmrag._retry_with_backoff.
 
 Wired via two env vars consumed by mmrag.get_genai_client:
 
