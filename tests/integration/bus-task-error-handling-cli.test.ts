@@ -203,7 +203,7 @@ describe.skipIf(!existsSync(DIST_CLI))(
       expect(stdout).toContain("project -> conduit");
     });
 
-    it("update-task with neither status nor --assignee/--project/--priority/--append-desc exits 1 with a clean message", async () => {
+    it("update-task with neither status nor --assignee/--project/--priority/--append-desc/--blocked-by exits 1 with a clean message", async () => {
       writeTask("task_real_005");
       const { stdout, stderr, code } = await runCli([
         "bus",
@@ -213,7 +213,7 @@ describe.skipIf(!existsSync(DIST_CLI))(
 
       expect(code).toBe(1);
       expect(stderr.trim()).toBe(
-        "Nothing to update — pass a status, --assignee, --project, --priority, and/or --append-desc",
+        "Nothing to update — pass a status, --assignee, --project, --priority, --append-desc, and/or --blocked-by",
       );
       expect(stdout).toBe("");
     });
