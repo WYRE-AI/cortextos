@@ -1769,10 +1769,24 @@ busCommand
       process.exit(1);
     }
 
+    const scope = (opts.scope as 'shared' | 'private') || 'shared';
+    const agent = opts.agent || env.agentName;
+    // deleteFromKnowledgeBase throws a plain Error for this same condition,
+    // which — uncaught here — dumps a raw Node stack trace instead of a
+    // clean CLI error. Mirror the --org guard above rather than let it
+    // bubble: an operator running kb-delete --scope private without an
+    // agent resolved (no --agent, no CTX_AGENT_NAME) should see the same
+    // one-line ERROR/exit(1) shape every other missing-required-value case
+    // in this command gets.
+    if (scope === 'private' && !agent) {
+      console.error('ERROR: --agent or CTX_AGENT_NAME required for --scope private');
+      process.exit(1);
+    }
+
     deleteFromKnowledgeBase(sourcePath, {
       org,
-      agent: opts.agent || env.agentName,
-      scope: (opts.scope as 'shared' | 'private') || 'shared',
+      agent,
+      scope,
       frameworkRoot: env.frameworkRoot || process.cwd(),
       instanceId: env.instanceId,
     });

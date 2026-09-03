@@ -37,7 +37,7 @@ vi.mock('../../../src/utils/org.js', () => ({
   normalizeOrgName: (_root: string, org: string) => org,
 }));
 
-const { queryKnowledgeBase, ingestKnowledgeBase } = await import('../../../src/bus/knowledge-base.js');
+const { queryKnowledgeBase, ingestKnowledgeBase, deleteFromKnowledgeBase } = await import('../../../src/bus/knowledge-base.js');
 
 // Minimal BusPaths stub — knowledge-base.ts doesn't actually USE the paths
 // object at call time, just the options/env it constructs.
@@ -140,6 +140,49 @@ describe('ingestKnowledgeBase — graceful missing-config', () => {
     expect(argv).toEqual(expect.arrayContaining(['ingest', '/some/file.md']));
     // Happy path emits no [kb] warning.
     expect(warnLog.filter((m) => m.includes('[kb]'))).toHaveLength(0);
+  });
+});
+
+describe('deleteFromKnowledgeBase', () => {
+  it('missing config: warn + return cleanly, execFileSync NEVER called', () => {
+    mockMissingKbConfig();
+
+    expect(() =>
+      deleteFromKnowledgeBase('/some/file.md', baseOptions),
+    ).not.toThrow();
+
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+    expect(warnLog.some((m) => m.includes('TestOrg') && /run setup/i.test(m))).toBe(true);
+  });
+
+  it('config present: execFileSync IS called with the mmrag delete args and a timeout', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+
+    deleteFromKnowledgeBase('/some/file.md', baseOptions);
+
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+    const [pythonPath, argv, execOpts] = execFileSyncMock.mock.calls[0] as [string, string[], { timeout?: number }];
+    expect(String(pythonPath)).toMatch(/python/);
+    expect(argv).toEqual(expect.arrayContaining(['delete', '/some/file.md']));
+    // Local disk I/O only (no Gemini/network calls like ingest) — a flat
+    // bounded timeout, not ingest's minutes-scale floor/default/env knob.
+    expect(execOpts.timeout).toBe(30000);
+  });
+
+  it('--scope private with no agent throws a plain Error, not an execFileSync crash', () => {
+    mockConfiguredKb();
+
+    // This is the condition the CLI layer (src/cli/bus.ts kb-delete action)
+    // pre-checks with console.error+process.exit(1) before ever calling
+    // this function — asserting it here locks the underlying contract the
+    // CLI guard depends on: a clean, catchable Error, not a raw child-process
+    // crash from execFileSync running with an unresolvable collection name.
+    expect(() =>
+      deleteFromKnowledgeBase('/some/file.md', { ...baseOptions, agent: undefined, scope: 'private' }),
+    ).toThrow('--agent or CTX_AGENT_NAME required for --scope private');
+
+    expect(execFileSyncMock).not.toHaveBeenCalled();
   });
 });
 
