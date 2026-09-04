@@ -458,6 +458,63 @@ describe('Sprint 3: Experiment Framework', () => {
       });
     });
 
+    describe('--baseline override (marketing, exp_1786858829_uzaff shape, task_1788524506203)', () => {
+      it('refuses a --baseline override with no --justification', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'test', { baseline: 37.6 });
+        runExperiment(testDir, id);
+        expect(() => evaluateExperiment(testDir, id, 48.65, { baseline: 50.77 })).toThrow(
+          'no --justification',
+        );
+      });
+
+      it('reproduces the real bug without an override: stale stored baseline mechanically reads keep', () => {
+        // The stored baseline_value (37.6) is from a non-adjacent window and
+        // reads as an improvement; this is exactly what happened to
+        // exp_1786858829_uzaff before the correction — no override given.
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'cookie copy test', {
+          direction: 'higher',
+          baseline: 37.6,
+        });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 48.65);
+        expect(result.decision).toBe('keep'); // the bug, reproduced — 48.65 > 37.6
+      });
+
+      it('uses the override for the decision without touching stored baseline_value', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'cookie copy test v2', {
+          direction: 'higher',
+          baseline: 37.6,
+        });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 48.65, {
+          baseline: 50.77,
+          justification: 'Adjacent matched-window remeasurement supersedes the stale 08-16 baseline',
+        });
+
+        expect(result.decision).toBe('discard'); // 48.65 < 50.77 — correct call
+        expect(result.baseline_value).toBe(37.6); // frozen, untouched — historical fact preserved
+        expect(result.next_baseline_value).toBe(50.77); // discard: ratchet uses the OVERRIDE, not the stale stored value
+        expect(result.learning).toContain('BASELINE OVERRIDE');
+        expect(result.learning).toContain('50.77');
+        expect(result.learning).toContain('37.6');
+        expect(result.learning).toContain('Adjacent matched-window remeasurement');
+      });
+
+      it('a keep with an override still ratchets forward to the override-driven effective value', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'cookie copy test v3', {
+          direction: 'higher',
+          baseline: 10,
+        });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 60, {
+          baseline: 50,
+          justification: 'Fresher comparison point',
+        });
+        expect(result.decision).toBe('keep'); // 60 > 50
+        expect(result.next_baseline_value).toBe(60); // keep: ratchet is the effective (measured) value
+      });
+    });
+
     describe('--score (qualitative metrics)', () => {
       it('keeps result_value as the raw measuredValue passed, even when score is given (task_1786464752094)', () => {
         const id = createExperiment(testDir, 'testbot', 'tone', 'Warmer replies', {

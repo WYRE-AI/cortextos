@@ -1221,12 +1221,14 @@ busCommand
   .argument('<value>', 'Measured value')
   .option('--score <n>', 'Score 1-10')
   .option('--justification <text>', 'Justification text')
-  .action((id: string, value: string, opts: { score?: string; justification?: string }) => {
+  .option('--baseline <n>', 'Override the stored baseline_value for this decision (requires --justification) — use when the stored baseline has gone stale (e.g. a non-adjacent measurement window) and you have a freshly-validated comparison point. The stored baseline_value is left untouched for history.')
+  .action((id: string, value: string, opts: { score?: string; justification?: string; baseline?: string }) => {
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     const experiment = evaluateExperiment(agentDir, id, parseFloat(value), {
       score: opts.score ? parseFloat(opts.score) : undefined,
       justification: opts.justification,
+      baseline: opts.baseline ? parseFloat(opts.baseline) : undefined,
     });
     console.log(JSON.stringify(experiment, null, 2));
   });
