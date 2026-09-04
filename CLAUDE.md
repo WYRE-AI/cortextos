@@ -84,6 +84,17 @@ npm test
   fast-checker "heartbeat watchdog" fake-timer tests, phase4-performance p95
   assertions, and phase5-performance SC-2. They pass on a quiet machine —
   not regressions.
+- Same flaky class, different environment (2026-09-04, dev/murph, PR #151
+  CI): `tests/integration/phase5-performance.test.ts` P-4 ("10 successive
+  write+read cycles of 100 crons all complete in <100ms each") failed on a
+  GitHub Actions hosted runner — 103.586ms vs the 100ms threshold — while a
+  second parallel `Unit Tests` run on the same commit passed clean (run
+  33874368157, job 101027786766). Not the Mac-scoped case above (this is a
+  cloud CI runner, not the primary dev Mac) and not the named SC-2 case —
+  a sibling load-sensitive-timing assertion in the same file. Confirmed
+  unrelated to the PR's diff. Don't assume "already documented" covers a
+  new instance without checking which specific assertion and environment
+  the existing entry actually names.
 
 ## Learnings - 2026-08-04
 
