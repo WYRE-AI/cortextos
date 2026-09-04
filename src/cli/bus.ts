@@ -261,10 +261,23 @@ busCommand
  * existence only, not `enabled` state — a disabled agent is still a
  * legitimate reassignment target; the failure mode this guards against is a
  * name that was never real to begin with.
+ *
+ * Fails open when the roster comes back completely empty for the org
+ * (`listAgents` finds zero agent directories under it at all). A real org
+ * always has agents on disk, so an empty roster means the scan had nothing
+ * to check against — not that every possible name is invalid — and is the
+ * shape a CLI-level integration test hits when it drives the real compiled
+ * binary against a synthetic org name with no `orgs/<org>/agents/` fixture
+ * behind it (e.g. tests/integration/bus-task-error-handling-cli.test.ts's
+ * `testorg`, which broke this check on first fleet-wide test run: 507 tests
+ * green at author-verify time only covered tests/unit/bus/ + tests/unit/cli/,
+ * not tests/integration/). Blocking on an unreadable roster would be worse
+ * than the typo it guards against.
  */
 function validateAssigneeArg(ctxRoot: string, org: string, assignee: string): void {
   if (assignee === 'human' || assignee === 'user') return;
   const roster = listAgents(ctxRoot, org);
+  if (roster.length === 0) return;
   if (!roster.some((a) => a.name === assignee)) {
     console.error(`Invalid assignee '${assignee}': not found in the enabled-agents roster for org '${org}'.`);
     process.exit(1);
