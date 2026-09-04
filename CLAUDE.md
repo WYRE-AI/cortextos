@@ -1685,3 +1685,16 @@ the fact; treat it the way an activity log without a genuinely per-identity cred
 suggestive, not evidence. This matters most during exactly the kind of concurrent, time-pressured
 multi-region provisioning work that surfaced it — the conditions that make a "who touched this"
 question urgent are the same conditions that make the shared-identity substrate likeliest to be hit.
+- **ADDENDUM 2026-09-04 (murph) — the NUL sentinel also breaks GNU `diff3`, and worse than the
+  grep/rg misses above: it doesn't return a false zero, it FABRICATES a false-clean 3-way merge.**
+  Diagnosing a real conflict on `src/cli/bus.ts` (cortextos#151 vs main), extracted the three blobs
+  (base/ours/theirs) to plain files and ran `diff3 -m` — exit 0, zero conflict markers, read as "no
+  overlap, safe to auto-merge." The merged output had silently DROPPED the entire PR side's changes
+  (`listAgents` import, new `validateAssigneeArg` function, both call sites — verified via direct
+  byte-level python3 check, not grep, since the wrapper bug covers this file too). `git merge-file`
+  (git's actual merge algorithm, not GNU diff3) on the same three files correctly produced the real
+  conflict markers. **Apply: for any 3-way merge/conflict check on a file that might carry this NUL
+  sentinel (`bus.ts` today, any future NUL-carrying file), use `git merge-file` or `git merge-tree`,
+  never GNU `diff3` on extracted blobs — a silent false-zero is bad, a tool that hands back a
+  confident, mergeable-looking, WRONG result is worse, because there is no failed-lookup shape to
+  notice.**
