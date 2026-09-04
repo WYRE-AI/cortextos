@@ -10,6 +10,7 @@ import { validateAgentName, validateTaskId, validatePriority, validateCapability
 import { randomDigits } from '../utils/random.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, checkBatchStaleness, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { listAgents } from '../bus/agents.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus/heartbeat.js';
@@ -246,6 +247,43 @@ busCommand
     console.log(`ACK'd ${id}`);
   });
 
+/**
+ * Reject a typo'd or nonexistent --assignee before it silently routes a task
+ * into the void (task_1786739337901_81484880). Checked here at the CLI
+ * boundary — where a human actually types the name — rather than inside
+ * createTask/updateTask themselves: those are also called directly by the
+ * unit test suite with lightweight fixture agent names that have no real
+ * enabled-agents.json/orgs-directory roster to check against, so validating
+ * at the library layer would require rebuilding roster fixtures for dozens
+ * of unrelated tests just to keep them passing. 'human' and 'user' are
+ * deliberate sentinels for [HUMAN] tasks (see the assigned_to checks in
+ * src/bus/task.ts) and bypass the roster check entirely. Checks name
+ * existence only, not `enabled` state — a disabled agent is still a
+ * legitimate reassignment target; the failure mode this guards against is a
+ * name that was never real to begin with.
+ *
+ * Fails open when the roster comes back completely empty for the org
+ * (`listAgents` finds zero agent directories under it at all). A real org
+ * always has agents on disk, so an empty roster means the scan had nothing
+ * to check against — not that every possible name is invalid — and is the
+ * shape a CLI-level integration test hits when it drives the real compiled
+ * binary against a synthetic org name with no `orgs/<org>/agents/` fixture
+ * behind it (e.g. tests/integration/bus-task-error-handling-cli.test.ts's
+ * `testorg`, which broke this check on first fleet-wide test run: 507 tests
+ * green at author-verify time only covered tests/unit/bus/ + tests/unit/cli/,
+ * not tests/integration/). Blocking on an unreadable roster would be worse
+ * than the typo it guards against.
+ */
+function validateAssigneeArg(ctxRoot: string, org: string, assignee: string): void {
+  if (assignee === 'human' || assignee === 'user') return;
+  const roster = listAgents(ctxRoot, org);
+  if (roster.length === 0) return;
+  if (!roster.some((a) => a.name === assignee)) {
+    console.error(`Invalid assignee '${assignee}': not found in the enabled-agents roster for org '${org}'.`);
+    process.exit(1);
+  }
+}
+
 busCommand
   .command('create-task')
   .argument('<title>', 'Task title')
@@ -273,6 +311,7 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
+    if (opts.assignee !== undefined) validateAssigneeArg(paths.ctxRoot, env.org, opts.assignee);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
     const taskId = createTask(paths, env.agentName, env.org, title, {
       description: resolvedDesc,
@@ -447,6 +486,12 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
+    // Validated against the CALLER's own org roster — findTaskFile searches
+    // every org under ctxRoot/orgs/, so a cross-org reassignment (rare;
+    // update-task's own docs describe rerouting within the fleet, not across
+    // orgs) could in principle be checked against the wrong roster. Matches
+    // create-task's identical scoping above.
+    if (opts.assignee !== undefined) validateAssigneeArg(paths.ctxRoot, env.org, opts.assignee);
 
     // Guard: block review/completion when deliverables are required but missing.
     // Checks both ready_for_review (approval workflow) and completed (vanilla upstream)
