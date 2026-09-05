@@ -422,8 +422,26 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status?: TaskStatus,
-  opts: { assignee?: string; project?: string; priority?: Priority; appendDesc?: string } = {},
+  opts: {
+    assignee?: string;
+    project?: string;
+    priority?: Priority;
+    appendDesc?: string;
+    /**
+     * Who is performing this update. Recorded as the audit entry's `agent`.
+     *
+     * Deliberately separate in meaning from `assignee`: `assignee` is WHAT
+     * changes, `actor` is WHO changes it. The audit previously derived its
+     * `agent` from the pre-mutation `assigned_to`, which is correct only when
+     * an agent updates its own task — so a reassignment by a third party
+     * recorded the wrong agent. Callers that omit it audit as 'unknown'
+     * rather than borrowing an identity (see `|| 'unknown'` below).
+     */
+    actor?: string;
+  } = {},
 ): void {
+  // `actor` is metadata about the update, not a field being updated — it
+  // deliberately does not satisfy this guard.
   if (
     status === undefined &&
     opts.assignee === undefined &&
@@ -443,13 +461,11 @@ export function updateTask(
     );
   }
   let prevStatus: TaskStatus | undefined;
-  let auditAgent: string | undefined;
   const noteParts: string[] = [];
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
-    auditAgent = task.assigned_to;
     if (status !== undefined) task.status = status;
     if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
       noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
@@ -476,7 +492,7 @@ export function updateTask(
   }
   appendTaskAudit(paths, taskId, {
     event: 'update',
-    agent: auditAgent || 'unknown',
+    agent: opts.actor || 'unknown',
     from: prevStatus,
     to: status ?? prevStatus,
     ...(noteParts.length ? { note: noteParts.join(', ') } : {}),

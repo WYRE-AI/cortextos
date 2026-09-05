@@ -411,6 +411,59 @@ restart locks, agent-pidfile orphan reaping, per-engineer namespaces,
 media-route XSS hardening, and the name-free leak-guard port with this
 fork's operator identity.
 
+### Fixed — `updateTask` audit entries named the previous assignee instead of the agent that acted
+
+`updateTask` derived the audit entry's `agent` from the task's own
+`assigned_to`, captured before the mutation:
+
+```ts
+auditAgent = task.assigned_to;   // pre-mutation assignee
+...
+agent: auditAgent || 'unknown',
+```
+
+`TaskAuditEntry.agent` is documented as *"who caused the event"*. The comment was
+always right; the code never matched it. It happened to agree whenever an agent
+updated its own task — the common case, and the reason this survived — and named
+the wrong agent exactly when a third party reassigned someone else's work.
+
+**The audit log could not show its own defect.** `agent` and the left-hand side
+of the `assignee: X -> Y` note are the same variable read twice, so no entry can
+ever record `agent != pre-mutation assignee`. Searching 8,790 historical entries
+for the counter-example returns zero on a healthy fleet and on a thoroughly
+corrupted one alike — the field being searched is produced by the bug. The
+failing case therefore had to be constructed; it provably could not be sampled.
+For the same reason the 69 historical entries carrying an assignee change stay
+ambiguous forever and are deliberately **not** retro-attributed.
+
+The actor is now threaded explicitly. `updateTask` takes `opts.actor`, kept
+separate in meaning from `opts.assignee` — assignee is *what* changes, actor is
+*who* changes it, and collapsing the two is the defect. `bus update-task` grows
+`--agent`, mirroring `claim-task`: explicit override, `CTX_AGENT_NAME` fallback,
+and a hard error when neither is present. That abort is load-bearing rather than
+boilerplate — an empty agent value widens instead of narrowing elsewhere in this
+CLI, and defaulting here would write a borrowed or empty identity into an
+append-only log as though it were an observation. Callers that omit an actor
+audit as `unknown`, following the existing `|| 'unknown'` precedent on the same
+line, rather than borrowing the assignee's name.
+
+Covered by `tests/unit/bus/task.test.ts`. The regression test is asserted in the
+**negative** form (`expect(entry.agent).not.toBe('boss')`) because `updateTask`
+had no actor parameter before this change: the positive assertion could not be
+compiled, let alone fail, until the fix it validates already existed, so the
+merge condition and the fix would have been circular. The negative form compiles
+and fails against the unfixed code — `expected 'boss' not to be 'boss'` — and the
+positive form ships alongside it to pin the contract. One existing test asserted
+the defect in its own title (*"with assignee as agent"*) and passed only because
+its fixture was a self-transition; it is renamed and re-pointed in the same
+commit so the diff reads as a deliberate contract change rather than a
+regression.
+
+Notifications on task state change are deliberately **not** in this PR. They
+depend on the threaded actor to suppress self-notification, and they carry a
+routing design that is still open; coupling a decided change to an undecided one
+lets the undecided one set the schedule.
+
 ### Fixed — `bus update-cron --prompt ""` wiped the prompt and reported success
 
 The CLI passed `--prompt` straight through whenever it was defined, and an empty

@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { execFile } from "child_process";
@@ -79,18 +79,27 @@ function writeTask(id: string, overrides: Record<string, unknown> = {}): void {
 async function runCli(
   args: string[],
 ): Promise<{ stdout: string; stderr: string; code: number }> {
+  return runCliWithEnv(args, { CTX_AGENT_NAME: "dev", CTX_ORG: ORG });
+}
+
+// Lets a test override or OMIT specific env vars (e.g. to test the
+// missing-identity path, which needs CTX_AGENT_NAME genuinely absent —
+// not just overridden to a different value).
+async function runCliWithEnv(
+  args: string[],
+  envOverrides: Record<string, string | undefined>,
+  execOpts: { cwd?: string } = {},
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: fakeHome };
+  for (const [key, value] of Object.entries(envOverrides)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
   try {
     const { stdout, stderr } = await execFileAsync(
       process.execPath,
       [DIST_CLI, ...args],
-      {
-        env: {
-          ...process.env,
-          HOME: fakeHome,
-          CTX_AGENT_NAME: "dev",
-          CTX_ORG: ORG,
-        },
-      },
+      { env, ...execOpts },
     );
     return { stdout, stderr, code: 0 };
   } catch (err) {
@@ -105,6 +114,25 @@ async function runCli(
       code: typeof e.code === "number" ? e.code : 1,
     };
   }
+}
+
+function readAudit(id: string): Array<{ event: string; agent: string; [k: string]: unknown }> {
+  const auditPath = join(
+    fakeHome,
+    ".cortextos",
+    "default",
+    "orgs",
+    ORG,
+    "tasks",
+    "audit",
+    `${id}.jsonl`,
+  );
+  if (!existsSync(auditPath)) return [];
+  return readFileSync(auditPath, "utf-8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 describe.skipIf(!existsSync(DIST_CLI))(
@@ -259,6 +287,80 @@ describe.skipIf(!existsSync(DIST_CLI))(
 
       expect(code).toBe(0);
       expect(stdout).toContain("description appended");
+    });
+
+    // CLI actor-resolution coverage (CodeRabbit finding on #137): the
+    // underlying updateTask() function is covered directly in
+    // tests/unit/bus/task.test.ts, but that never exercises the CLI's own
+    // opts.agent || env.agentName resolution, its hard-fail-when-neither
+    // branch, or that the resolved actor actually reaches the audit log
+    // through the full `cortextos bus update-task` invocation.
+    it("update-task --agent takes precedence over CTX_AGENT_NAME and is recorded as the audit actor", async () => {
+      writeTask("task_actor_001", { assigned_to: "grower" });
+      const { code } = await runCliWithEnv(
+        ["bus", "update-task", "task_actor_001", "in_progress", "--agent", "boss"],
+        { CTX_AGENT_NAME: "dev", CTX_ORG: ORG },
+      );
+
+      expect(code).toBe(0);
+      const audit = readAudit("task_actor_001");
+      expect(audit).toHaveLength(1);
+      expect(audit[0].agent).toBe("boss");
+      // The bug this PR fixes: without the --agent override, the acting
+      // agent would previously have been misrecorded as the task's own
+      // pre-mutation assigned_to ("grower"), not the actual caller.
+      expect(audit[0].agent).not.toBe("grower");
+    });
+
+    it("update-task falls back to CTX_AGENT_NAME when --agent is omitted", async () => {
+      writeTask("task_actor_002", { assigned_to: "grower" });
+      const { code } = await runCliWithEnv(
+        ["bus", "update-task", "task_actor_002", "in_progress"],
+        { CTX_AGENT_NAME: "dev", CTX_ORG: ORG },
+      );
+
+      expect(code).toBe(0);
+      const audit = readAudit("task_actor_002");
+      expect(audit).toHaveLength(1);
+      expect(audit[0].agent).toBe("dev");
+    });
+
+    it("update-task exits 1 with a clean message when neither --agent nor CTX_AGENT_NAME is present", async () => {
+      // resolveEnv() falls back to basename(process.cwd()) when
+      // CTX_AGENT_NAME is unset, which is truthy for almost any real cwd —
+      // so the CLI's own guard is only reachable when that fallback ALSO
+      // comes back empty. basename('/') === '' is the one real cwd value
+      // that triggers it; run from cwd '/' to genuinely exercise the guard
+      // rather than a case resolveEnv() silently rescues.
+      writeTask("task_actor_003");
+      const { stdout, stderr, code } = await runCliWithEnv(
+        ["bus", "update-task", "task_actor_003", "in_progress"],
+        { CTX_AGENT_NAME: undefined, CTX_ORG: ORG },
+        { cwd: "/" },
+      );
+
+      expect(code).toBe(1);
+      expect(stderr.trim()).toBe("ERROR: --agent or CTX_AGENT_NAME required");
+      expect(stdout).toBe("");
+      // No audit entry should have been written for a rejected call.
+      expect(readAudit("task_actor_003")).toHaveLength(0);
+    });
+
+    it("update-task on a reassignment records the ACTING agent, not the agent losing the task", async () => {
+      // Direct regression for the original defect this PR fixes: boss
+      // reroutes a task away from grower. The audit's `agent` field must
+      // name boss (who caused the change), not grower (who is losing it).
+      writeTask("task_actor_004", { assigned_to: "grower" });
+      const { code } = await runCliWithEnv(
+        ["bus", "update-task", "task_actor_004", "--assignee", "dev", "--agent", "boss"],
+        { CTX_AGENT_NAME: "boss", CTX_ORG: ORG },
+      );
+
+      expect(code).toBe(0);
+      const audit = readAudit("task_actor_004");
+      expect(audit).toHaveLength(1);
+      expect(audit[0].agent).toBe("boss");
+      expect(audit[0].agent).not.toBe("grower");
     });
   },
 );
