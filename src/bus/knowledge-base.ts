@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process';
-import { existsSync, mkdirSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { BusPaths } from '../types/index.js';
@@ -312,14 +312,47 @@ export function ingestKnowledgeBase(
   // produced ETIMEDOUT mid-Gemini-call. Default 10 min, override via env,
   // floored at 60s so nobody accidentally sets it to 0 or a value smaller
   // than a single Gemini call needs.
+  //
+  // A flat 10 min default isn't enough once a text file (MEMORY.md) grows —
+  // task_1787849190389_13577787: analyst's and adoption's MEMORY.md both hit
+  // ETIMEDOUT at the flat default (3642 lines / 476 chunks and 323 chunks
+  // respectively), both confirmed fixed by manually raising the timeout to
+  // 30 min via the env override. Since MEMORY.md only grows over an agent's
+  // lifetime, every long-lived agent eventually hits this wall at the flat
+  // default. Scale the default with total input size instead of guessing a
+  // single bigger flat number: 1.5ms per input byte, still floored at the
+  // existing 60s minimum and capped at 1 hour so a huge/runaway input still
+  // fails loud instead of hanging indefinitely. The 1.5ms/byte rate is a
+  // deliberately generous estimate grounded in the one data point on record
+  // (a several-hundred-KB MEMORY.md succeeding within the 30min manual
+  // override) — not a benchmarked constant. KB_INGEST_TIMEOUT_MS still wins
+  // outright when set, exactly as before; this only changes what "default"
+  // resolves to when no override is given.
   const KB_INGEST_TIMEOUT_FLOOR_MS = 60_000;
   const KB_INGEST_TIMEOUT_DEFAULT_MS = 600_000;
+  const KB_INGEST_TIMEOUT_MAX_MS = 3_600_000;
+  const KB_INGEST_MS_PER_BYTE = 1.5;
+
+  let totalInputBytes = 0;
+  for (const p of paths) {
+    try {
+      totalInputBytes += statSync(p).size;
+    } catch {
+      // Missing/unreadable path — mmrag.py will report it; timeout sizing
+      // just skips it rather than failing the whole call over a stat error.
+    }
+  }
+  const sizeScaledDefaultMs = Math.min(
+    KB_INGEST_TIMEOUT_MAX_MS,
+    Math.max(KB_INGEST_TIMEOUT_DEFAULT_MS, totalInputBytes * KB_INGEST_MS_PER_BYTE),
+  );
+
   const requestedTimeout = Number(process.env.KB_INGEST_TIMEOUT_MS);
   const ingestTimeoutMs = Math.max(
     KB_INGEST_TIMEOUT_FLOOR_MS,
     Number.isFinite(requestedTimeout) && requestedTimeout > 0
       ? requestedTimeout
-      : KB_INGEST_TIMEOUT_DEFAULT_MS,
+      : sizeScaledDefaultMs,
   );
 
   execFileSync(pythonPath, args, {
