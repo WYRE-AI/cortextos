@@ -263,6 +263,35 @@ is given explicitly, regardless of value.
 
 Closes task_1787699537830_61600762.
 
+### Fixed — `bus kb-delete`/`kb-ingest` `--scope` silently defaulted instead of refusing; `kb-query` silently emptied on a bad value
+
+A knowledge-base delete or ingest is a write/destroy operation with no undo, and `orgs/` (where
+every agent's private-scope content lives) is gitignored repo-wide — there is no git history to
+recover a mistake against the wrong collection. `kb-delete` and `kb-ingest` both defaulted
+`--scope` to `'shared'` (at the CLI option level and inside their respective functions), so an
+omitted `--scope` silently acted on the shared collection rather than refusing. Per review, the
+ingest case is the more dangerous of the two: a wrong-scope ingest doesn't just touch the wrong
+collection, it silently *writes* agent-private content into the shared one with no error signal.
+`kb-query` had a related but distinct gap: its scope switch has no `default` case, so an invalid
+(typo'd) scope silently produced zero results — indistinguishable from a legitimate no-match.
+
+`--scope` is now required for `kb-delete` and `kb-ingest`, with no default — omitting it, or
+passing anything other than `shared` or `private`, exits 1 at the CLI layer before the knowledge
+base is ever touched. `kb-query` keeps its `'all'` default for an omitted scope (a sensible
+search-everything behavior, not a guess with unrecoverable consequences) but now rejects an
+explicitly-invalid value instead of silently returning nothing. All three CLI commands and their
+underlying functions share one validator each (`validateKBScope` / `validateKBQueryScope` in
+`src/utils/validate.ts`, matching this file's existing `validatePriority`/`validateAgentName`
+convention) instead of hand-rolling the same condition with drifting error text per call site.
+
+Surfaced while closing cortextos#130 (a separate, since-superseded PR that added `kb-delete`
+before this one shipped) as superseded — that PR's own implementation got the no-default point
+right and is credited in its close comment. Scope extended from `kb-delete` alone to all three
+`kb-*` scope-taking commands per review (the sibling gaps in ingest/query were flagged as worse
+than the original bug, not separate follow-up work).
+
+Closes task_1787747897711_56565516.
+
 ### Added — `bus update-task --append-desc` — a task description can now be corrected without churning its ID
 
 A task description had no edit path after creation: `update-task` only

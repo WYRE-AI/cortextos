@@ -4,6 +4,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import type { BusPaths } from '../types/index.js';
 import { normalizeOrgName } from '../utils/org.js';
+import { validateKBScope, validateKBQueryScope } from '../utils/validate.js';
 
 /**
  * Knowledge base integration — calls mmrag.py directly (cross-platform,
@@ -134,7 +135,9 @@ export function queryKnowledgeBase(
     instanceId: string;
   },
 ): KBQueryResponse {
-  const { agent, scope = 'all', topK = 5, threshold = 0.5, frameworkRoot, instanceId } = options;
+  const { agent, scope: rawScope = 'all', topK = 5, threshold = 0.5, frameworkRoot, instanceId } = options;
+  validateKBQueryScope(rawScope);
+  const scope = rawScope;
   // Normalize once at the top so every downstream path join, env var, and
   // ChromaDB collection name uses the canonical filesystem casing. Without
   // this, `shared-acmecorp` and `shared-AcmeCorp` become two
@@ -252,13 +255,14 @@ export function ingestKnowledgeBase(
   options: {
     org: string;
     agent?: string;
-    scope?: 'shared' | 'private';
+    scope: 'shared' | 'private';
     force?: boolean;
     frameworkRoot: string;
     instanceId: string;
   },
 ): void {
-  const { agent, scope = 'shared', force, frameworkRoot, instanceId } = options;
+  const { agent, scope, force, frameworkRoot, instanceId } = options;
+  validateKBScope(scope);
   // Normalize once (see queryKnowledgeBase for rationale).
   const org = normalizeOrgName(frameworkRoot, options.org);
 
@@ -340,18 +344,26 @@ export function ingestKnowledgeBase(
  * MMRAG_CONFIG/MMRAG_DIR/MMRAG_CHROMADB_DIR set by hand (mmrag.py's own
  * defaults point at ~/.mmrag/config.json, which never exists), so the
  * command was effectively unusable outside this module (task_1786414730820).
+ *
+ * `scope` has NO default, unlike ingest/query. A delete is a destructive
+ * ChromaDB operation with no undo, and `orgs/` (where every agent's private
+ * scope lives) is gitignored repo-wide — there is no git history to recover
+ * from a delete that silently ran against the wrong collection. A caller
+ * that hasn't decided which scope to delete from must be refused, not
+ * defaulted to a guess.
  */
 export function deleteFromKnowledgeBase(
   sourcePath: string,
   options: {
     org: string;
     agent?: string;
-    scope?: 'shared' | 'private';
+    scope: 'shared' | 'private';
     frameworkRoot: string;
     instanceId: string;
   },
 ): void {
-  const { agent, scope = 'shared', frameworkRoot, instanceId } = options;
+  const { agent, scope, frameworkRoot, instanceId } = options;
+  validateKBScope(scope);
   const org = normalizeOrgName(frameworkRoot, options.org);
 
   const env = buildKBEnv(frameworkRoot, org, instanceId, agent);

@@ -6,7 +6,7 @@ import { homedir } from 'os';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInboxWithStatus, ackInbox } from '../bus/message.js';
 import { sendToCapability } from '../bus/agents.js';
-import { validateAgentName, validateTaskId, validatePriority, validateCapability } from '../utils/validate.js';
+import { validateAgentName, validateTaskId, validatePriority, validateCapability, validateKBScope, validateKBQueryScope } from '../utils/validate.js';
 import { randomDigits } from '../utils/random.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, checkBatchStaleness, archiveTasks, checkHumanTasks } from '../bus/task.js';
@@ -1711,6 +1711,12 @@ busCommand
       console.error('ERROR: --org or CTX_ORG required');
       process.exit(1);
     }
+    try {
+      validateKBQueryScope(opts.scope || 'all');
+    } catch (err) {
+      console.error(String(err));
+      process.exit(1);
+    }
 
     const result = queryKnowledgeBase(
       resolvePaths(env.agentName, env.instanceId, org, env.ctxRoot),
@@ -1751,7 +1757,7 @@ busCommand
   .argument('<paths...>', 'Files or directories to ingest')
   .option('--org <org>', 'Organization name')
   .option('--agent <name>', 'Agent name (for private scope)')
-  .option('--scope <s>', 'Scope: shared or private', 'shared')
+  .option('--scope <s>', 'Scope: shared or private — required, no default (a wrong-scope ingest silently writes into the wrong collection)')
   .option('--force', 'Re-ingest even if already indexed')
   .action((paths: string[], opts: { org?: string; agent?: string; scope?: string; force?: boolean }) => {
     const env = resolveEnv();
@@ -1760,13 +1766,19 @@ busCommand
       console.error('ERROR: --org or CTX_ORG required');
       process.exit(1);
     }
+    try {
+      validateKBScope(opts.scope);
+    } catch (err) {
+      console.error(String(err));
+      process.exit(1);
+    }
 
     ensureKBDirs(env.instanceId, env.frameworkRoot, org);
 
     ingestKnowledgeBase(paths, {
       org,
       agent: opts.agent || env.agentName,
-      scope: (opts.scope as 'shared' | 'private') || 'shared',
+      scope: opts.scope,
       force: opts.force,
       frameworkRoot: env.frameworkRoot || process.cwd(),
       instanceId: env.instanceId,
@@ -1779,7 +1791,7 @@ busCommand
   .argument('<path>', 'Source file path that was ingested')
   .option('--org <org>', 'Organization name')
   .option('--agent <name>', 'Agent name (for private scope)')
-  .option('--scope <s>', 'Scope: shared or private', 'shared')
+  .option('--scope <s>', 'Scope: shared or private — required, no default (a KB delete cannot be undone)')
   .action((sourcePath: string, opts: { org?: string; agent?: string; scope?: string }) => {
     const env = resolveEnv();
     const org = opts.org || env.org;
@@ -1787,11 +1799,17 @@ busCommand
       console.error('ERROR: --org or CTX_ORG required');
       process.exit(1);
     }
+    try {
+      validateKBScope(opts.scope);
+    } catch (err) {
+      console.error(String(err));
+      process.exit(1);
+    }
 
     deleteFromKnowledgeBase(sourcePath, {
       org,
       agent: opts.agent || env.agentName,
-      scope: (opts.scope as 'shared' | 'private') || 'shared',
+      scope: opts.scope,
       frameworkRoot: env.frameworkRoot || process.cwd(),
       instanceId: env.instanceId,
     });
