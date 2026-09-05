@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -154,9 +154,14 @@ describe('Telegram Logging', () => {
 
       recordInboundTelegram(paths, testDir, 'spark', 'eros-os', 'Eros', msg);
 
-      // The telegram_received event WAS written…
-      const today = new Date().toISOString().split('T')[0];
-      const eventPath = join(testDir, 'analytics', 'events', 'spark', `${today}.jsonl`);
+      // The telegram_received event WAS written… Enumerate the single file in
+      // the event directory rather than deriving `today` a second time here:
+      // computing it independently of the write inside recordInboundTelegram
+      // could read the wrong day's file if a UTC-midnight boundary fell
+      // between the two computations (CodeRabbit finding on #149).
+      const eventDir = join(testDir, 'analytics', 'events', 'spark');
+      const [eventFile] = readdirSync(eventDir);
+      const eventPath = join(eventDir, eventFile);
       const eventEntry = JSON.parse(readFileSync(eventPath, 'utf-8').trim());
       expect(eventEntry.event).toBe('telegram_received');
 
