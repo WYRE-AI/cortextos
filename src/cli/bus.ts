@@ -1257,7 +1257,14 @@ busCommand
 function formatExperimentsText(experiments: ReturnType<typeof listExperiments>): string {
   if (experiments.length === 0) return 'No experiments found.';
   const header = ['ID', 'Agent', 'Metric', 'Status', 'Decision'];
-  const rows = experiments.map(e => [e.id, e.agent, e.metric, e.status, e.decision ?? '-']);
+  // Experiment records are read straight off disk (JSON.parse with no schema
+  // validation — see listExperiments) so a hand-edited or partially-written
+  // file can be missing a field the type says is required. Coerce anything
+  // that isn't a non-empty string to '-' rather than letting `.length` below
+  // throw on undefined; JSON output is untouched (the raw objects, not these
+  // rendered rows, are what --format json prints).
+  const cell = (v: unknown): string => (typeof v === 'string' && v.length > 0) ? v : '-';
+  const rows = experiments.map(e => [cell(e.id), cell(e.agent), cell(e.metric), cell(e.status), cell(e.decision)]);
   const widths = header.map((h, i) => Math.max(h.length, ...rows.map(r => r[i].length)));
   const pad = (s: string, w: number) => s.padEnd(w);
   const line = (cols: string[]) => cols.map((c, i) => pad(c, widths[i])).join('  ');

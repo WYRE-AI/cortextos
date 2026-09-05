@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createExperiment } from '../../../src/bus/experiment';
@@ -84,5 +84,28 @@ describe('bus list-experiments --format', () => {
 
     const out = logSpy.mock.calls.map(c => c.join(' ')).join('\n');
     expect(out).toContain('No experiments found.');
+  });
+
+  it('--format text renders a record missing agent/metric/status instead of throwing', async () => {
+    // listExperiments does a bare JSON.parse with no schema validation, so a
+    // hand-edited or partially-written history file can be missing a field
+    // the Experiment type says is required. This must render as a placeholder
+    // cell, not crash on `.length` of undefined.
+    createExperiment(agentDir, TEST_AGENT, 'p95_latency', 'caching helps');
+    const historyDir = join(agentDir, 'experiments', 'history');
+    writeFileSync(join(historyDir, 'malformed.json'), JSON.stringify({
+      id: 'exp_malformed',
+      created_at: new Date().toISOString(),
+      // agent, metric, status intentionally omitted
+    }));
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    // If formatExperimentsText throws on the missing fields, this await rejects
+    // and the test fails — no separate not-throw assertion needed.
+    await busCommand.parseAsync(['node', 'bus', 'list-experiments', '--format', 'text']);
+
+    const out = logSpy.mock.calls.map(c => c.join(' ')).join('\n');
+    expect(out).toContain('Experiments (2)');
+    expect(out).toContain('exp_malformed');
   });
 });
