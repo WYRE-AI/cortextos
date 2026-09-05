@@ -1250,26 +1250,56 @@ busCommand
     console.log(JSON.stringify(experiment, null, 2));
   });
 
+/**
+ * Compact one-line-per-experiment text rendering for `list-experiments --format text`.
+ * Matches list-tasks/list-agents's table-column convention.
+ */
+function formatExperimentsText(experiments: ReturnType<typeof listExperiments>): string {
+  if (experiments.length === 0) return 'No experiments found.';
+  const header = ['ID', 'Agent', 'Metric', 'Status', 'Decision'];
+  // Experiment records are read straight off disk (JSON.parse with no schema
+  // validation — see listExperiments) so a hand-edited or partially-written
+  // file can be missing a field the type says is required. Coerce anything
+  // that isn't a non-empty string to '-' rather than letting `.length` below
+  // throw on undefined; JSON output is untouched (the raw objects, not these
+  // rendered rows, are what --format json prints).
+  const cell = (v: unknown): string => (typeof v === 'string' && v.length > 0) ? v : '-';
+  const rows = experiments.map(e => [cell(e.id), cell(e.agent), cell(e.metric), cell(e.status), cell(e.decision)]);
+  const widths = header.map((h, i) => Math.max(h.length, ...rows.map(r => r[i].length)));
+  const pad = (s: string, w: number) => s.padEnd(w);
+  const line = (cols: string[]) => cols.map((c, i) => pad(c, widths[i])).join('  ');
+  return [
+    `Experiments (${experiments.length})`,
+    '',
+    line(header),
+    widths.map(w => '-'.repeat(w)).join('  '),
+    ...rows.map(line),
+  ].join('\n');
+}
+
 busCommand
   .command('list-experiments')
   .description('List experiments with optional filters. With no --agent, scans fleet-wide across every agent (like read-all-heartbeats) rather than just the caller.')
   .option('--agent <name>', 'Filter by agent')
   .option('--status <s>', 'Filter by status')
   .option('--metric <m>', 'Filter by metric')
-  .option('--json', 'Output as JSON')
-  .action((opts: { agent?: string; status?: string; metric?: string; json?: boolean }) => {
+  .option('--format <fmt>', 'Output format: json or text (matches list-tasks/list-agents)', 'json')
+  .action((opts: { agent?: string; status?: string; metric?: string; format?: string }) => {
     const env = resolveEnv();
+    const format = opts.format === 'text' ? 'text' : 'json';
+    const render = (experiments: ReturnType<typeof listExperiments>) => {
+      console.log(format === 'text' ? formatExperimentsText(experiments) : JSON.stringify(experiments, null, 2));
+    };
 
     if (opts.agent) {
       const agentDir = env.frameworkRoot
         ? resolveAgentDir(env.frameworkRoot, env.org, opts.agent)
         : (env.agentDir || process.cwd());
-      const experiments = listExperiments(agentDir, {
+      render(listExperiments(agentDir, {
         agent: opts.agent,
         status: opts.status,
         metric: opts.metric,
-      });
-      console.log(JSON.stringify(experiments, null, 2));
+      }));
       return;
     }
 
@@ -1278,17 +1308,13 @@ busCommand
     // scan silently returns a subset with no error. Iterate the whole fleet
     // instead, same discovery source list-agents/checkGoalStaleness use.
     if (!env.frameworkRoot) {
-      console.log(JSON.stringify(
-        listExperiments(env.agentDir || process.cwd(), { status: opts.status, metric: opts.metric }),
-        null, 2,
-      ));
+      render(listExperiments(env.agentDir || process.cwd(), { status: opts.status, metric: opts.metric }));
       return;
     }
-    const experiments = listAllExperiments(env.frameworkRoot, env.ctxRoot, {
+    render(listAllExperiments(env.frameworkRoot, env.ctxRoot, {
       status: opts.status,
       metric: opts.metric,
-    });
-    console.log(JSON.stringify(experiments, null, 2));
+    }));
   });
 
 busCommand
