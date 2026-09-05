@@ -170,7 +170,7 @@ busCommand
 
     const msgId = sendMessage(paths, env.agentName, to, resolved.priority, resolved.text, effectiveReplyTo);
     try {
-      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority: resolved.priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
+      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority: resolved.priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }), { refreshHeartbeat: true });
     } catch { /* non-fatal */ }
     console.log(msgId);
   });
@@ -241,7 +241,7 @@ busCommand
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
     ackInbox(paths, id);
     try {
-      logEvent(paths, env.agentName, env.org, 'message', 'inbox_ack', 'info', JSON.stringify({ msg_id: id }));
+      logEvent(paths, env.agentName, env.org, 'message', 'inbox_ack', 'info', JSON.stringify({ msg_id: id }), { refreshHeartbeat: true });
     } catch { /* non-fatal */ }
     console.log(`ACK'd ${id}`);
   });
@@ -729,7 +729,7 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
-    logEvent(paths, env.agentName, env.org, category as EventCategory, event, severity as EventSeverity, opts.meta);
+    logEvent(paths, env.agentName, env.org, category as EventCategory, event, severity as EventSeverity, opts.meta, { refreshHeartbeat: true });
     console.log(`Logged ${category}/${event} (${severity})`);
   });
 
@@ -792,7 +792,7 @@ busCommand
     // even if the agent itself forgets to call log-event. This makes the
     // dashboard "agents" list derive from heartbeats, not just explicit events.
     try {
-      logEvent(paths, env.agentName, env.org, 'heartbeat', 'heartbeat', 'info', JSON.stringify({ status, task: opts.task ?? '' }));
+      logEvent(paths, env.agentName, env.org, 'heartbeat', 'heartbeat', 'info', JSON.stringify({ status, task: opts.task ?? '' }), { refreshHeartbeat: true });
     } catch {
       // Non-fatal: heartbeat write already succeeded
     }
@@ -1535,7 +1535,7 @@ busCommand
         try {
           const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
           const preview = message.length > 120 ? message.slice(0, 120) + '…' : message;
-          logEvent(paths, env.agentName, env.org, 'message', 'telegram_sent', 'info', JSON.stringify({ chat_id: chatId, message_id: sentMessageId, preview }));
+          logEvent(paths, env.agentName, env.org, 'message', 'telegram_sent', 'info', JSON.stringify({ chat_id: chatId, message_id: sentMessageId, preview }), { refreshHeartbeat: true });
         } catch { /* non-fatal */ }
       }
 
@@ -3467,7 +3467,7 @@ busCommand
                 line: trimmed,
                 session: sessionName,
                 high_signal: isHighSignal,
-              });
+              }, { refreshHeartbeat: true });
             } catch { /* Never fail the stream */ }
           } else {
             logLine(`[event] ${trimmed}`);
