@@ -248,6 +248,21 @@ I/O-cost budget — a genuine regression moves the average) and
 `max < 250ms` (headroom for CI noise while still catching a real multi-cycle
 slowdown).
 
+### Added — `bus create-task` warns on stderr when `--assignee` is omitted
+
+`create-task` silently defaulted `assigned_to` to the calling agent whenever `--assignee` was
+omitted, with no warning. This bit a fleet agent twice in one day: tasks filed for another agent
+without `--assignee <name>` landed `assigned_to` on the filer instead, caught only after the fact
+via `update-task --assignee`. There is no unassign — `update-task --assignee` only reroutes — so a
+task filed wrong the first time depends on someone noticing.
+
+The CLI action handler now writes a one-line `Warning: no --assignee given — task defaults to
+assigned_to: "<agent>" ...` to stderr whenever `--assignee` is not explicitly passed, so the caller
+notices immediately rather than discovering it later on the dashboard. No warning when `--assignee`
+is given explicitly, regardless of value.
+
+Closes task_1787699537830_61600762.
+
 ### Added — `bus update-task --append-desc` — a task description can now be corrected without churning its ID
 
 A task description had no edit path after creation: `update-task` only

@@ -362,5 +362,32 @@ describe.skipIf(!existsSync(DIST_CLI))(
       expect(audit[0].agent).toBe("boss");
       expect(audit[0].agent).not.toBe("grower");
     });
+
+    it("create-task without --assignee prints a stderr warning that it defaulted to the calling agent", async () => {
+      const { stdout, stderr, code } = await runCli([
+        "bus",
+        "create-task",
+        "unassigned title",
+      ]);
+
+      expect(code).toBe(0);
+      expect(stderr).toContain('Warning: no --assignee given');
+      expect(stderr).toContain('assigned_to: "dev"');
+      expect(stdout).toMatch(/^task_\d+_\d+\s*$/);
+    });
+
+    it("create-task with an explicit --assignee prints no warning", async () => {
+      const { stdout, stderr, code } = await runCli([
+        "bus",
+        "create-task",
+        "assigned title",
+        "--assignee",
+        "dev",
+      ]);
+
+      expect(code).toBe(0);
+      expect(stderr).toBe("");
+      expect(stdout).toMatch(/^task_\d+_\d+\s*$/);
+    });
   },
 );
