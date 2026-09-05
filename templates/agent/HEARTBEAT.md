@@ -175,7 +175,7 @@ timeout and it still failed" reports tonight never actually tested a raised time
 **RUN EACH FILE AS A BACKGROUND / UNCAPPED CALL. NEVER GATE COMPLETION ON A TIMEOUT, EXIT CODE, OR ELAPSED TIME.**
 ```bash
 cortextos bus kb-ingest "$f" --org "$CTX_ORG" --agent "$CTX_AGENT_NAME" --scope private --force \
-  > "/tmp/kb-ingest-${CTX_AGENT_NAME}-$(date -u +%Y%m%d-%H%M%S)-${BASHPID}-$(basename "$f").log" 2>&1 &
+  > "/tmp/kb-ingest-${CTX_AGENT_NAME}-$(date -u +%Y%m%d-%H%M%S)-$$-$(basename "$f").log" 2>&1 &
 ```
 `$$` alone collides across concurrent agent sessions on a shared host — `$CTX_AGENT_NAME` in the
 filename is required, not cosmetic (infra, 2026-08-25: a single heartbeat's log came back
@@ -183,12 +183,18 @@ interleaved with 7+ other agents' ingest output under the un-namespaced path). `
 alone is still not sufficient: PIDs get reused across days on a long-running box, and time-of-day-only
 labels (`hb2342`, `hb0342`) collide identically — infra, 2026-09-05, caught its own prior-day 429 log
 being misread as current via an hb-time-only filename. The UTC date+time component kills both the
-cross-agent and cross-day/cross-hour collisions in one form. **Use `${BASHPID}`, not `$$`** — `$$`
-always expands to the ORIGINATING shell's PID even for a backgrounded job, so two `&`-launched
-kb-ingest calls from the same loop iteration keep the identical `$$` (verified: same date-second +
-same `$$` + same file = the second silently overwrites the first's log) — `${BASHPID}` is the actual
-forked background process's own PID and reliably differs per job (CodeRabbit catch on PR #178,
-2026-09-05, verified before merging). PID remains only as the final tiebreaker
+cross-agent and cross-day/cross-hour collisions in one form.
+
+⚠️ **`${BASHPID}` was tried and reverted the same day (CodeRabbit's original suggestion on PR #178):
+it is a BASH-ONLY special variable and is UNDEFINED in zsh, which is the actual shell every agent's
+Bash tool (and this box's `$SHELL`) executes commands in — verified directly (`ZSH_VERSION` set,
+`BASH_VERSION` empty, `${BASHPID}` expands to nothing). Shipping it produced literal double-hyphen,
+empty-differentiator filenames in the real execution environment despite passing verification via an
+explicit `bash script.sh` subprocess — a different, non-representative shell context. `$$` remains
+the working differentiator here; it does not distinguish two `&`-launched siblings from the exact
+same loop iteration, but the Step 10 loop always launches DISTINCT files per iteration (basename
+already differentiates), so that theoretical gap does not occur in the documented usage.** PID
+remains only as the final tiebreaker
 for two calls landing in the same second.
 
 The only valid completion signal is the literal text `Ingest complete` appearing in that log — not `rc=0`,
