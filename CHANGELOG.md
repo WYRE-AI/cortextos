@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Added — daemon can surface a2a-inbox arrivals in real time instead of waiting for the next heartbeat
+
+`task_1788132068761_23739797`: a2a-inbox (`~/.cortextos/<instance>/a2a-inbox/*.json`, written by the
+external a2a-server process) had exactly one consumer — the owning agent's own HEARTBEAT.md Step 7.5d,
+polled on the agent's 4h heartbeat cadence. Two prior incidents (08-17: messages sat unprocessed 4-12
+days; 08-30: a briefing carried a refuted "silent" premise through two heartbeats) traced back to that
+cadence being structurally too slow for dispatch-latency traffic.
+
+`FastChecker` now polls a2a-inbox every cycle and injects an arrival notification — formatted like the
+existing Telegram/bus-inbox injection blocks — the moment a new file appears, rather than waiting for
+the next heartbeat fire. Fail-quiet and off by default: gated on a new `AgentConfig.a2a_inbox_owner`
+field (absent/false everywhere preserves current behavior exactly; no instance is affected until an
+agent's `config.json` explicitly opts in). Arrival-only by design — the watcher never moves, renames, or
+deletes a2a-inbox files; that stays the owning agent's existing Step 7.5d processing unchanged. Dedup is
+a small persisted "already-notified" filename set (`state/<agent>/.a2a-notified.json`), written only
+after a confirmed PTY injection so a failed injection retries the same arrival next poll instead of
+silently dropping it — the same pattern the bus inbox already uses for its ack ids.
+
 ### Fixed — `add-cron`/`remove-cron` mutated `crons.json` with no corresponding audit trail
 
 Theta-wave cycle #33 finding (task_1788142055347_87999645): a cron's disappearance from an
