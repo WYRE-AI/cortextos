@@ -445,6 +445,7 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
       approvalDir: join(orgBase, 'approvals'),
       analyticsDir: join(orgBase, 'analytics'),
       deliverablesDir: join(orgBase, 'deliverables'),
+      a2aInboxDir: join(ctxRoot, 'a2a-inbox'),
     };
     const blocked = listTasks(paths, { status: 'blocked' });
     scanned += blocked.length;

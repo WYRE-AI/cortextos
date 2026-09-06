@@ -530,6 +530,9 @@ export class AgentManager {
       // FastChecker only needs the first ID for its single-recipient typing
       // indicator / quick-checks. Multi-user is enforced by the gates above.
       allowedUserId: allowedUserId ? parseInt(allowedUserId.split(',')[0].trim(), 10) : undefined,
+      // Fail-quiet default (task_1788132068761_23739797): absent/false on
+      // every agent except the one instance owner that opts in.
+      a2aInboxOwner: config.a2a_inbox_owner === true,
     });
 
     // Send Telegram notification on crashes and session refreshes
