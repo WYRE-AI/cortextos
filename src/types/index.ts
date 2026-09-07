@@ -285,6 +285,15 @@ export interface AgentConfig {
    * acks first wins (see InboxMessage.fanout). Absent = advertises nothing.
    */
   capabilities?: string[];
+  /**
+   * Marks this agent as the a2a-inbox owner for its instance (see
+   * BusPaths.a2aInboxDir). Absent/false = current behavior preserved
+   * (fail-quiet): FastChecker never reads a2a-inbox for this agent, and
+   * arrivals are only surfaced by the agent's own HEARTBEAT.md polling step.
+   * Exactly one agent per instance should set this to true — there is no
+   * general multi-target routing (task_1788132068761_23739797 design).
+   */
+  a2a_inbox_owner?: boolean;
 }
 
 export interface CronEntry {
@@ -754,6 +763,16 @@ export interface BusPaths {
    * they live under CTX_ROOT.
    */
   deliverablesDir: string;
+  /**
+   * Instance-level (not agent-level) a2a-inbox: {ctxRoot}/a2a-inbox/*.json,
+   * written by the external a2a-server process. Exactly one agent per
+   * instance is configured as the owner (AgentConfig.a2a_inbox_owner) and
+   * polls it via FastChecker; everyone else's `paths.a2aInboxDir` still
+   * resolves but is never read. Optional (rather than required) so the
+   * many existing hand-built BusPaths test fixtures that predate this field
+   * keep compiling — always populated by resolvePaths().
+   */
+  a2aInboxDir?: string;
 }
 
 // IPC Types
