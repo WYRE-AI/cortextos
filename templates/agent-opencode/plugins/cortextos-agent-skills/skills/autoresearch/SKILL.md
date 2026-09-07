@@ -34,6 +34,7 @@ Read the output carefully. Pay attention to:
 
 ### Step 2: Evaluate Previous Experiment
 If there is an active experiment (check `experiments/active.json`):
+- **Check whether the experiment's own window has actually closed (`started_at` + `window`) before doing anything else.** Your cron's fixed cadence and the experiment's window are two independent clocks — they will not always land on the same moment (added 2026-09-03, boss/marketing: a weekly cron fired 18h43m before that cycle's window closed). If the window has NOT closed yet: **skip evaluation this fire, do nothing else with this experiment, and let it run to your next cron fire.** Do not evaluate early to avoid "wasting" this fire (violates the window), and do not treat the still-running experiment as orphaned or stale just because this particular fire landed early — it isn't overdue, your clock is just out of phase with it this cycle. Log a one-line heartbeat/memory note that you're bridging, then move on to other cron work this fire.
 - Compare ALL relevant aspects: the surface changes you made, the context around those changes, and the output metric
 - Measure the metric using the configured measurement method
 - Run evaluate-experiment:
