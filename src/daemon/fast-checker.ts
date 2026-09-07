@@ -453,8 +453,19 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     kind?: string;
     payload?: { text?: string } & Record<string, unknown>;
   }): string {
-    const safeName = sanitizeForPtyInjection(msg.sender?.name || 'unknown');
-    const safeKind = sanitizeForPtyInjection(msg.kind || 'unknown');
+    // sanitizeForPtyInjection alone is not enough for a HEADER field (as
+    // opposed to a fenced body): it neutralizes known header strings
+    // (=== AGENT MESSAGE / TELEGRAM) but has no entry for the new "A2A
+    // MESSAGE" header this function introduces, so an embedded newline in
+    // sender.name/kind followed by a forged header would pass through
+    // unrecognized (CodeRabbit PR #179 review). Force both to a single line
+    // — the header has no legitimate use for multi-line values — which
+    // closes the whole class regardless of what string is forged after the
+    // newline, rather than only the specific strings the shared sanitizer
+    // happens to enumerate.
+    const toSingleLine = (s: string) => s.replace(/[\r\n]+/g, ' ');
+    const safeName = toSingleLine(sanitizeForPtyInjection(msg.sender?.name || 'unknown'));
+    const safeKind = toSingleLine(sanitizeForPtyInjection(msg.kind || 'unknown'));
     const preview = typeof msg.payload?.text === 'string' ? msg.payload.text : JSON.stringify(msg.payload ?? {});
     return `=== A2A MESSAGE from ${safeName} (kind:${safeKind}, instance:${basename(this.paths.ctxRoot)}) ===
 ${wrapFenceSafe(preview)}

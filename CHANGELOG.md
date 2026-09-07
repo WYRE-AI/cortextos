@@ -36,6 +36,13 @@ a small persisted "already-notified" filename set (`state/<agent>/.a2a-notified.
 after a confirmed PTY injection so a failed injection retries the same arrival next poll instead of
 silently dropping it — the same pattern the bus inbox already uses for its ack ids.
 
+`a2a_inbox_owner` is enforced as exactly-one-per-instance: `AgentManager` tracks the currently-granted
+owner and refuses (loudly, via a log line naming both agents) a second agent's claim rather than letting
+both poll the same a2a-inbox and both inject duplicate notifications — caught by CodeRabbit's PR #179
+review before merge. Header fields in the arrival notification (sender name, message kind) are forced to
+a single line before interpolation, closing a newline-based header-forgery injection vector the shared
+PTY-injection sanitizer doesn't cover for this new header format (same review).
+
 ### Fixed — `migration-collision-check.yml` listed open PRs with a POST
 
 The cross-PR scan called `gh api repos/<repo>/pulls --paginate --slurp -f state=open -f base=<ref> -f per_page=100`. `gh api` defaults to GET, and switches to POST whenever any `-f`/`--raw-field` is present. That call was `POST /repos/{owner}/{repo}/pulls` (create a pull request), which `GITHUB_TOKEN` cannot do, so consumer CI (WYRE-AI/conduit PR #1895) failed with `gh: Resource not accessible by integration (HTTP 403)` and a `subprocess.CalledProcessError`. The 403 is not a permissions gap on GET listing and not a migration collision.
