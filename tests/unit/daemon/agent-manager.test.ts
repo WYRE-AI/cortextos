@@ -364,6 +364,79 @@ describe('AgentManager - duplicate agent names across orgs (BUG-011 false alarm 
   });
 });
 
+describe('AgentManager.claimA2AInboxOwner — exactly-one-per-instance enforcement (task_1788132068761_23739797, CodeRabbit PR #179 review)', () => {
+  let testDir: string;
+  let am: AgentManager;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-a2a-owner-'));
+    am = new AgentManager('default', join(testDir, 'instance'), join(testDir, 'framework'), 'acme');
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('grants the claim when nobody currently holds it', () => {
+    const granted = (am as any).claimA2AInboxOwner('alice', true, () => {});
+    expect(granted).toBe(true);
+    expect((am as any).a2aInboxOwner).toBe('alice');
+  });
+
+  it('returns false without touching state when not requested', () => {
+    const granted = (am as any).claimA2AInboxOwner('alice', false, () => {});
+    expect(granted).toBe(false);
+    expect((am as any).a2aInboxOwner).toBeNull();
+  });
+
+  it('re-granting the SAME agent (e.g. a restart) is not a conflict', () => {
+    (am as any).claimA2AInboxOwner('alice', true, () => {});
+    const granted = (am as any).claimA2AInboxOwner('alice', true, () => {});
+    expect(granted).toBe(true);
+    expect((am as any).a2aInboxOwner).toBe('alice');
+  });
+
+  it('refuses a second agent while the first still holds the claim, and logs naming both agents', () => {
+    (am as any).claimA2AInboxOwner('alice', true, () => {});
+    const log = vi.fn();
+
+    const granted = (am as any).claimA2AInboxOwner('bob', true, log);
+
+    expect(granted).toBe(false);
+    expect((am as any).a2aInboxOwner).toBe('alice'); // unchanged — alice keeps it
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toContain('bob');
+    expect(log.mock.calls[0][0]).toContain('alice');
+  });
+
+  it('stopAgent releases the claim so a different agent can take over afterward', async () => {
+    (am as any).claimA2AInboxOwner('alice', true, () => {});
+    (am as any).agents.set('alice', {
+      process: { stop: async () => {}, getPid: () => undefined },
+      checker: { stop() {} },
+    });
+
+    await am.stopAgent('alice');
+    expect((am as any).a2aInboxOwner).toBeNull();
+
+    const granted = (am as any).claimA2AInboxOwner('bob', true, () => {});
+    expect(granted).toBe(true);
+    expect((am as any).a2aInboxOwner).toBe('bob');
+  });
+
+  it('stopAgent for a NON-owner does not clear an unrelated owner claim', async () => {
+    (am as any).claimA2AInboxOwner('alice', true, () => {});
+    (am as any).agents.set('bob', {
+      process: { stop: async () => {}, getPid: () => undefined },
+      checker: { stop() {} },
+    });
+
+    await am.stopAgent('bob');
+
+    expect((am as any).a2aInboxOwner).toBe('alice');
+  });
+});
+
 describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', () => {
   let testDir: string;
   let ctxRoot: string;

@@ -20,6 +20,13 @@ a small persisted "already-notified" filename set (`state/<agent>/.a2a-notified.
 after a confirmed PTY injection so a failed injection retries the same arrival next poll instead of
 silently dropping it — the same pattern the bus inbox already uses for its ack ids.
 
+`a2a_inbox_owner` is enforced as exactly-one-per-instance: `AgentManager` tracks the currently-granted
+owner and refuses (loudly, via a log line naming both agents) a second agent's claim rather than letting
+both poll the same a2a-inbox and both inject duplicate notifications — caught by CodeRabbit's PR #179
+review before merge. Header fields in the arrival notification (sender name, message kind) are forced to
+a single line before interpolation, closing a newline-based header-forgery injection vector the shared
+PTY-injection sanitizer doesn't cover for this new header format (same review).
+
 ### Fixed — `add-cron`/`remove-cron` mutated `crons.json` with no corresponding audit trail
 
 Theta-wave cycle #33 finding (task_1788142055347_87999645): a cron's disappearance from an
