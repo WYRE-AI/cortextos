@@ -2,7 +2,8 @@ import { execSync } from 'child_process';
 import { existsSync, readFileSync, readdirSync, appendFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { ensureDir } from '../utils/atomic.js';
-import { TelegramAPI } from '../telegram/api.js';
+import { SlackAPI } from '../slack/api.js';
+import { parseEnvFile } from '../utils/env.js';
 import type { BusPaths, TaskStatus } from '../types/index.js';
 import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -727,73 +728,84 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
 }
 
 /**
- * Post a message to the org's Telegram activity channel.
+ * Post a message to the org's Slack activity channel.
  *
  * Returns false if not configured (silent fail — callers can ignore the
  * return value and treat activity-channel posting as best-effort).
  *
- * `replyMarkup` is an optional Telegram inline keyboard (or any reply
- * markup shape). When provided, the message ships with the keyboard
- * attached — used for interactive workflows like approval Approve/Deny
- * buttons posted alongside approval creation. Leaving it undefined
- * preserves the prior one-way notification shape exactly.
+ * Text-only. `replyMarkup` is accepted for call-site compatibility with the
+ * prior Telegram version (which shipped it as an inline keyboard) but is
+ * unused here — Slack's equivalent (Block Kit buttons) needs interactive-
+ * payload handling that isn't built yet (see socket-mode.ts: it only parses
+ * `events_api` envelopes, not the `interactive` frame type a button click
+ * sends). Approve/Deny from a posted approval goes through the dashboard
+ * until that lands.
  *
- * Mirrors bash bus/post-activity.sh.
+ * Two config sources, both file-based so a short-lived CLI invocation gets
+ * a real value regardless of the calling agent's ambient shell env:
+ *  - activity-channel.env: ACTIVITY_SLACK_CHANNEL_ID, the one org-specific
+ *    value this feature needs.
+ *  - secrets.env: SLACK_BOT_TOKEN — same key name the daemon's Socket Mode
+ *    connection already reads (see agent-manager.ts), so there is exactly
+ *    one name for this credential fleet-wide, not a second one scoped to
+ *    just this call site.
+ *
+ * Formerly mirrored bash bus/post-activity.sh (Telegram). That script is
+ * stale as of this change — see PR description.
  */
 export async function postActivity(
   orgDir: string,
   ctxRoot: string,
   org: string,
   message: string,
-  replyMarkup?: object,
+  _replyMarkup?: object,
 ): Promise<boolean> {
-  // Look for activity-channel.env
-  const candidates = [
+  const activityCandidates = [
     join(orgDir, 'activity-channel.env'),
     join(ctxRoot, 'orgs', org, 'activity-channel.env'),
   ];
 
-  let configPath: string | null = null;
-  for (const candidate of candidates) {
+  let channelId: string | undefined;
+  for (const candidate of activityCandidates) {
     if (existsSync(candidate)) {
-      configPath = candidate;
-      break;
+      channelId = parseEnvFile(candidate).ACTIVITY_SLACK_CHANNEL_ID;
+      if (channelId) break;
     }
   }
 
-  if (!configPath) {
+  if (!channelId) {
+    console.warn(
+      `[activity-channel] ACTIVITY_SLACK_CHANNEL_ID not set (checked ${activityCandidates.join(', ')}) — skipping Slack post.`,
+    );
     return false;
   }
 
-  // Parse the env file
+  const secretsCandidates = [
+    join(orgDir, 'secrets.env'),
+    join(ctxRoot, 'orgs', org, 'secrets.env'),
+  ];
+
   let botToken: string | undefined;
-  let chatId: string | undefined;
-
-  try {
-    const content = readFileSync(configPath, 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx <= 0) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const value = trimmed.slice(eqIdx + 1).trim();
-      if (key === 'ACTIVITY_BOT_TOKEN') botToken = value;
-      if (key === 'ACTIVITY_CHAT_ID') chatId = value;
+  for (const candidate of secretsCandidates) {
+    if (existsSync(candidate)) {
+      botToken = parseEnvFile(candidate).SLACK_BOT_TOKEN;
+      if (botToken) break;
     }
-  } catch {
-    return false;
   }
 
-  if (!botToken || !chatId) {
+  if (!botToken) {
+    console.warn(
+      `[activity-channel] SLACK_BOT_TOKEN not set (checked ${secretsCandidates.join(', ')}) — skipping Slack post.`,
+    );
     return false;
   }
 
   try {
-    const api = new TelegramAPI(botToken);
-    await api.sendMessage(chatId, message, replyMarkup);
+    const api = new SlackAPI(botToken);
+    await api.postMessage({ channel: channelId, text: message });
     return true;
-  } catch {
+  } catch (err) {
+    console.warn(`[activity-channel] Slack post failed: ${(err as Error).message}`);
     return false;
   }
 }

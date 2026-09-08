@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Changed — activity channel (`postActivity`) now posts to Slack instead of Telegram
+
+`orgs/<org>/activity-channel.env` (Telegram `ACTIVITY_BOT_TOKEN`/`ACTIVITY_CHAT_ID`) had never
+been configured anywhere in the fleet — verified absent 2026-08-15 and re-verified 2026-09-03 and
+2026-09-08 — because it needed a human to BotFather a bot and hand back a token, and that
+[HUMAN] task had aged through 6+ duplicate filings since 2026-07-16 with no progress
+(`task_1786122601201_28151267`). Every approval and activity broadcast silently degraded to
+"nobody notified" the entire time.
+
+`postActivity` (`src/bus/system.ts`) now posts to Slack via the existing `SlackAPI` (SP3a,
+already proven elsewhere) instead of `TelegramAPI`. Text-only — no interactive buttons — because
+Slack's equivalent needs Block Kit + inbound `interactive`-payload handling that isn't built yet
+(`socket-mode.ts` currently only parses `events_api` envelopes). `postApprovalToActivityChannel`
+(`src/bus/approval.ts`) drops the Telegram inline Approve/Deny keyboard it used to build and adds
+a "resolve via the dashboard" line to the message instead.
+
+Config surface shrinks to one new value: `ACTIVITY_SLACK_CHANNEL_ID` in `activity-channel.env`.
+The bot token is *not* a new per-feature secret — it reads `SLACK_BOT_TOKEN` from `secrets.env`,
+the same key name the daemon's Socket Mode connection already uses, so there's exactly one name
+for this credential fleet-wide. Wired live for `wyre` against `#agent-ops` (an empty, unused
+channel — history checked before adopting it) after `conversations.create` for a fresh channel
+came back `missing_scope: channels:manage` on the available token.
+
+Interactive Approve/Deny buttons remain deferred behind the unbuilt Slack interactive-payload
+handling (tracked separately) — not a regression from where activity-channel actually stood
+(never configured), since there was no working button flow to preserve.
+
 ### Fixed — `add-cron`/`remove-cron` mutated `crons.json` with no corresponding audit trail
 
 Theta-wave cycle #33 finding (task_1788142055347_87999645): a cron's disappearance from an

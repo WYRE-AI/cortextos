@@ -89,7 +89,7 @@ describe('createApproval', () => {
     expect(approval.org).toBe('TestOrg');
   });
 
-  it('posts to the activity channel with Approve/Deny inline keyboard (framework orgDir, not ctxRoot)', async () => {
+  it('posts a text-only activity-channel message with a dashboard hint (framework orgDir, not ctxRoot)', async () => {
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Push to main', 'deployment', 'rationale', frameworkRoot);
 
     expect(postActivitySpy).toHaveBeenCalledTimes(1);
@@ -114,19 +114,12 @@ describe('createApproval', () => {
     expect(String(message)).toContain('deployment');
     expect(String(message)).toContain('alice');
     expect(String(message)).toContain(id);
-
-    // Inline keyboard: single row, two buttons, callback_data prefixes
-    // keyed on the approval id.
-    expect(replyMarkup).toBeDefined();
-    const rows = replyMarkup.inline_keyboard;
-    expect(Array.isArray(rows)).toBe(true);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toHaveLength(2);
-    expect(rows[0][0].callback_data).toBe(`appr_allow_${id}`);
-    expect(rows[0][1].callback_data).toBe(`appr_deny_${id}`);
-    // Button labels should clearly say Approve / Deny regardless of emoji.
-    expect(String(rows[0][0].text)).toMatch(/Approve/);
-    expect(String(rows[0][1].text)).toMatch(/Deny/);
+    // Text-only: no interactive keyboard is built or passed (Slack
+    // interactive buttons need unbuilt SP3c payload handling — see
+    // postActivity's docblock in system.ts). Resolution happens via the
+    // dashboard, and the message says so.
+    expect(replyMarkup).toBeUndefined();
+    expect(String(message)).toMatch(/dashboard/i);
   });
 
   it('activity-channel post failure is suppressed: approval creation succeeds even when postActivity rejects', async () => {

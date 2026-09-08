@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -221,8 +221,15 @@ describe('Bus System', () => {
     });
   });
 
-  describe('postActivity', () => {
-    it('returns false when not configured', async () => {
+  describe('postActivity (Slack)', () => {
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      fetchMock = vi.fn();
+      global.fetch = fetchMock as any;
+    });
+
+    it('returns false when activity-channel.env is absent (no channel id)', async () => {
       const result = await postActivity(
         join(testDir, 'nonexistent'),
         testDir,
@@ -230,21 +237,53 @@ describe('Bus System', () => {
         'hello',
       );
       expect(result).toBe(false);
+      expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('returns false when env file has no token', async () => {
+    it('returns false when activity-channel.env has no ACTIVITY_SLACK_CHANNEL_ID', async () => {
       const orgDir = join(testDir, 'orgdir');
       mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_CHAT_ID=123\n');
+      writeFileSync(join(orgDir, 'activity-channel.env'), '# no channel id yet\n');
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
+      expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('returns false when env file has no chat ID', async () => {
+    it('returns false when secrets.env has no SLACK_BOT_TOKEN', async () => {
       const orgDir = join(testDir, 'orgdir');
       mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_BOT_TOKEN=abc123\n');
+      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(false);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('posts to Slack chat.postMessage when both values are configured', async () => {
+      const orgDir = join(testDir, 'orgdir');
+      mkdirSync(orgDir, { recursive: true });
+      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
+      writeFileSync(join(orgDir, 'secrets.env'), 'SLACK_BOT_TOKEN=xoxb-test\n');
+      fetchMock.mockResolvedValue({ ok: true, json: async () => ({ ok: true, channel: 'C123', ts: '1.0' }) });
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(true);
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://slack.com/api/chat.postMessage',
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: 'Bearer xoxb-test' }),
+          body: JSON.stringify({ channel: 'C123', text: 'hello' }),
+        }),
+      );
+    });
+
+    it('returns false and does not throw when the Slack API call fails', async () => {
+      const orgDir = join(testDir, 'orgdir');
+      mkdirSync(orgDir, { recursive: true });
+      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
+      writeFileSync(join(orgDir, 'secrets.env'), 'SLACK_BOT_TOKEN=xoxb-test\n');
+      fetchMock.mockResolvedValue({ ok: true, json: async () => ({ ok: false, error: 'channel_not_found' }) });
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);

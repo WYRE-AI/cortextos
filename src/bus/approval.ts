@@ -10,24 +10,13 @@ import { sendMessage } from './message.js';
 import { postActivity } from './system.js';
 
 /**
- * Build the inline keyboard posted to the activity channel alongside a
- * newly-created approval. Two buttons (Approve / Deny) with callback_data
- * keyed on the approval id so fast-checker's activity-channel callback
- * handler can route them to updateApproval.
- */
-function buildApprovalKeyboard(approvalId: string): object {
-  return {
-    inline_keyboard: [[
-      { text: '✅ Approve', callback_data: `appr_allow_${approvalId}` },
-      { text: '❌ Deny', callback_data: `appr_deny_${approvalId}` },
-    ]],
-  };
-}
-
-/**
- * Post a newly-created approval to the org's activity channel with
- * Approve/Deny inline buttons. Returns a promise that resolves once the
- * post attempt has settled.
+ * Post a newly-created approval to the org's activity channel. Returns a
+ * promise that resolves once the post attempt has settled.
+ *
+ * Text-only: the activity channel now posts to Slack, and clickable
+ * Approve/Deny buttons need Slack interactive-payload handling that isn't
+ * built yet (see postActivity's docblock in system.ts). Resolve from the
+ * dashboard instead — the message says so.
  *
  * Path resolution: activity-channel.env lives under the FRAMEWORK root
  * (frameworkRoot/orgs/<org>/activity-channel.env), NOT the runtime state
@@ -79,18 +68,19 @@ function postApprovalToActivityChannel(
   if (context) {
     lines.push('', context);
   }
-  lines.push('', `id: ${approvalId}`);
+  lines.push('', `id: ${approvalId}`, 'Approve/deny via the dashboard.');
   const message = lines.join('\n');
 
-  return postActivity(orgDir, paths.ctxRoot, org, message, buildApprovalKeyboard(approvalId))
+  return postActivity(orgDir, paths.ctxRoot, org, message)
     .then((posted) => {
       if (!posted) {
-        // postActivity returns false when activity-channel.env is missing
-        // or cannot be parsed. Surface this visibly — the silent-false
-        // pattern is what hid tonight's path-resolution bug for hours.
+        // postActivity returns false when activity-channel.env or
+        // secrets.env is missing/unparseable. Surface this visibly — the
+        // silent-false pattern is what hid the original path-resolution
+        // bug for hours.
         console.warn(
           `[approval] Activity-channel post failed for ${approvalId} — ` +
-          `check ${orgDir}/activity-channel.env (must define ACTIVITY_BOT_TOKEN + ACTIVITY_CHAT_ID).`,
+          `check ${orgDir}/activity-channel.env (needs ACTIVITY_SLACK_CHANNEL_ID) and secrets.env (needs SLACK_BOT_TOKEN).`,
         );
       }
     })
