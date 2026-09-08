@@ -29,6 +29,13 @@ Interactive Approve/Deny buttons remain deferred behind the unbuilt Slack intera
 handling (tracked separately) — not a regression from where activity-channel actually stood
 (never configured), since there was no working button flow to preserve.
 
+`postActivity` dropped its unused `replyMarkup` parameter entirely (dev's review: zero callers on
+this branch pass a 5th arg, and Block Kit's shape wouldn't fit the old `object` type anyway — the
+interactive follow-up will define its own). Behavior note also from that review: each config file
+lookup now keeps searching past a candidate path that *exists* but lacks the needed key, rather
+than stopping at the first existing file regardless of content — a real (if minor) change from the
+prior Telegram version, not merely a rename of the same logic.
+
 ### Fixed — `add-cron`/`remove-cron` mutated `crons.json` with no corresponding audit trail
 
 Theta-wave cycle #33 finding (task_1788142055347_87999645): a cron's disappearance from an

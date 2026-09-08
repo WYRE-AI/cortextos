@@ -733,16 +733,19 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
  * Returns false if not configured (silent fail — callers can ignore the
  * return value and treat activity-channel posting as best-effort).
  *
- * Text-only. `replyMarkup` is accepted for call-site compatibility with the
- * prior Telegram version (which shipped it as an inline keyboard) but is
- * unused here — Slack's equivalent (Block Kit buttons) needs interactive-
- * payload handling that isn't built yet (see socket-mode.ts: it only parses
- * `events_api` envelopes, not the `interactive` frame type a button click
- * sends). Approve/Deny from a posted approval goes through the dashboard
- * until that lands.
+ * Text-only — no interactive buttons. Slack's equivalent (Block Kit
+ * buttons) needs interactive-payload handling that isn't built yet (see
+ * socket-mode.ts: it only parses `events_api` envelopes, not the
+ * `interactive` frame type a button click sends). Approve/Deny from a
+ * posted approval goes through the dashboard until that lands — when it
+ * does, it'll need its own param, since Block Kit blocks are a different
+ * shape than the Telegram inline keyboard this function used to accept.
  *
  * Two config sources, both file-based so a short-lived CLI invocation gets
- * a real value regardless of the calling agent's ambient shell env:
+ * a real value regardless of the calling agent's ambient shell env. Each
+ * checks its two candidate paths independently and keeps going past a
+ * candidate that exists but lacks the key — a file present with the wrong
+ * (or no) key should not stop the search the way a missing file does:
  *  - activity-channel.env: ACTIVITY_SLACK_CHANNEL_ID, the one org-specific
  *    value this feature needs.
  *  - secrets.env: SLACK_BOT_TOKEN — same key name the daemon's Socket Mode
@@ -758,7 +761,6 @@ export async function postActivity(
   ctxRoot: string,
   org: string,
   message: string,
-  _replyMarkup?: object,
 ): Promise<boolean> {
   const activityCandidates = [
     join(orgDir, 'activity-channel.env'),
