@@ -17,7 +17,7 @@ export interface Experiment {
   direction: 'higher' | 'lower';
   window: string;
   measurement: string;
-  status: 'proposed' | 'running' | 'completed';
+  status: 'proposed' | 'running' | 'completed' | 'closed';
   /** The baseline this experiment was actually evaluated against. Frozen at
    * whatever value it held when the experiment was created — evaluateExperiment
    * never mutates it. Historical fact: "what was this cycle compared against."
@@ -53,6 +53,19 @@ export interface Experiment {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  /** Set by closeExperiment when status transitions to 'closed'. Free-text —
+   * covers every reason a proposal or run needs to be terminated without a
+   * measured result: a declined approval, a decision made and documented
+   * elsewhere, superseded by a later experiment, or a running experiment
+   * that's structurally unevaluatable (e.g. no baseline_value). Distinct
+   * from `decision`, which is ONLY ever set by evaluateExperiment against a
+   * real measurement — closing an experiment is never a keep/discard verdict,
+   * it's "this record will never produce one." null until closed. */
+  closed_reason: string | null;
+  /** When closeExperiment ran. Deliberately separate from completed_at
+   * (which stays null on a closed record) — completed_at means "produced a
+   * real measured result," and a closed experiment never did. */
+  closed_at: string | null;
   changes_description: string | null;
   kind: 'intervention' | 'snapshot';
   /** Approval linked at creation when config.approval_required is set (see
@@ -243,6 +256,8 @@ export function createExperiment(
     created_at: nowISO(),
     started_at: null,
     completed_at: null,
+    closed_reason: null,
+    closed_at: null,
     changes_description: null,
     kind: options?.kind ?? 'intervention',
     approval_id: null,
@@ -522,6 +537,70 @@ export function evaluateExperiment(
       unlinkSync(activePath);
     } catch {
       // ignore
+    }
+  }
+
+  return experiment;
+}
+
+/**
+ * Close an experiment that will never produce a measured result.
+ *
+ * Covers every case where a 'proposed' or 'running' experiment needs a
+ * terminal state without going through runExperiment → evaluateExperiment:
+ * an approval that was declined, a decision documented elsewhere (a surface
+ * doc, a superseding experiment), or a running experiment that's
+ * structurally unevaluatable (e.g. no baseline_value — evaluateExperiment
+ * refuses those outright, and there's no retrofit path, so closing is the
+ * only way out).
+ *
+ * Refuses from 'completed' or already-'closed' — both are already terminal.
+ * Closing a completed experiment would bury a real measured result under a
+ * status that means "never got one."
+ *
+ * `reason` is required and stored verbatim in `closed_reason` — it's the
+ * only durable record of why this experiment never completed normally, so
+ * it should name the concrete cause (a linked approval id, a superseding
+ * experiment id, a surface doc reference) rather than a generic word.
+ *
+ * Deliberately does NOT touch `decision`: closing is never a keep/discard
+ * verdict, and reusing that field here would make a future reader unable to
+ * tell a real mechanical result from "we gave up on this one."
+ */
+export function closeExperiment(
+  agentDir: string,
+  experimentId: string,
+  reason: string,
+): Experiment {
+  const experiment = loadExperiment(agentDir, experimentId);
+
+  if (experiment.status === 'completed' || experiment.status === 'closed') {
+    throw new Error(
+      `Experiment ${experimentId} is already '${experiment.status}' — refusing to close. ` +
+      `Only 'proposed' or 'running' experiments can be closed.`,
+    );
+  }
+
+  experiment.status = 'closed';
+  experiment.closed_reason = reason;
+  experiment.closed_at = nowISO();
+
+  saveExperiment(agentDir, experiment);
+
+  // Mirror evaluateExperiment's active.json cleanup: closing the currently
+  // active experiment must clear it too, or a stale entry keeps pointing at
+  // a run that's now terminal. Only removes it when it names THIS
+  // experiment — a proposed experiment being closed was never active, and a
+  // different experiment's active run must not be disturbed.
+  const activePath = join(agentDir, 'experiments', 'active.json');
+  if (existsSync(activePath)) {
+    try {
+      const active = JSON.parse(readFileSync(activePath, 'utf-8').trim()) as Experiment;
+      if (active.id === experimentId) {
+        unlinkSync(activePath);
+      }
+    } catch {
+      // active.json corruption isn't this function's problem — leave it.
     }
   }
 

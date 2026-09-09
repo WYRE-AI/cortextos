@@ -6,6 +6,7 @@ import {
   createExperiment,
   runExperiment,
   evaluateExperiment,
+  closeExperiment,
   listExperiments,
   listAllExperiments,
   gatherContext,
@@ -581,6 +582,79 @@ describe('Sprint 3: Experiment Framework', () => {
     });
   });
 
+  describe('closeExperiment', () => {
+    it('closes a proposed experiment with the given reason', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h1');
+      const closed = closeExperiment(testDir, id, 'Approval declined — approval_123');
+
+      expect(closed.status).toBe('closed');
+      expect(closed.closed_reason).toBe('Approval declined — approval_123');
+      expect(closed.closed_at).not.toBeNull();
+      expect(closed.completed_at).toBeNull(); // never produced a real result
+      expect(closed.decision).toBeNull(); // closing is never a keep/discard verdict
+
+      const onDisk = JSON.parse(
+        readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim(),
+      );
+      expect(onDisk.status).toBe('closed');
+    });
+
+    it('closes a running experiment, including one with no baseline_value that evaluate-experiment would refuse', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h1'); // no --baseline
+      runExperiment(testDir, id);
+
+      expect(() => evaluateExperiment(testDir, id, 5)).toThrow(/no baseline_value/);
+
+      const closed = closeExperiment(testDir, id, 'Superseded by exp_9999_zzzzz, structurally unevaluatable');
+      expect(closed.status).toBe('closed');
+      expect(closed.closed_reason).toContain('Superseded');
+    });
+
+    it('clears active.json when closing the currently active experiment', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h1');
+      runExperiment(testDir, id);
+      const activePath = join(testDir, 'experiments', 'active.json');
+      expect(existsSync(activePath)).toBe(true);
+
+      closeExperiment(testDir, id, 'Abandoned mid-run');
+      expect(existsSync(activePath)).toBe(false);
+    });
+
+    it('does not disturb a different experiment\'s active.json', () => {
+      const proposedId = createExperiment(testDir, 'testbot', 'ctr', 'h1');
+      const runningId = createExperiment(testDir, 'testbot', 'ctr', 'h2');
+      runExperiment(testDir, runningId);
+
+      closeExperiment(testDir, proposedId, 'Never going to run this one');
+
+      const activePath = join(testDir, 'experiments', 'active.json');
+      expect(existsSync(activePath)).toBe(true);
+      const active = JSON.parse(readFileSync(activePath, 'utf-8').trim());
+      expect(active.id).toBe(runningId);
+    });
+
+    it('refuses to close an already-completed experiment', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h1', { baseline: 0 });
+      runExperiment(testDir, id);
+      evaluateExperiment(testDir, id, 5);
+
+      expect(() => closeExperiment(testDir, id, 'trying to close a completed one')).toThrow(
+        /already 'completed'/,
+      );
+    });
+
+    it('refuses to close an already-closed experiment (no double-close)', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h1');
+      closeExperiment(testDir, id, 'first reason');
+
+      expect(() => closeExperiment(testDir, id, 'second reason')).toThrow(/already 'closed'/);
+    });
+
+    it('throws for a nonexistent experiment', () => {
+      expect(() => closeExperiment(testDir, 'exp_nonexistent_00000', 'reason')).toThrow(/not found/);
+    });
+  });
+
   describe('listExperiments', () => {
     it('returns all experiments sorted by created_at desc', () => {
       createExperiment(testDir, 'bot1', 'metric_a', 'hyp1');
@@ -601,6 +675,19 @@ describe('Sprint 3: Experiment Framework', () => {
       const running = listExperiments(testDir, { status: 'running' });
       expect(running).toHaveLength(1);
       expect(running[0].id).toBe(id1);
+
+      const proposed = listExperiments(testDir, { status: 'proposed' });
+      expect(proposed).toHaveLength(1);
+    });
+
+    it('filters by status closed', () => {
+      const id1 = createExperiment(testDir, 'bot1', 'ctr', 'h1');
+      createExperiment(testDir, 'bot1', 'ctr', 'h2');
+      closeExperiment(testDir, id1, 'declined');
+
+      const closed = listExperiments(testDir, { status: 'closed' });
+      expect(closed).toHaveLength(1);
+      expect(closed[0].id).toBe(id1);
 
       const proposed = listExperiments(testDir, { status: 'proposed' });
       expect(proposed).toHaveLength(1);
