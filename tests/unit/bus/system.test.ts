@@ -367,6 +367,53 @@ describe('Bus System', () => {
       expect(report.entries[0].detail).not.toContain('PR #306');
     });
 
+    // task_1788535091729: task_1788446092100_21920670 / #170 and
+    // task_1788464546954_33593143 / #172 both re-flagged identically every
+    // scan even though a full github.com/.../pull/N URL for the same
+    // number, resolving the repo, was already on record right alongside the
+    // bare mention.
+    it('does not flag a bare "PR #N" mention when a full github.com URL for the same number appears anywhere in the same text', () => {
+      writeTask('myorg', {
+        id: 'task_url_resolved',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'blocked on PR#172 merging. See https://github.com/WYRE-AI/cortextos/pull/172 for status — currently blocked_by Aaron\'s click.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('still flags a bare "PR #N" mention when a full URL is present for a DIFFERENT PR number', () => {
+      writeTask('myorg', {
+        id: 'task_url_different',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'blocked on PR#67 merging. Related work landed in https://github.com/WYRE-AI/cortextos/pull/99.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    it('does not flag a PR cited ONLY as a full github.com URL, with no bare "PR #N" form anywhere', () => {
+      writeTask('myorg', {
+        id: 'task_url_only',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'blocked on https://github.com/WYRE-AI/cortextos/pull/181 merging.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
     it('does not flag other precedent-citation phrasings ("see PR #NN for the pattern", "e.g.", "prior art")', () => {
       writeTask('org-a', {
         id: 'task_see_pattern',

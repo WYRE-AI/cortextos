@@ -234,6 +234,33 @@ export interface StaleBlockerReport {
 // structured field.
 const PR_REFERENCE_REGEX = /\bPR\s*#\s*(\d+)\b/gi;
 
+// task_1788535091729: a bare "PR #NN" is unverifiable (task_1786068529924's
+// own research: no structured field names which repo it belongs to). A full
+// github.com/<owner>/<repo>/pull/<n> URL for the SAME number is the opposite
+// case — it names the repo explicitly, so there's nothing left to verify.
+// Two recurring false-positive shapes this fixes: (1) a task cites a PR only
+// as a full URL (never as bare "PR #N") — previously invisible to the
+// extraction regex entirely, so recognized here in its own right; (2) a task
+// cites the SAME PR both ways ("blocked on PR #172... see
+// https://github.com/WYRE-AI/cortextos/pull/172 for status") — the bare
+// mention re-flagged every scan even though the adjacent URL already
+// resolved it (confirmed live: task_1788446092100_21920670 / #170,
+// task_1788464546954_33593143 / #172, both with the full URL and a correct
+// blocked_by-Aaron's-click status already on record, re-flagged anyway).
+//
+// Deliberately matches ANYWHERE in the text, not proximity-windowed like
+// isPrecedentCitation/isDismissedElsewhere — those two are about judging
+// whether a mention is a genuine blocker vs. an example/dismissal, which is
+// proximity-sensitive prose disambiguation. This is just "does the task
+// record independently name which repo PR #N belongs to," which a URL
+// anywhere in the same text answers regardless of distance from the bare
+// mention.
+const GITHUB_PR_URL_REGEX = /\bgithub\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)\b/gi;
+
+function extractUrlResolvedPrNumbers(text: string): Set<string> {
+  return new Set([...text.matchAll(GITHUB_PR_URL_REGEX)].map(m => m[1]));
+}
+
 // task_1786548092193 (analyst/forge, 2026-08-12 first live run): the bare
 // regex above matches ANY "PR #NN" mention, including precedent-citation
 // prose ("...same shape as the action1 precedent, PR #306...") that isn't
@@ -470,6 +497,7 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
       }
 
       const text = `${task.title} ${task.description}`;
+      const urlResolvedPrNumbers = extractUrlResolvedPrNumbers(text);
       // matchAll yields matches left-to-right; previousMatchEnd tracks the
       // prior match's end so each mention's precedent-cue window can be
       // clamped against it (see isPrecedentCitation's doc comment).
@@ -477,7 +505,10 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
       const keptRefs: string[] = [];
       for (const m of text.matchAll(PR_REFERENCE_REGEX)) {
         const matchIndex = m.index ?? 0;
-        if (!isPrecedentCitation(text, matchIndex, m[0].length, previousMatchEnd)) {
+        if (
+          !urlResolvedPrNumbers.has(m[1]) &&
+          !isPrecedentCitation(text, matchIndex, m[0].length, previousMatchEnd)
+        ) {
           keptRefs.push(`PR #${m[1]}`);
         }
         previousMatchEnd = matchIndex + m[0].length;
