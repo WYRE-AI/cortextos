@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Added — `bus close-experiment` — a terminal state for a `proposed`/`running` experiment that will never produce a measured result
+
+The experiment lifecycle had no way to close a proposal without running it. A `proposed`
+experiment whose linked approval was declined stayed stuck at `status: proposed` forever — every
+future fleet scan of proposed-but-never-run experiments re-flagged it (theta-wave cycle #34 spent
+cycles re-clearing a documented PARK; cycle #37 counted 3 live instances and bumped the underlying
+gap to high priority, task_1788276326374_26114110). The same shape hit `running` experiments too:
+one created before `--baseline` became required at create-time (`baseline_value: null`) is
+permanently refused by `evaluate-experiment` ("comparing against an implicit 0 baseline
+structurally forces every `direction=higher` result to KEEP" — a real, correct guard), with no
+repair or force-close path (task_1788228728494_04553223).
+
+`closeExperiment` adds a new terminal `status: 'closed'`, reachable directly from `proposed` or
+`running`, refusing on an already-`completed` or already-`closed` record. A required `reason`
+argument is stored verbatim in the new `closed_reason` field — the only durable record of why the
+experiment never completed normally — alongside a `closed_at` timestamp kept deliberately separate
+from `completed_at` (which stays `null`; a closed experiment never produced a real result).
+Deliberately does not touch `decision`: closing is never a keep/discard verdict.
+
+```bash
+cortextos bus close-experiment <experiment_id> "<reason>"
+```
+
+Considered and rejected the fuller MPAC-style state machine (REJECTED/ABANDONED/SUPERSEDED as
+distinct enum values) proposed in task_1788276326374_26114110's theta-wave append notes — a single
+terminal status with a free-text reason covers every concrete case seen in this corpus (declined
+approval, orphaned no-baseline record, superseded-in-practice) without a fixed taxonomy that would
+need its own maintenance as new closing reasons show up.
+
 ### Fixed — `add-cron`/`remove-cron` mutated `crons.json` with no corresponding audit trail
 
 Theta-wave cycle #33 finding (task_1788142055347_87999645): a cron's disappearance from an
