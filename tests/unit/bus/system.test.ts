@@ -1,10 +1,18 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
 import { selfRestart, hardRestart, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, postActivity } from '../../../src/bus/system';
 import type { BusPaths, Task } from '../../../src/types';
+
+const slackPostMessageSpy = vi.fn().mockResolvedValue({ ok: true });
+vi.mock('../../../src/slack/api.js', () => ({
+  SlackAPI: class {
+    constructor(public token: string) { /* no-op */ }
+    async postMessage(...args: unknown[]) { return slackPostMessageSpy(...args); }
+  },
+}));
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
   return {
@@ -232,22 +240,73 @@ describe('Bus System', () => {
       expect(result).toBe(false);
     });
 
-    it('returns false when env file has no token', async () => {
+    it('returns false when activity-channel.env has no channel ID', async () => {
       const orgDir = join(testDir, 'orgdir');
       mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_CHAT_ID=123\n');
+      writeFileSync(join(orgDir, 'activity-channel.env'), 'SOME_OTHER_VAR=123\n');
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
     });
 
-    it('returns false when env file has no chat ID', async () => {
+    it('returns false when channel ID is set but secrets.env has no SLACK_BOT_TOKEN', async () => {
       const orgDir = join(testDir, 'orgdir');
       mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_BOT_TOKEN=abc123\n');
+      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
+    });
+
+    it('returns false when secrets.env exists but SLACK_BOT_TOKEN is empty', async () => {
+      const orgDir = join(testDir, 'orgdir');
+      mkdirSync(orgDir, { recursive: true });
+      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
+      writeFileSync(join(orgDir, 'secrets.env'), 'OTHER_KEY=abc\n');
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(false);
+    });
+
+    it('posts via Slack and returns true when channel ID and bot token are both configured', async () => {
+      const orgDir = join(testDir, 'orgdir');
+      mkdirSync(orgDir, { recursive: true });
+      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
+      writeFileSync(join(orgDir, 'secrets.env'), 'SLACK_BOT_TOKEN=xoxb-test\n');
+      slackPostMessageSpy.mockClear();
+      slackPostMessageSpy.mockResolvedValueOnce({ ok: true });
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(true);
+      expect(slackPostMessageSpy).toHaveBeenCalledTimes(1);
+      expect(slackPostMessageSpy).toHaveBeenCalledWith({ channel: 'C123', text: 'hello' });
+    });
+
+    it('returns false when the Slack API call rejects', async () => {
+      const orgDir = join(testDir, 'orgdir');
+      mkdirSync(orgDir, { recursive: true });
+      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
+      writeFileSync(join(orgDir, 'secrets.env'), 'SLACK_BOT_TOKEN=xoxb-test\n');
+      slackPostMessageSpy.mockClear();
+      slackPostMessageSpy.mockRejectedValueOnce(new Error('slack unreachable'));
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(false);
+    });
+
+    it('finds activity-channel.env / secrets.env at the ctxRoot-anchored fallback path when orgDir has neither', async () => {
+      const orgDir = join(testDir, 'orgdir-empty');
+      mkdirSync(orgDir, { recursive: true });
+      const anchoredOrgDir = join(testDir, 'orgs', 'myorg');
+      mkdirSync(anchoredOrgDir, { recursive: true });
+      writeFileSync(join(anchoredOrgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C456\n');
+      writeFileSync(join(anchoredOrgDir, 'secrets.env'), 'SLACK_BOT_TOKEN=xoxb-anchored\n');
+      slackPostMessageSpy.mockClear();
+      slackPostMessageSpy.mockResolvedValueOnce({ ok: true });
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(true);
+      expect(slackPostMessageSpy).toHaveBeenCalledWith({ channel: 'C456', text: 'hello' });
     });
   });
 

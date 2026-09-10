@@ -1142,7 +1142,7 @@ busCommand
 
 busCommand
   .command('post-activity')
-  .description('Post a message to the org activity channel (Telegram if configured, bus broadcast otherwise)')
+  .description('Post a message to the org activity channel (Slack if configured, bus broadcast otherwise)')
   .argument('<message>', 'Message to post')
   .action(async (message: string) => {
     const env = resolveEnv();
@@ -1152,9 +1152,9 @@ busCommand
       console.log('Activity posted');
       return;
     }
-    // No Telegram activity channel (activity-channel.env absent or incomplete):
+    // No Slack activity channel (activity-channel.env absent or incomplete):
     // fall back to a bus-native broadcast so fleet-wide activity never depends
-    // on a Telegram chat id — bus-only agents must be able to broadcast too.
+    // on a Slack channel id — bus-only agents must be able to broadcast too.
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
     const result = broadcastActivityViaBus(projectRoot, env.ctxRoot, env.instanceId, env.org, env.agentName, message);
     try {
@@ -1164,9 +1164,9 @@ busCommand
     } catch { /* non-fatal */ }
     if (result.delivered.length > 0) {
       const skippedNote = result.skipped.length > 0 ? ` (${result.skipped.length} skipped)` : '';
-      console.log(`No Telegram activity channel configured — broadcast over the bus to ${result.delivered.length} agent(s)${skippedNote}`);
+      console.log(`No Slack activity channel configured — broadcast over the bus to ${result.delivered.length} agent(s)${skippedNote}`);
     } else {
-      console.error('Failed to post activity: no Telegram activity channel and no reachable bus recipients. For the Telegram channel, create orgs/<org>/activity-channel.env with ACTIVITY_BOT_TOKEN and ACTIVITY_CHAT_ID.');
+      console.error('Failed to post activity: no Slack activity channel and no reachable bus recipients. For the Slack channel, create orgs/<org>/activity-channel.env with ACTIVITY_SLACK_CHANNEL_ID and orgs/<org>/secrets.env with SLACK_BOT_TOKEN.');
       process.exit(1);
     }
   });

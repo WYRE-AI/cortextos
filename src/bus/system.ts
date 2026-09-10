@@ -827,14 +827,14 @@ export interface BusBroadcastResult {
 }
 
 /**
- * Bus-native activity broadcast — the fallback used when no Telegram
+ * Bus-native activity broadcast — the fallback used when no Slack
  * activity channel is configured (activity-channel.env absent). Fans the
  * message out as a normal-priority inbox message to every enabled agent in
  * the sender's org except the sender itself.
  *
- * Telegram-independent by design: a fleet can contain bus-only agents (no
- * BOT_TOKEN at all), and fleet-wide broadcast must not depend on a Telegram
- * chat id existing anywhere.
+ * Slack-independent by design: a fleet can contain bus-only agents (no
+ * SLACK_BOT_TOKEN at all), and fleet-wide broadcast must not depend on a
+ * Slack channel id existing anywhere.
  */
 export function broadcastActivityViaBus(
   frameworkRoot: string,
