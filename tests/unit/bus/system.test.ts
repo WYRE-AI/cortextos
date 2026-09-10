@@ -230,6 +230,24 @@ describe('Bus System', () => {
   });
 
   describe('postActivity', () => {
+    // Writes activity-channel.env / secrets.env into `dir`. Omit a field to
+    // leave that file (or that key within it) absent, so callers can target
+    // exactly the branch they mean to exercise.
+    function writeActivityConfig(
+      dir: string,
+      opts: { channelId?: string; token?: string; writeEmptySecrets?: boolean } = {},
+    ) {
+      mkdirSync(dir, { recursive: true });
+      if (opts.channelId !== undefined) {
+        writeFileSync(join(dir, 'activity-channel.env'), `ACTIVITY_SLACK_CHANNEL_ID=${opts.channelId}\n`);
+      }
+      if (opts.token !== undefined) {
+        writeFileSync(join(dir, 'secrets.env'), `SLACK_BOT_TOKEN=${opts.token}\n`);
+      } else if (opts.writeEmptySecrets) {
+        writeFileSync(join(dir, 'secrets.env'), 'OTHER_KEY=abc\n');
+      }
+    }
+
     it('returns false when not configured', async () => {
       const result = await postActivity(
         join(testDir, 'nonexistent'),
@@ -249,10 +267,9 @@ describe('Bus System', () => {
       expect(result).toBe(false);
     });
 
-    it('returns false when channel ID is set but secrets.env has no SLACK_BOT_TOKEN', async () => {
+    it('returns false when channel ID is set but secrets.env does not exist', async () => {
       const orgDir = join(testDir, 'orgdir');
-      mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
+      writeActivityConfig(orgDir, { channelId: 'C123' });
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
@@ -260,9 +277,7 @@ describe('Bus System', () => {
 
     it('returns false when secrets.env exists but SLACK_BOT_TOKEN is empty', async () => {
       const orgDir = join(testDir, 'orgdir');
-      mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
-      writeFileSync(join(orgDir, 'secrets.env'), 'OTHER_KEY=abc\n');
+      writeActivityConfig(orgDir, { channelId: 'C123', writeEmptySecrets: true });
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
@@ -270,9 +285,7 @@ describe('Bus System', () => {
 
     it('posts via Slack and returns true when channel ID and bot token are both configured', async () => {
       const orgDir = join(testDir, 'orgdir');
-      mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
-      writeFileSync(join(orgDir, 'secrets.env'), 'SLACK_BOT_TOKEN=xoxb-test\n');
+      writeActivityConfig(orgDir, { channelId: 'C123', token: 'xoxb-test' });
       slackPostMessageSpy.mockClear();
       slackPostMessageSpy.mockResolvedValueOnce({ ok: true });
 
@@ -284,9 +297,7 @@ describe('Bus System', () => {
 
     it('returns false when the Slack API call rejects', async () => {
       const orgDir = join(testDir, 'orgdir');
-      mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C123\n');
-      writeFileSync(join(orgDir, 'secrets.env'), 'SLACK_BOT_TOKEN=xoxb-test\n');
+      writeActivityConfig(orgDir, { channelId: 'C123', token: 'xoxb-test' });
       slackPostMessageSpy.mockClear();
       slackPostMessageSpy.mockRejectedValueOnce(new Error('slack unreachable'));
 
@@ -298,9 +309,7 @@ describe('Bus System', () => {
       const orgDir = join(testDir, 'orgdir-empty');
       mkdirSync(orgDir, { recursive: true });
       const anchoredOrgDir = join(testDir, 'orgs', 'myorg');
-      mkdirSync(anchoredOrgDir, { recursive: true });
-      writeFileSync(join(anchoredOrgDir, 'activity-channel.env'), 'ACTIVITY_SLACK_CHANNEL_ID=C456\n');
-      writeFileSync(join(anchoredOrgDir, 'secrets.env'), 'SLACK_BOT_TOKEN=xoxb-anchored\n');
+      writeActivityConfig(anchoredOrgDir, { channelId: 'C456', token: 'xoxb-anchored' });
       slackPostMessageSpy.mockClear();
       slackPostMessageSpy.mockResolvedValueOnce({ ok: true });
 

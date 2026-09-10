@@ -751,6 +751,22 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
  *
  * Mirrors bash bus/post-activity.sh.
  */
+/** First candidate path that exists on disk, or null if none do. */
+function findFirstExisting(candidates: string[]): string | null {
+  return candidates.find(existsSync) ?? null;
+}
+
+/**
+ * Read `key` out of the first candidate env file that exists. `parseEnvFile`
+ * never throws (it swallows read errors and returns `{}`), so there is
+ * nothing to catch here — a missing file or missing key both fall through
+ * to `undefined`.
+ */
+function findConfigValue(candidates: string[], key: string): string | undefined {
+  const path = findFirstExisting(candidates);
+  return path ? parseEnvFile(path)[key] : undefined;
+}
+
 export async function postActivity(
   orgDir: string,
   ctxRoot: string,
@@ -758,54 +774,19 @@ export async function postActivity(
   message: string,
   _replyMarkup?: object,
 ): Promise<boolean> {
-  // Look for activity-channel.env
-  const channelConfigCandidates = [
-    join(orgDir, 'activity-channel.env'),
-    join(ctxRoot, 'orgs', org, 'activity-channel.env'),
-  ];
-  let channelConfigPath: string | null = null;
-  for (const candidate of channelConfigCandidates) {
-    if (existsSync(candidate)) {
-      channelConfigPath = candidate;
-      break;
-    }
-  }
-  if (!channelConfigPath) {
-    return false;
-  }
-
-  let channelId: string | undefined;
-  try {
-    channelId = parseEnvFile(channelConfigPath).ACTIVITY_SLACK_CHANNEL_ID;
-  } catch {
-    return false;
-  }
+  const channelId = findConfigValue(
+    [join(orgDir, 'activity-channel.env'), join(ctxRoot, 'orgs', org, 'activity-channel.env')],
+    'ACTIVITY_SLACK_CHANNEL_ID',
+  );
   if (!channelId) {
     return false;
   }
 
   // SLACK_BOT_TOKEN lives in the org's secrets.env, not activity-channel.env.
-  const secretsCandidates = [
-    join(orgDir, 'secrets.env'),
-    join(ctxRoot, 'orgs', org, 'secrets.env'),
-  ];
-  let secretsPath: string | null = null;
-  for (const candidate of secretsCandidates) {
-    if (existsSync(candidate)) {
-      secretsPath = candidate;
-      break;
-    }
-  }
-  if (!secretsPath) {
-    return false;
-  }
-
-  let botToken: string | undefined;
-  try {
-    botToken = parseEnvFile(secretsPath).SLACK_BOT_TOKEN;
-  } catch {
-    return false;
-  }
+  const botToken = findConfigValue(
+    [join(orgDir, 'secrets.env'), join(ctxRoot, 'orgs', org, 'secrets.env')],
+    'SLACK_BOT_TOKEN',
+  );
   if (!botToken) {
     return false;
   }
