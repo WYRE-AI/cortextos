@@ -2,7 +2,8 @@ import { execSync } from 'child_process';
 import { existsSync, readFileSync, readdirSync, appendFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { ensureDir } from '../utils/atomic.js';
-import { TelegramAPI } from '../telegram/api.js';
+import { parseEnvFile } from '../utils/env.js';
+import { SlackAPI } from '../slack/api.js';
 import type { BusPaths, TaskStatus } from '../types/index.js';
 import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -727,16 +728,26 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
 }
 
 /**
- * Post a message to the org's Telegram activity channel.
+ * Post a message to the org's Slack activity channel.
  *
  * Returns false if not configured (silent fail — callers can ignore the
  * return value and treat activity-channel posting as best-effort).
  *
- * `replyMarkup` is an optional Telegram inline keyboard (or any reply
- * markup shape). When provided, the message ships with the keyboard
- * attached — used for interactive workflows like approval Approve/Deny
- * buttons posted alongside approval creation. Leaving it undefined
- * preserves the prior one-way notification shape exactly.
+ * Migrated 2026-09-08 from Telegram to Slack: `activity-channel.env` now
+ * carries only `ACTIVITY_SLACK_CHANNEL_ID`; the bot token lives in the
+ * org's `secrets.env` as `SLACK_BOT_TOKEN` (shared with the daemon's
+ * Socket Mode connection), not in activity-channel.env itself.
+ *
+ * `replyMarkup` (the historical Telegram inline-keyboard shape, e.g.
+ * approval Approve/Deny buttons) is accepted for backward compatibility
+ * with existing callers but is intentionally NOT rendered as Slack Block
+ * Kit — there is no Slack interactive-callback handler wired up yet for
+ * `appr_allow_*`/`appr_deny_*` actions, so a translated button would look
+ * clickable and silently do nothing. Callers already include the
+ * approval/experiment id in the message body as plain text so an operator
+ * can act via `cortextos bus update-approval <id> approved|rejected` or
+ * the dashboard. Real interactive Slack buttons are a separate, larger
+ * follow-up (Socket Mode block_actions handling), not done here.
  *
  * Mirrors bash bus/post-activity.sh.
  */
@@ -745,53 +756,63 @@ export async function postActivity(
   ctxRoot: string,
   org: string,
   message: string,
-  replyMarkup?: object,
+  _replyMarkup?: object,
 ): Promise<boolean> {
   // Look for activity-channel.env
-  const candidates = [
+  const channelConfigCandidates = [
     join(orgDir, 'activity-channel.env'),
     join(ctxRoot, 'orgs', org, 'activity-channel.env'),
   ];
-
-  let configPath: string | null = null;
-  for (const candidate of candidates) {
+  let channelConfigPath: string | null = null;
+  for (const candidate of channelConfigCandidates) {
     if (existsSync(candidate)) {
-      configPath = candidate;
+      channelConfigPath = candidate;
       break;
     }
   }
-
-  if (!configPath) {
+  if (!channelConfigPath) {
     return false;
   }
 
-  // Parse the env file
-  let botToken: string | undefined;
-  let chatId: string | undefined;
-
+  let channelId: string | undefined;
   try {
-    const content = readFileSync(configPath, 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx <= 0) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const value = trimmed.slice(eqIdx + 1).trim();
-      if (key === 'ACTIVITY_BOT_TOKEN') botToken = value;
-      if (key === 'ACTIVITY_CHAT_ID') chatId = value;
-    }
+    channelId = parseEnvFile(channelConfigPath).ACTIVITY_SLACK_CHANNEL_ID;
   } catch {
     return false;
   }
+  if (!channelId) {
+    return false;
+  }
 
-  if (!botToken || !chatId) {
+  // SLACK_BOT_TOKEN lives in the org's secrets.env, not activity-channel.env.
+  const secretsCandidates = [
+    join(orgDir, 'secrets.env'),
+    join(ctxRoot, 'orgs', org, 'secrets.env'),
+  ];
+  let secretsPath: string | null = null;
+  for (const candidate of secretsCandidates) {
+    if (existsSync(candidate)) {
+      secretsPath = candidate;
+      break;
+    }
+  }
+  if (!secretsPath) {
+    return false;
+  }
+
+  let botToken: string | undefined;
+  try {
+    botToken = parseEnvFile(secretsPath).SLACK_BOT_TOKEN;
+  } catch {
+    return false;
+  }
+  if (!botToken) {
     return false;
   }
 
   try {
-    const api = new TelegramAPI(botToken);
-    await api.sendMessage(chatId, message, replyMarkup);
+    const api = new SlackAPI(botToken);
+    await api.postMessage({ channel: channelId, text: message });
     return true;
   } catch {
     return false;
