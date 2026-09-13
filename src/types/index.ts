@@ -188,7 +188,10 @@ export interface Approval {
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
+  /** Identity of who resolved this (agent name, or a Telegram-derived actor string) — never free text. */
   resolved_by: string | null;
+  /** Free-text commentary on the decision, e.g. "not authorized yet". Distinct from resolved_by. */
+  resolution_note: string | null;
 }
 
 // Agent Config Types (config.json)

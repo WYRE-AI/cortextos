@@ -6,7 +6,7 @@ import { homedir } from 'os';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInboxWithStatus, ackInbox } from '../bus/message.js';
 import { sendToCapability } from '../bus/agents.js';
-import { validateAgentName, validateTaskId, validatePriority, validateCapability, validateKBScope, validateKBQueryScope } from '../utils/validate.js';
+import { validateAgentName, validateTaskId, validatePriority, validateCapability, validateKBScope, validateKBQueryScope, validateOrgName } from '../utils/validate.js';
 import { randomDigits } from '../utils/random.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, checkBatchStaleness, archiveTasks, checkHumanTasks } from '../bus/task.js';
@@ -1652,6 +1652,7 @@ busCommand
       process.exit(1);
     }
     const env = resolveEnv();
+    validateOrgName(env.org);
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
     // await — createApproval fan-out posts to the activity channel, which
     // must complete before the CLI process exits or the post silently
@@ -1676,8 +1677,9 @@ busCommand
       process.exit(1);
     }
     const env = resolveEnv();
+    validateOrgName(env.org);
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
-    updateApproval(paths, id, status as ApprovalStatus, note);
+    updateApproval(paths, id, status as ApprovalStatus, env.agentName, note);
     console.log(`Approval ${id} -> ${status}`);
   });
 
@@ -2389,6 +2391,7 @@ busCommand
         approvals = approvals.concat(listApprovals(orgPaths, effectiveStatus));
       }
     } else {
+      validateOrgName(env.org);
       const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
       approvals = listApprovals(paths, effectiveStatus);
     }
@@ -2396,10 +2399,10 @@ busCommand
     if (opts.format === 'text') {
       const label = effectiveStatus ? `${effectiveStatus} ` : '';
       if (approvals.length === 0) { console.log(`No ${label}approvals`); return; }
-      for (const a of approvals as Array<{ id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string }>) {
+      for (const a of approvals as Array<{ id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; resolved_at?: string | null; resolved_by?: string | null; resolution_note?: string | null; description?: string; org?: string }>) {
         console.log(`[${a.id}] ${a.title}`);
         console.log(`  Status: ${a.status} | Category: ${a.category} | Agent: ${a.requesting_agent} | Org: ${a.org ?? env.org} | Created: ${a.created_at}`);
-        if (a.resolved_at) console.log(`  Resolved: ${a.resolved_at}${a.resolved_by ? ` — ${a.resolved_by}` : ''}`);
+        if (a.resolved_at) console.log(`  Resolved: ${a.resolved_at}${a.resolved_by ? ` by ${a.resolved_by}` : ''}${a.resolution_note ? ` — ${a.resolution_note}` : ''}`);
         if (a.description) console.log(`  Context: ${a.description}`);
         console.log('');
       }
@@ -2429,9 +2432,10 @@ busCommand
   .action((approvalId: string, opts: { format?: string; allOrgs?: boolean }) => {
     const { getApproval } = require('../bus/approval.js');
     const env = resolveEnv();
+    if (!opts.allOrgs) validateOrgName(env.org);
 
     const orgs = opts.allOrgs ? listOrgDirs(env.instanceId, env.ctxRoot) : [env.org];
-    let found: { id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; updated_at?: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string } | null = null;
+    let found: { id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; updated_at?: string; resolved_at?: string | null; resolved_by?: string | null; resolution_note?: string | null; description?: string; org?: string } | null = null;
     for (const org of orgs) {
       found = getApproval(resolvePaths(env.agentName, env.instanceId, org, env.ctxRoot), approvalId);
       if (found) break;
@@ -2453,8 +2457,8 @@ busCommand
       console.log(`  Status: ${found.status}`);
       console.log(`  Category: ${found.category} | Agent: ${found.requesting_agent} | Org: ${found.org ?? env.org}`);
       console.log(`  Created: ${found.created_at}`);
-      if (found.resolved_at) console.log(`  Resolved: ${found.resolved_at}`);
-      if (found.resolved_by) console.log(`  Decision note: ${found.resolved_by}`);
+      if (found.resolved_at) console.log(`  Resolved: ${found.resolved_at}${found.resolved_by ? ` by ${found.resolved_by}` : ''}`);
+      if (found.resolution_note) console.log(`  Decision note: ${found.resolution_note}`);
       if (found.description) console.log(`  Context: ${found.description}`);
     } else {
       console.log(JSON.stringify(found, null, 2));

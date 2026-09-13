@@ -663,10 +663,9 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     const auditWho = firstName && username
       ? `${firstName} (@${username})`
       : firstName ?? (username ? `@${username}` : `user ${query.from?.id ?? 'unknown'}`);
-    const auditNote = `via Telegram activity channel by ${auditWho}`;
 
     try {
-      updateApproval(this.paths, approvalId, status, auditNote);
+      updateApproval(this.paths, approvalId, status, auditWho, 'via Telegram activity channel');
     } catch (err) {
       this.log(`Approval callback: updateApproval failed for ${approvalId}: ${err}`);
       if (api) {

@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
+
+Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`
+resolved `org` to `''` with no validation (the `validateOrgName` import in `env.ts` was never
+called), `resolvePaths()` silently collapsed an empty org to the un-scoped `ctxRoot` instead of the
+real `orgs/<org>/` directory, and the resulting "approval not found" error gave no hint that the
+real cause was a missing `CTX_ORG` rather than a wrong ID.
+
+`create-approval`, `update-approval`, and `list-approvals`/`get-approval` (when not run with
+`--all-orgs`) now call `validateOrgName(env.org)` right after `resolveEnv()`, matching the existing
+inline status/category validation already in those same handlers — an unset org now fails loudly
+with "Invalid org name ''" instead of a misleading not-found.
+
+Separately, `updateApproval()` wrote its free-text `note` argument directly into `resolved_by` — a
+field the dashboard already renders under a "Resolved by" label (`approval-detail-dialog.tsx`) and
+already has a separate `resolution_note` column for (`dashboard/src/lib/db.ts`, populated via
+`sync.ts` but never fed by the CLI writer, so it was permanently `null`). `updateApproval()` now
+takes a required `resolverIdentity` parameter (the CLI passes `env.agentName`; the Telegram
+inline-button path in `fast-checker.ts` passes the actor string it already computes, `auditWho`)
+and writes it to `resolved_by`, while `note` now writes to a new `Approval.resolution_note` field.
+The dashboard needed no changes — `sync.ts`/`db.ts`/the detail dialog already expected this exact
+two-field shape.
+
 ### Fixed — `add-cron`/`remove-cron` mutated `crons.json` with no corresponding audit trail
 
 Theta-wave cycle #33 finding (task_1788142055347_87999645): a cron's disappearance from an
