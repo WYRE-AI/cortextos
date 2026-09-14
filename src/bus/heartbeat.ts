@@ -22,6 +22,7 @@ const END_TYPE_MARKERS = [
   '.user-stop',
   '.daemon-crashed',
   '.daemon-stop',
+  '.rotation-recovered',
 ];
 
 /**
