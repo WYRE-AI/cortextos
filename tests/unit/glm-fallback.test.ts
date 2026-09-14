@@ -109,7 +109,7 @@ describe('attemptGlmFallback', () => {
   it('is a guaranteed no-op when disabled (no config file at all)', () => {
     const log = vi.fn();
     const result = attemptGlmFallback(ctxRoot, ['boss'], 'all exhausted', { log });
-    expect(result).toEqual({ entered: [], excluded: [], skippedReason: 'disabled' });
+    expect(result).toEqual({ candidates: [], excluded: [], skippedReason: 'disabled' });
     expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false);
   });
 
@@ -120,31 +120,56 @@ describe('attemptGlmFallback', () => {
       log,
       fetchKey: () => 'key',
     });
-    expect(result.entered).toEqual(['boss']);
+    expect(result.candidates).toEqual(['boss']);
     expect(result.excluded.sort()).toEqual(['marketing', 'pearl']);
-    expect(isGlmFallbackActive(ctxRoot, 'pearl')).toBe(false);
-    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(true);
   });
 
-  it('fails closed and marks nobody active when the key fetch fails', () => {
+  it('does NOT mark anyone active itself — that is the caller\'s job, only after a confirmed restart (PR #186 review fix)', () => {
+    enable();
+    const result = attemptGlmFallback(ctxRoot, ['boss'], 'all exhausted', { log: vi.fn(), fetchKey: () => 'key' });
+    expect(result.candidates).toEqual(['boss']);
+    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false);
+  });
+
+  it('fails closed and returns no candidates when the key fetch fails', () => {
     enable();
     const log = vi.fn();
     const result = attemptGlmFallback(ctxRoot, ['boss'], 'all exhausted', {
       log,
       fetchKey: () => { throw new Error('secret not found'); },
     });
-    expect(result).toEqual({ entered: [], excluded: [], skippedReason: 'key-fetch-failed' });
+    expect(result).toEqual({ candidates: [], excluded: [], skippedReason: 'key-fetch-failed' });
     expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false);
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/ZAI_API_KEY fetch failed/));
   });
 
-  it('is idempotent — an already-active agent is not re-entered or re-logged as newly entered', () => {
+  it('excludes an agent already marked active from the candidate list — the caller marks after entry, this checks the caller did', () => {
     enable();
     const fetchKey = vi.fn(() => 'key');
-    attemptGlmFallback(ctxRoot, ['boss'], 'r1', { log: vi.fn(), fetchKey });
+    const result1 = attemptGlmFallback(ctxRoot, ['boss'], 'r1', { log: vi.fn(), fetchKey });
+    expect(result1.candidates).toEqual(['boss']);
+    // Simulate what rotation-manager does after a CONFIRMED restart.
+    markGlmFallbackActive(ctxRoot, 'boss', 'r1', () => 1);
+
     const log2 = vi.fn();
     const result2 = attemptGlmFallback(ctxRoot, ['boss'], 'r2', { log: log2, fetchKey });
-    expect(result2).toEqual({ entered: [], excluded: [], skippedReason: 'no-eligible-agents' });
+    expect(result2).toEqual({ candidates: [], excluded: [], skippedReason: 'no-eligible-agents' });
+  });
+
+  it('regression (PR #186 review, dev): an agent whose restart FAILED must remain a candidate on the next attempt, not get silently stuck forever', () => {
+    // This models what a naive "mark active before restart" implementation
+    // gets wrong — a real caller (rotation-manager) marks active only AFTER
+    // a confirmed restartAgent success, so a restart failure leaves the
+    // agent unmarked and it must show up as a candidate again here.
+    enable();
+    const fetchKey = vi.fn(() => 'key');
+    const result1 = attemptGlmFallback(ctxRoot, ['boss'], 'r1', { log: vi.fn(), fetchKey });
+    expect(result1.candidates).toEqual(['boss']);
+    // Caller's restartAgent() throws — caller does NOT mark active.
+    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false);
+
+    const result2 = attemptGlmFallback(ctxRoot, ['boss'], 'retry', { log: vi.fn(), fetchKey });
+    expect(result2.candidates).toEqual(['boss']); // still retryable, not stuck
   });
 });
 

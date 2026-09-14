@@ -391,7 +391,7 @@ describe('RotationManager -> Tier 2 (GLM-5.3) trigger wiring', () => {
   });
 
   it('calls tryGlmFallback exactly once with the blocked-agent list, once every Tier 1 account is confirmed exhausted', async () => {
-    const tryGlmFallback = vi.fn().mockReturnValue({ entered: [], excluded: [] });
+    const tryGlmFallback = vi.fn().mockReturnValue({ candidates: [], excluded: [] });
     const rm = new RotationManager({
       ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
       preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
@@ -401,22 +401,41 @@ describe('RotationManager -> Tier 2 (GLM-5.3) trigger wiring', () => {
     expect(tryGlmFallback).toHaveBeenCalledWith(ctxRoot, ['boss'], expect.any(String), expect.any(Function));
   });
 
-  it('restarts and alerts for agents tryGlmFallback reports as newly entered', async () => {
-    const tryGlmFallback = vi.fn().mockReturnValue({ entered: ['boss'], excluded: [] });
+  it('restarts, marks active, and alerts for agents tryGlmFallback reports as candidates', async () => {
+    const tryGlmFallback = vi.fn().mockReturnValue({ candidates: ['boss'], excluded: [] });
     const rm = new RotationManager({
       ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
       preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
     });
     await rm.onLimitEvent('boss', EV);
     expect(restartAgent).toHaveBeenCalledWith('boss');
+    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(true);
     expect(sendAlert).toHaveBeenCalledWith(expect.stringMatching(/Tier 2 \(GLM-5\.3\/Z\.ai\) entered for boss/));
     // Tier 1's own halt state is untouched by a Tier 2 entry — boss stays
     // limitBlocked so a future Tier 1 recovery still reclaims it.
     expect(isLimitBlocked(ctxRoot, 'boss')).toBe(true);
   });
 
-  it('does not restart or alert when tryGlmFallback reports nothing entered (e.g. disabled)', async () => {
-    const tryGlmFallback = vi.fn().mockReturnValue({ entered: [], excluded: [], skippedReason: 'disabled' as const });
+  it('regression (PR #186 review, dev): a candidate whose restartAgent() FAILS is NOT marked active, and no Tier 2 alert fires for it', async () => {
+    const tryGlmFallback = vi.fn().mockReturnValue({ candidates: ['boss'], excluded: [] });
+    restartAgent.mockRejectedValueOnce(new Error('spawn ENOENT'));
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
+    });
+    await rm.onLimitEvent('boss', EV);
+    expect(restartAgent).toHaveBeenCalledWith('boss');
+    // The bug this test pins: marking active BEFORE a confirmed restart
+    // would leave a failed agent permanently un-retryable (the next
+    // attempt's already-active filter excludes it forever). It must stay
+    // unmarked so the next halt-branch pass offers it as a candidate again.
+    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false);
+    // No Tier 2 "entered" alert for an agent that never actually entered.
+    expect(sendAlert.mock.calls.some(c => /Tier 2/.test(c[0]))).toBe(false);
+  });
+
+  it('does not restart or alert when tryGlmFallback reports no candidates (e.g. disabled)', async () => {
+    const tryGlmFallback = vi.fn().mockReturnValue({ candidates: [], excluded: [], skippedReason: 'disabled' as const });
     const rm = new RotationManager({
       ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
       preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
