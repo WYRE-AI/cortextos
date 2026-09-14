@@ -53,7 +53,14 @@ describe('RotationManager', () => {
     });
   });
 
-  it('rotates to the first passing candidate and restarts only blocked agents', async () => {
+  it('rotates to the first passing candidate and restarts only blocked agents, writing a .rotation-recovered marker first (task_1789351994840_86202746)', async () => {
+    // The marker must exist by the time restartAgent is called — that's what
+    // actually kills the old PTY and fires the SessionEnd hook that reads it.
+    let markerAtCallTime: string | null = null;
+    restartAgent.mockImplementation(async (agent: string) => {
+      const p = join(ctxRoot, 'state', agent, '.rotation-recovered');
+      markerAtCallTime = existsSync(p) ? readFileSync(p, 'utf-8') : null;
+    });
     await rm.onLimitEvent('boss', EV);
     expect(preflight).toHaveBeenCalledWith('tok-b');
     const accounts = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/accounts.json'), 'utf-8'));
@@ -64,17 +71,6 @@ describe('RotationManager', () => {
     expect(readFileSync(join(frameworkRoot, 'orgs/wyre/agents/dev/.env'), 'utf-8')).toContain('tok-b');
     expect(sendAlert).toHaveBeenCalledTimes(1);
     expect(isLimitBlocked(ctxRoot, 'boss')).toBe(false); // cleared after restart
-  });
-
-  it('writes a .rotation-recovered marker BEFORE restarting an agent onto a newly-rotated account (task_1789351994840_86202746)', async () => {
-    // The marker must exist by the time restartAgent is called — that's what
-    // actually kills the old PTY and fires the SessionEnd hook that reads it.
-    let markerAtCallTime: string | null = null;
-    restartAgent.mockImplementation(async (agent: string) => {
-      const p = join(ctxRoot, 'state', agent, '.rotation-recovered');
-      markerAtCallTime = existsSync(p) ? readFileSync(p, 'utf-8') : null;
-    });
-    await rm.onLimitEvent('boss', EV);
     expect(markerAtCallTime).not.toBeNull();
     expect(markerAtCallTime).toContain('account "b" now active');
     // Still present after restart returns — hook-crash-alert.ts's
@@ -134,7 +130,7 @@ describe('RotationManager', () => {
     expect(isLimitBlocked(ctxRoot, 'boss')).toBe(false);
   });
 
-  it('restarts blocked agents on the ACTIVE account when it recovered and bench is dry', async () => {
+  it('restarts blocked agents on the ACTIVE account when it recovered and bench is dry, writing a .rotation-recovered marker first (task_1789351994840_86202746)', async () => {
     // bench (b, c) permanently dry; active (a) recovers after its window resets
     preflight.mockImplementation(async (tok: string) => (tok === 'tok-a' ? 'ok' : 'limit'));
     await rm.onLimitEvent('boss', EV);          // banner = fresh proof; active NOT re-pinged
@@ -147,15 +143,7 @@ describe('RotationManager', () => {
     expect(isLimitBlocked(ctxRoot, 'boss')).toBe(false);
     const accounts = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/accounts.json'), 'utf-8'));
     expect(accounts.active).toBe('a');           // no flip — recovered in place
-  });
-
-  it('writes a .rotation-recovered marker before restarting agents when the ACTIVE account recovers in place (task_1789351994840_86202746)', async () => {
-    preflight.mockImplementation(async (tok: string) => (tok === 'tok-a' ? 'ok' : 'limit'));
-    await rm.onLimitEvent('boss', EV);
-    t += 36 * 60_000;
-    await rm.tick();
-    const marker = readFileSync(join(ctxRoot, 'state/boss/.rotation-recovered'), 'utf-8');
-    expect(marker).toContain('account "a" recovered');
+    expect(readFileSync(join(ctxRoot, 'state/boss/.rotation-recovered'), 'utf-8')).toContain('account "a" recovered');
   });
 
   it('proactive preflight rotates when the ACTIVE account hits its limit', async () => {
