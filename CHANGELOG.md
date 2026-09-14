@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added — Tier 2 cross-provider fallback (GLM-5.3 / Z.ai), shipped disabled
+
+New `src/daemon/glm-fallback.ts`, entered only from `rotation-manager.ts`'s existing "every Tier 1
+OAuth account exhausted" branch — not a new standalone watcher. Per-agent, with Aaron-facing agents
+(`pearl`, `marketing`, `scribe`) excluded by default so customer/stakeholder-visible output never
+falls to an unvalidated provider. The Z.ai key is fetched at spawn time via `cortex-secret get
+ZAI_API_KEY --context conduit` and merged straight into the PTY's in-memory env in `agent-pty.ts`'s
+`customizeEnv` hook — never written to any `.env` file. An agent restarted back onto a recovered
+Tier 1 account has its Tier 2 state cleared so it can't keep serving off a stale GLM override.
+
+**Ships with `enabled: false`** (no `state/glm-fallback/config.json` at all is the same as
+`enabled: false` — fails closed on a missing or malformed config, never open). Per the design doc
+(`orgs/wyre/deliverables/infra/task_1789176721585_85041330/glm-5.3-fallback-design.md`), flipping it
+on is gated behind a still-pending validation pass (tool-call fidelity, PTY/banner-parsing
+compatibility, restart/`--continue` semantics) against a throwaway canary — not done in this change.
+
 ### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
 
 Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`

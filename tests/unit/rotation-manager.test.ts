@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { RotationManager, isLimitBlocked, loadRotationState } from '../../src/daemon/rotation-manager.js';
+import { isGlmFallbackActive, attemptGlmFallback } from '../../src/daemon/glm-fallback.js';
 import type { LimitEvent } from '../../src/daemon/limit-detector.js';
 
 const EV: LimitEvent = { kind: 'session', resetAt: null, matchedText: "You'vehityoursessionlimit" };
@@ -357,5 +358,106 @@ describe('exhaustion observations (2026-08-20 fix)', () => {
     }));
     const state = loadRotationState(ctxRoot);
     expect(state.exhausted.b).toEqual({ observedAt: 0, resetAt: 1784718000000, source: 'legacy-migrated' });
+  });
+});
+
+describe('RotationManager -> Tier 2 (GLM-5.3) trigger wiring', () => {
+  let ctxRoot: string, frameworkRoot: string;
+  let t: number;
+  let preflight: ReturnType<typeof vi.fn>;
+  let restartAgent: ReturnType<typeof vi.fn>;
+  let sendAlert: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    ctxRoot = mkdtempSync(join(tmpdir(), 'ctx-glm-'));
+    frameworkRoot = mkdtempSync(join(tmpdir(), 'fw-glm-'));
+    seedAccounts(ctxRoot);
+    makeAgentEnvs(frameworkRoot, 'wyre', ['boss', 'dev']);
+    t = T0;
+    preflight = vi.fn().mockResolvedValue('limit'); // every Tier 1 candidate dry, every time
+    restartAgent = vi.fn().mockResolvedValue(undefined);
+    sendAlert = vi.fn();
+  });
+
+  it('does not call tryGlmFallback at all while Tier 1 still has a live candidate (normal rotation, no exhaustion)', async () => {
+    preflight.mockResolvedValue('ok');
+    const tryGlmFallback = vi.fn();
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
+    });
+    await rm.onLimitEvent('boss', EV);
+    expect(tryGlmFallback).not.toHaveBeenCalled();
+  });
+
+  it('calls tryGlmFallback exactly once with the blocked-agent list, once every Tier 1 account is confirmed exhausted', async () => {
+    const tryGlmFallback = vi.fn().mockReturnValue({ entered: [], excluded: [] });
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
+    });
+    await rm.onLimitEvent('boss', EV);
+    expect(tryGlmFallback).toHaveBeenCalledTimes(1);
+    expect(tryGlmFallback).toHaveBeenCalledWith(ctxRoot, ['boss'], expect.any(String), expect.any(Function));
+  });
+
+  it('restarts and alerts for agents tryGlmFallback reports as newly entered', async () => {
+    const tryGlmFallback = vi.fn().mockReturnValue({ entered: ['boss'], excluded: [] });
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
+    });
+    await rm.onLimitEvent('boss', EV);
+    expect(restartAgent).toHaveBeenCalledWith('boss');
+    expect(sendAlert).toHaveBeenCalledWith(expect.stringMatching(/Tier 2 \(GLM-5\.3\/Z\.ai\) entered for boss/));
+    // Tier 1's own halt state is untouched by a Tier 2 entry — boss stays
+    // limitBlocked so a future Tier 1 recovery still reclaims it.
+    expect(isLimitBlocked(ctxRoot, 'boss')).toBe(true);
+  });
+
+  it('does not restart or alert when tryGlmFallback reports nothing entered (e.g. disabled)', async () => {
+    const tryGlmFallback = vi.fn().mockReturnValue({ entered: [], excluded: [], skippedReason: 'disabled' as const });
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
+    });
+    await rm.onLimitEvent('boss', EV);
+    expect(restartAgent).not.toHaveBeenCalled();
+    // Only the Tier 1 halt alert fired, no Tier 2 alert.
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+    expect(sendAlert.mock.calls[0][0]).toContain('ALL OAuth accounts exhausted');
+  });
+
+  it('end-to-end with the REAL attemptGlmFallback (not mocked): enabling config + a working key fetch actually flips Tier-2 state and restarts', async () => {
+    mkdirSync(join(ctxRoot, 'state', 'glm-fallback'), { recursive: true });
+    writeFileSync(join(ctxRoot, 'state', 'glm-fallback', 'config.json'), JSON.stringify({ enabled: true, excludedAgents: [] }));
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {},
+      tryGlmFallback: (root, blocked, reason, log) =>
+        attemptGlmFallback(root, blocked, reason, { log, fetchKey: () => 'real-zai-key', now: () => t }),
+    });
+    await rm.onLimitEvent('boss', EV);
+    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(true);
+    expect(restartAgent).toHaveBeenCalledWith('boss');
+  });
+
+  it('a subsequent real Tier 1 recovery clears Tier-2 state for the recovered agent', async () => {
+    mkdirSync(join(ctxRoot, 'state', 'glm-fallback'), { recursive: true });
+    writeFileSync(join(ctxRoot, 'state', 'glm-fallback', 'config.json'), JSON.stringify({ enabled: true, excludedAgents: [] }));
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {},
+      tryGlmFallback: (root, blocked, reason, log) =>
+        attemptGlmFallback(root, blocked, reason, { log, fetchKey: () => 'real-zai-key', now: () => t }),
+    });
+    await rm.onLimitEvent('boss', EV); // Tier 1 exhausted -> falls to Tier 2
+    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(true);
+
+    preflight.mockResolvedValue('ok'); // Tier 1 recovers
+    t += 36 * 60_000;
+    await rm.tick();
+    expect(restartAgent).toHaveBeenCalledWith('boss'); // restarted back onto a real Tier 1 account
+    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false); // and no longer Tier-2-marked
   });
 });
