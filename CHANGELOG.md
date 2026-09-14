@@ -71,6 +71,31 @@ a SIGKILLed holder times out loudly (`exit 2`) rather than silently proceeding. 
 gained a case racing a real (sed-slowed) invocation against a normal one at the same leaking ref,
 proven to reproduce the exact silent-false-clean failure against the pre-fix scanner before
 confirming both racing invocations correctly detect the leak post-fix.
+### Fixed — rotation-manager's recovery restarts wrote no marker, so a healthy OAuth-rotation recovery misclassified as a fleet-wide crash burst
+
+`rotation-manager.ts`'s `doRotation()` restarts every previously limit-blocked agent once a bench
+candidate (or the active account itself) recovers — a routine, expected daemon action — but neither
+restart loop wrote any of the marker files `hook-crash-alert.ts`'s `classifyFromMarkers()` checks
+for. Every agent it restarted therefore fell through to `type=crash reason=none` in `crashes.log`
+(or, worse, got swept into `type=rate-limited` by the hook's stdout-tail substring scan if its
+recent PTY output happened to contain a rate-limit-shaped phrase for unrelated reasons). Because
+this fires whenever the shared seat cycles through exhaustion-then-recovery, the recovery itself —
+nothing actually broken — paged a false 10-13-agent CRASH-alert burst and spawned root-cause
+investigations on a recurring, roughly-nightly cadence.
+
+Both restart loops in `doRotation()` (rotating onto a newly-available candidate account, and the
+active account recovering in place) now write a `.rotation-recovered` marker via a new
+`writeRestartMarker()` helper before calling `restartAgent()` — mirroring `soft-restart-all`'s
+existing `.user-restart` write in `src/cli/bus.ts`, synchronously before the call that actually
+kills the old PTY session. `hook-crash-alert.ts` gained a matching `.rotation-recovered` ->
+`rotation-recovered` marker entry, a `QUIET_SUPPRESSED_TYPES` addition (it's a routine event, same
+treatment as `user-restart`/`rate-limited`), and a distinctly-worded Telegram message rather than
+reusing `user-restart`'s misleading "restarted by user" text. `src/bus/heartbeat.ts`'s
+`END_TYPE_MARKERS` (the list `clearEndMarkers` uses to retire a marker on the next successful
+heartbeat) also gained the new marker — without it the marker would only ever clear via the hook's
+5-minute staleness TTL, not immediately on the post-restart heartbeat like every sibling marker.
+
+### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
 
 Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`
 resolved `org` to `''` with no validation (the `validateOrgName` import in `env.ts` was never
