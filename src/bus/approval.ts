@@ -204,6 +204,7 @@ export async function createApproval(
     updated_at: now,
     resolved_at: null,
     resolved_by: null,
+    resolution_note: null,
   };
 
   const pendingDir = join(paths.approvalDir, 'pending');
@@ -231,11 +232,19 @@ export async function createApproval(
 /**
  * Update an approval's status (approve or deny).
  * Notifies the requesting agent via inbox message.
+ *
+ * `resolverIdentity` is who actually resolved it (an agent name, or a
+ * Telegram-derived actor string) — kept separate from `note`, which is
+ * free-text commentary on the decision. Previously `note` was written
+ * directly into `resolved_by`, which made a "Resolved by" field in the
+ * dashboard show commentary instead of an identity (see
+ * dashboard/src/components/approvals/approval-detail-dialog.tsx).
  */
 export function updateApproval(
   paths: BusPaths,
   approvalId: string,
   status: ApprovalStatus,
+  resolverIdentity: string,
   note?: string,
 ): void {
   const pendingDir = join(paths.approvalDir, 'pending');
@@ -247,7 +256,8 @@ export function updateApproval(
     approval.status = status;
     approval.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     approval.resolved_at = approval.updated_at;
-    approval.resolved_by = note || null;
+    approval.resolved_by = resolverIdentity;
+    approval.resolution_note = note || null;
 
     // Move to resolved/ directory (matches bash version)
     const destDir = join(paths.approvalDir, 'resolved');

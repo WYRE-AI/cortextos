@@ -104,6 +104,7 @@ describe('FastChecker', () => {
         updated_at: '2026-04-13T00:00:00Z',
         resolved_at: null,
         resolved_by: null,
+        resolution_note: null,
       };
       writeFileSync(join(pendingDir, `${id}.json`), JSON.stringify(approval));
     }
@@ -133,6 +134,9 @@ describe('FastChecker', () => {
       expect(approval.status).toBe('approved');
       expect(approval.resolved_by).toContain('Alice');
       expect(approval.resolved_by).toContain('@alice');
+      // resolved_by is now the actor identity ONLY; the channel context
+      // lives in the separate resolution_note field, not concatenated in.
+      expect(approval.resolution_note).toBe('via Telegram activity channel');
 
       // Telegram side effects: answerCallbackQuery + editMessageText called.
       expect(activityApi.answerCallbackQuery).toHaveBeenCalledWith('cb-123', 'Approved');
