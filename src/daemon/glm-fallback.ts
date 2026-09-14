@@ -173,14 +173,26 @@ export function fetchZaiApiKey(exec: SecretFetcher = defaultFetchZaiApiKey): str
 }
 
 export interface GlmFallbackAttemptResult {
-  entered: string[];
+  /**
+   * Agents eligible to enter Tier 2 (not excluded, not already active, and a
+   * key fetch succeeded) — NOT yet marked active. The caller must call
+   * markGlmFallbackActive itself, and ONLY after confirming restartAgent
+   * actually succeeded for that agent (PR #186 review, dev): marking active
+   * before the restart is confirmed means a restart failure leaves the agent
+   * permanently stuck — the next attempt's `alreadyActive` filter would
+   * exclude it from ever being retried, despite a log line claiming it
+   * would be.
+   */
+  candidates: string[];
   excluded: string[];
   skippedReason?: 'disabled' | 'key-fetch-failed' | 'no-eligible-agents';
 }
 
 /**
  * Tier 2 trigger. Call ONLY from rotation-manager's "every Tier 1 account
- * exhausted" halt branch, with the agents currently blocked there.
+ * exhausted" halt branch, with the agents currently blocked there. Pure
+ * decision logic plus a fail-closed key-fetch precondition — does NOT mark
+ * anyone active. See GlmFallbackAttemptResult's docstring for why.
  */
 export function attemptGlmFallback(
   ctxRoot: string,
@@ -192,15 +204,15 @@ export function attemptGlmFallback(
   const excluded = blockedAgents.filter(a => config.excludedAgents.includes(a));
 
   if (!config.enabled) {
-    return { entered: [], excluded, skippedReason: 'disabled' };
+    return { candidates: [], excluded, skippedReason: 'disabled' };
   }
 
   const eligible = blockedAgents.filter(a => !config.excludedAgents.includes(a));
   const alreadyActive = loadGlmFallbackState(ctxRoot).active;
-  const toEnter = eligible.filter(a => !(a in alreadyActive));
+  const candidates = eligible.filter(a => !(a in alreadyActive));
 
-  if (toEnter.length === 0) {
-    return { entered: [], excluded, skippedReason: 'no-eligible-agents' };
+  if (candidates.length === 0) {
+    return { candidates: [], excluded, skippedReason: 'no-eligible-agents' };
   }
 
   const apiKey = fetchZaiApiKey(opts.fetchKey);
@@ -209,15 +221,14 @@ export function attemptGlmFallback(
       '[glm-fallback] ZAI_API_KEY fetch failed (cortex-secret get ZAI_API_KEY --context conduit) — ' +
         'cannot enter Tier 2, staying on Tier 1 halt',
     );
-    return { entered: [], excluded, skippedReason: 'key-fetch-failed' };
+    return { candidates: [], excluded, skippedReason: 'key-fetch-failed' };
   }
 
-  for (const agent of toEnter) markGlmFallbackActive(ctxRoot, agent, reason, opts.now);
   opts.log(
-    `[glm-fallback] Tier 2 entered for: ${toEnter.join(', ')} (${reason}). ` +
+    `[glm-fallback] Tier 2 candidates: ${candidates.join(', ')} (${reason}). ` +
       `Excluded, held on Tier 1: ${excluded.join(', ') || 'none'}.`,
   );
-  return { entered: toEnter, excluded };
+  return { candidates, excluded };
 }
 
 /**
