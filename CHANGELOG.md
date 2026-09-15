@@ -71,6 +71,27 @@ a SIGKILLed holder times out loudly (`exit 2`) rather than silently proceeding. 
 gained a case racing a real (sed-slowed) invocation against a normal one at the same leaking ref,
 proven to reproduce the exact silent-false-clean failure against the pre-fix scanner before
 confirming both racing invocations correctly detect the leak post-fix.
+### Fixed — `create-approval` had no fail-loud signal when every Telegram push channel failed, and never notified the org orchestrator at all
+
+`createApproval()` fans out to two best-effort Telegram channels (the org activity channel, and
+the requesting agent's own bot) and, until now, that was the *only* notification path — if both
+were unconfigured or unreachable, the approval landed in `pending/` with nothing pointing anyone
+at it except a human who happened to check the dashboard or run `list-approvals` cold. Bus-only
+agents (no `BOT_TOKEN`/`CHAT_ID`) with a misconfigured activity channel had no notification path
+at all.
+
+`postApprovalToActivityChannel()` and `pingAgentChatId()` now return `Promise<boolean>` (whether
+the push actually sent) instead of `Promise<void>`, and `createApproval()` now unconditionally
+messages the org orchestrator (`CTX_ORCHESTRATOR_AGENT`, mirroring `hook-loop-detector.ts`'s
+`notifyOrchestrator` resolution — no-ops if unset or if the orchestrator is the requesting agent
+itself) via a direct `sendMessage()` call, independent of whether either Telegram path succeeded.
+When both push channels fail, `createApproval()` now also emits a `console.error` (not the
+existing per-path `console.warn`s) naming the approval and pointing at the two things to check
+(`activity-channel.env`, the agent's `.env`) — loud enough to stand out from the routine warns,
+since it means the approval is currently visible ONLY via the orchestrator's inbox and the
+dashboard.
+
+### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
 
 Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`
 resolved `org` to `''` with no validation (the `validateOrgName` import in `env.ts` was never
