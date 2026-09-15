@@ -481,6 +481,7 @@ describe('createApproval — orchestrator notification + fail-loud warning', () 
     { label: 'both channels fail', activityOk: false, pingOk: false, expectError: true },
     { label: 'only activity fails, ping succeeds', activityOk: false, pingOk: true, expectError: false },
     { label: 'only ping fails, activity succeeds', activityOk: true, pingOk: false, expectError: false },
+    { label: 'both channels succeed', activityOk: true, pingOk: true, expectError: false },
   ])('fail-loud only when BOTH push channels fail ($label)', async ({ activityOk, pingOk, expectError }) => {
     delete process.env.CTX_ORCHESTRATOR_AGENT; // isolate the fail-loud check from orchestrator noise
     postActivitySpy.mockResolvedValueOnce(activityOk);
