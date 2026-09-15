@@ -5,6 +5,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { parseEnvFile } from '../utils/env.js';
 import { randomString } from '../utils/random.js';
 import { validateApprovalCategory } from '../utils/validate.js';
+import { resolveOrchestratorTarget } from '../utils/orchestrator.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { sendMessage } from './message.js';
 import { postActivity } from './system.js';
@@ -177,10 +178,11 @@ function pingAgentChatId(
  * the orchestrator's bus inbox (and the dashboard, which reads the same
  * approval files) is the one path that does not depend on either.
  *
- * Mirrors hook-loop-detector.ts's notifyOrchestrator for HOW the
- * orchestrator name is resolved (CTX_ORCHESTRATOR_AGENT, no-op if unset or
- * equal to agentName) but calls sendMessage directly rather than shelling
- * out — this module already has direct bus access, unlike a hook process.
+ * Shares resolveOrchestratorTarget() with hook-loop-detector.ts's
+ * notifyOrchestrator (same no-op predicate: CTX_ORCHESTRATOR_AGENT unset,
+ * or equal to agentName) but calls sendMessage directly rather than
+ * shelling out — this module already has direct bus access, unlike a hook
+ * process.
  *
  * sendMessage validates `to`/`from`/`priority` and writes to disk
  * synchronously, so it can throw (e.g. a malformed CTX_ORCHESTRATOR_AGENT).
@@ -193,8 +195,8 @@ function notifyOrchestratorOfApproval(
   approvalId: string,
   title: string,
 ): void {
-  const orchestrator = process.env.CTX_ORCHESTRATOR_AGENT;
-  if (!orchestrator || orchestrator === agentName) return;
+  const orchestrator = resolveOrchestratorTarget(agentName);
+  if (!orchestrator) return;
   try {
     sendMessage(
       paths,
@@ -260,24 +262,26 @@ export async function createApproval(
   ensureDir(pendingDir);
   atomicWriteSync(join(pendingDir, `${approvalId}.json`), JSON.stringify(approval));
 
-  // Fan-out to the activity channel so the operator can approve/deny from
-  // Telegram without opening the dashboard. AWAITED so short-lived CLI callers do
-  // not exit before the Telegram post fetch completes. Errors are
-  // suppressed inside postApprovalToActivityChannel — activity-channel
-  // unreachable must not block approval creation. Callbacks route back
-  // via the orchestrator's activity-channel poller (see
-  // daemon/agent-manager.ts).
-  const postedToActivityChannel = await postApprovalToActivityChannel(paths, org, approvalId, title, category, agentName, context, frameworkRoot);
-
-  // Best-effort ping to the requesting agent's own Telegram bot (the
-  // operator's 1:1 conversation with the agent). Closes the gap where
-  // operators not in the activity channel would miss approvals entirely
-  // (the 50h+ Repo-B-style stall). Errors suppressed — see helper.
-  const pingedAgentChat = await pingAgentChatId(agentDir, approvalId, title, category, agentName, context);
-
   // Always notify the orchestrator, independent of whether either
-  // human-facing push channel above succeeded — see helper doc.
+  // human-facing push channel below succeeds — see helper doc. Fired
+  // immediately (it's synchronous and shares no data dependency with the
+  // two Telegram pushes) so dashboard/bus visibility never waits on them.
   notifyOrchestratorOfApproval(paths, agentName, approvalId, title);
+
+  // Fan out to the two best-effort Telegram channels in parallel — the
+  // activity channel (so the operator can approve/deny without opening the
+  // dashboard) and the requesting agent's own bot (closes the gap where
+  // operators not in the activity channel would miss approvals entirely,
+  // the 50h+ Repo-B-style stall). Neither depends on the other's outcome.
+  // Both helpers swallow their own errors and resolve to a boolean rather
+  // than rejecting, so Promise.all is safe here. AWAITED so short-lived CLI
+  // callers do not exit before the Telegram fetches complete. Callbacks
+  // route back via the orchestrator's activity-channel poller (see
+  // daemon/agent-manager.ts).
+  const [postedToActivityChannel, pingedAgentChat] = await Promise.all([
+    postApprovalToActivityChannel(paths, org, approvalId, title, category, agentName, context, frameworkRoot),
+    pingAgentChatId(agentDir, approvalId, title, category, agentName, context),
+  ]);
 
   if (!postedToActivityChannel && !pingedAgentChat) {
     // Neither push channel reached a human. Unlike the per-path warns

@@ -473,43 +473,33 @@ describe('createApproval — orchestrator notification + fail-loud warning', () 
     warnSpy.mockRestore();
   });
 
-  it('REGRESSION GUARD: prints a loud console.error only when BOTH push channels fail', async () => {
+  // REGRESSION GUARD: the loud console.error must fire on EXACTLY the
+  // both-fail cell of this 2x2 truth table — any other combination means
+  // at least one human-facing channel still reached someone, so it must
+  // stay silent (the per-path console.warns already cover that case).
+  it.each([
+    { label: 'both channels fail', activityOk: false, pingOk: false, expectError: true },
+    { label: 'only activity fails, ping succeeds', activityOk: false, pingOk: true, expectError: false },
+    { label: 'only ping fails, activity succeeds', activityOk: true, pingOk: false, expectError: false },
+  ])('fail-loud only when BOTH push channels fail ($label)', async ({ activityOk, pingOk, expectError }) => {
     delete process.env.CTX_ORCHESTRATOR_AGENT; // isolate the fail-loud check from orchestrator noise
-    postActivitySpy.mockResolvedValueOnce(false);
+    postActivitySpy.mockResolvedValueOnce(activityOk);
+    let agentDir: string | undefined;
+    if (pingOk) {
+      agentDir = join(testDir, `agent-with-bot-${Math.random().toString(36).slice(2)}`);
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(join(agentDir, '.env'), 'BOT_TOKEN=t\nCHAT_ID=c\n');
+    }
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    // No agentDir -> agent-bot ping also fails -> both channels down.
-    const id = await createApproval(paths, 'alice', 'TestOrg', 'Both down', 'deployment', 'ctx', frameworkRoot);
+    const id = await createApproval(paths, 'alice', 'TestOrg', 'Truth-table test', 'deployment', 'ctx', frameworkRoot, agentDir);
 
-    expect(errorSpy).toHaveBeenCalledTimes(1);
-    const errorCalls = errorSpy.mock.calls.map((c) => c.join(' '));
-    expect(errorCalls.some((w) => w.includes('[approval]') && w.includes(id))).toBe(true);
-    expect(errorCalls.some((w) => w.includes('orchestrator') && w.includes('dashboard'))).toBe(true);
-    errorSpy.mockRestore();
-  });
-
-  it('does NOT print the loud error when only the activity channel fails but the agent-bot ping succeeds', async () => {
-    delete process.env.CTX_ORCHESTRATOR_AGENT;
-    postActivitySpy.mockResolvedValueOnce(false);
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const agentDir = join(testDir, 'agent-with-bot-2');
-    mkdirSync(agentDir, { recursive: true });
-    writeFileSync(join(agentDir, '.env'), 'BOT_TOKEN=t\nCHAT_ID=c\n');
-
-    await createApproval(paths, 'alice', 'TestOrg', 'Only activity down', 'deployment', 'ctx', frameworkRoot, agentDir);
-
-    expect(errorSpy).not.toHaveBeenCalled();
-    errorSpy.mockRestore();
-  });
-
-  it('does NOT print the loud error when only the agent-bot ping fails but the activity channel succeeds', async () => {
-    delete process.env.CTX_ORCHESTRATOR_AGENT;
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-
-    // No agentDir -> ping fails; postActivitySpy default (mockResolvedValue(true)) -> activity channel succeeds.
-    await createApproval(paths, 'alice', 'TestOrg', 'Only ping down', 'deployment', 'ctx', frameworkRoot);
-
-    expect(errorSpy).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledTimes(expectError ? 1 : 0);
+    if (expectError) {
+      const errorCalls = errorSpy.mock.calls.map((c) => c.join(' '));
+      expect(errorCalls.some((w) => w.includes('[approval]') && w.includes(id))).toBe(true);
+      expect(errorCalls.some((w) => w.includes('orchestrator') && w.includes('dashboard'))).toBe(true);
+    }
     errorSpy.mockRestore();
   });
 });

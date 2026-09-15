@@ -28,6 +28,7 @@ import { homedir } from 'os';
 import { createHash } from 'crypto';
 import { execFile } from 'child_process';
 import { readStdin, parseHookInput } from './index.js';
+import { resolveOrchestratorTarget } from '../utils/orchestrator.js';
 
 export const HISTORY_SIZE = 30;
 export const REPETITION_BLOCK = 15;
@@ -169,11 +170,10 @@ function blockCall(reason: string): void {
  * comment). Best-effort: any failure is swallowed so a notify miss never
  * crashes the hook.
  *
- * Reads CTX_ORCHESTRATOR_AGENT (set on the PTY env from the org's
- * context.json — see agent-pty.ts) rather than a hardcoded recipient name,
- * so this works across orgs with differently-named orchestrators. No-ops if
- * unset (context.json missing/malformed) or if the orchestrator IS this
- * agent (an orchestrator alerting itself is a no-op, not a bug).
+ * Orchestrator resolution (CTX_ORCHESTRATOR_AGENT, set on the PTY env from
+ * the org's context.json — see agent-pty.ts; no-ops if unset or if the
+ * orchestrator IS this agent) is shared via resolveOrchestratorTarget() —
+ * see that function's doc for why it's factored out.
  *
  * This closes task_1785591582468's HARD PRE-ACTIVATION GATE for PR #55: the
  * emergency-escape alert previously only reached stderr (visible to no one
@@ -183,8 +183,8 @@ function blockCall(reason: string): void {
  * comment for the full masking analysis this closes path (a) of.
  */
 export function notifyOrchestrator(agentName: string, message: string): void {
-  const orchestrator = process.env.CTX_ORCHESTRATOR_AGENT;
-  if (!orchestrator || orchestrator === agentName) return;
+  const orchestrator = resolveOrchestratorTarget(agentName);
+  if (!orchestrator) return;
   const body = `[loop-detector] ${agentName} is stuck in a blocked tool-call loop — ${message}`;
   const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
   const cliPath = frameworkRoot ? join(frameworkRoot, 'dist', 'cli.js') : null;

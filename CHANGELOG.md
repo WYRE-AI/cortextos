@@ -82,14 +82,19 @@ at all.
 
 `postApprovalToActivityChannel()` and `pingAgentChatId()` now return `Promise<boolean>` (whether
 the push actually sent) instead of `Promise<void>`, and `createApproval()` now unconditionally
-messages the org orchestrator (`CTX_ORCHESTRATOR_AGENT`, mirroring `hook-loop-detector.ts`'s
-`notifyOrchestrator` resolution — no-ops if unset or if the orchestrator is the requesting agent
-itself) via a direct `sendMessage()` call, independent of whether either Telegram path succeeded.
-When both push channels fail, `createApproval()` now also emits a `console.error` (not the
-existing per-path `console.warn`s) naming the approval and pointing at the two things to check
-(`activity-channel.env`, the agent's `.env`) — loud enough to stand out from the routine warns,
-since it means the approval is currently visible ONLY via the orchestrator's inbox and the
-dashboard.
+messages the org orchestrator (`CTX_ORCHESTRATOR_AGENT`) via a direct `sendMessage()` call,
+independent of whether either Telegram path succeeded. When both push channels fail,
+`createApproval()` now also emits a `console.error` (not the existing per-path `console.warn`s)
+naming the approval and pointing at the two things to check (`activity-channel.env`, the agent's
+`.env`) — loud enough to stand out from the routine warns, since it means the approval is
+currently visible ONLY via the orchestrator's inbox and the dashboard.
+
+The orchestrator-resolution predicate (no-op if `CTX_ORCHESTRATOR_AGENT` is unset or equal to the
+requesting agent) already existed once, in `hook-loop-detector.ts`'s `notifyOrchestrator` — rather
+than copy it a second time, it's now `resolveOrchestratorTarget()` in a new
+`src/utils/orchestrator.ts`, shared by both call sites (each keeps its own delivery mechanism:
+`approval.ts` calls `sendMessage` directly, `hook-loop-detector.ts` still shells out via
+`execFile` since a hook process has no direct bus access).
 
 ### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
 
