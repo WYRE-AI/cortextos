@@ -1358,7 +1358,7 @@ so the gap stays open and stated rather than forced closed. Future work on it is
    each time). Boss verified directly against infra's artifact. Task `task_1786985480252_88421058`
    closed 2026-08-17T17:34:04Z, result: "REFUTED, verified by boss against infra's artifact (not
    relayed)... rotation moves all 15." Artifacts (confirmed present, byte-verified, nothing lost):
-   `/Users/asachs/.cortextos/default/orgs/wyre/deliverables/infra/task_1786986210975_09151119/`
+   `$CTX_ROOT/orgs/wyre/deliverables/infra/task_1786986210975_09151119/`
    (`CANONICAL.md`, `pty-credential-test-1.py`, `pty-run-captured-173057Z-1.txt`,
    `rollout-preconditions.md`). Boss's own resolution note, recorded the same evening in his
    personal archive (`MEMORY-archive-2026-08-16-to-2026-08-19.md:777`): "RESOLVED 2026-08-17
