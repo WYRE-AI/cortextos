@@ -14,7 +14,7 @@ import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity, broadcastActivityViaBus } from '../bus/system.js';
-import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline, linkExperimentApproval } from '../bus/experiment.js';
+import { createExperiment, runExperiment, evaluateExperiment, correctExperimentDecision, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline, linkExperimentApproval } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
@@ -1240,14 +1240,47 @@ busCommand
   .argument('<value>', 'Measured value')
   .option('--score <n>', 'Score 1-10')
   .option('--justification <text>', 'Justification text')
-  .action((id: string, value: string, opts: { score?: string; justification?: string }) => {
+  .option('--decision <keep|discard>', 'Override the mechanically-computed decision (requires --justification)')
+  .action((id: string, value: string, opts: { score?: string; justification?: string; decision?: string }) => {
+    if (opts.decision !== undefined && opts.decision !== 'keep' && opts.decision !== 'discard') {
+      console.error(`--decision must be 'keep' or 'discard', got '${opts.decision}'`);
+      process.exit(1);
+    }
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
-    const experiment = evaluateExperiment(agentDir, id, parseFloat(value), {
-      score: opts.score ? parseFloat(opts.score) : undefined,
-      justification: opts.justification,
-    });
-    console.log(JSON.stringify(experiment, null, 2));
+    try {
+      const experiment = evaluateExperiment(agentDir, id, parseFloat(value), {
+        score: opts.score ? parseFloat(opts.score) : undefined,
+        justification: opts.justification,
+        decision: opts.decision as 'keep' | 'discard' | undefined,
+      });
+      console.log(JSON.stringify(experiment, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('correct-experiment-decision')
+  .description('Retroactively fix the decision on an already-completed experiment, with an audit trail')
+  .argument('<id>', 'Experiment ID')
+  .argument('<decision>', 'keep or discard')
+  .argument('<reason>', 'Why this correction is being made')
+  .action((id: string, decision: string, reason: string) => {
+    if (decision !== 'keep' && decision !== 'discard') {
+      console.error(`decision must be 'keep' or 'discard', got '${decision}'`);
+      process.exit(1);
+    }
+    const env = resolveEnv();
+    const agentDir = env.agentDir || process.cwd();
+    try {
+      const experiment = correctExperimentDecision(agentDir, id, decision, reason);
+      console.log(JSON.stringify(experiment, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
   });
 
 /**

@@ -37,6 +37,29 @@ export interface Experiment {
    * null until the experiment completes. This is the ratchet mechanism;
    * baseline_value itself is never touched, so history stays readable. */
   next_baseline_value: number | null;
+  /** The decision evaluateExperiment computed mechanically from
+   * result_value/score vs baseline_value, BEFORE any --decision override is
+   * applied. null until the experiment is evaluated. When evaluateExperiment
+   * is called without --decision, this equals `decision`. When --decision is
+   * passed, this preserves what the mechanical rule would have said, so an
+   * override is auditable rather than silently replacing the machine's
+   * answer with no trace it disagreed (task_1789437846265_69785154 —
+   * evaluate-experiment previously derived `decision` purely from the
+   * numbers and ignored the learning/justification text entirely, so a
+   * correctly-argued KEEP in the prose sat stored as a mechanical DISCARD
+   * with no CLI path to fix it). Also backfilled by correctExperimentDecision
+   * on a pre-fix record that predates this field. */
+  mechanical_decision: 'keep' | 'discard' | null;
+  /** ISO timestamp of the most recent decision override or post-hoc
+   * correction (via evaluate-experiment --decision or
+   * correct-experiment-decision). null if decision has never been
+   * overridden/corrected. */
+  decision_corrected_at: string | null;
+  /** The reason given for the most recent decision override/correction —
+   * REQUIRED non-empty whenever decision_corrected_at is set, since an
+   * override with no stated reason defeats the point of this fix. null if
+   * decision has never been overridden/corrected. */
+  decision_correction_reason: string | null;
   /** True when this experiment's baseline_value was a forced placeholder (no
    * real prior measurement existed) rather than a genuine measured baseline.
    * Set at creation via --placeholder-baseline. Doesn't change decision
@@ -77,6 +100,12 @@ export interface ExperimentEvaluateOptions {
   learning?: string;
   score?: number;
   justification?: string;
+  /** Override the mechanically-computed keep/discard decision. The
+   * mechanical decision is still computed and stored in
+   * `mechanical_decision` for audit; the override becomes the authoritative
+   * `decision` and drives `next_baseline_value`. Requires a non-empty
+   * `justification` — evaluateExperiment refuses otherwise. */
+  decision?: 'keep' | 'discard';
 }
 
 export interface ExperimentFilters {
@@ -235,6 +264,9 @@ export function createExperiment(
     score: null,
     decision: null,
     next_baseline_value: null,
+    mechanical_decision: null,
+    decision_corrected_at: null,
+    decision_correction_reason: null,
     baseline_is_placeholder: options?.baselineIsPlaceholder ?? false,
     needs_manual_review: false,
     learning: '',
@@ -417,18 +449,42 @@ export function evaluateExperiment(
   // real measurement or a qualitative score.
   const effectiveValue = options?.score !== undefined ? options.score : measuredValue;
 
-  let decision: 'keep' | 'discard';
+  let mechanicalDecision: 'keep' | 'discard';
   if (experiment.direction === 'higher') {
-    decision = effectiveValue > baseline ? 'keep' : 'discard';
+    mechanicalDecision = effectiveValue > baseline ? 'keep' : 'discard';
   } else {
-    decision = effectiveValue < baseline ? 'keep' : 'discard';
+    mechanicalDecision = effectiveValue < baseline ? 'keep' : 'discard';
   }
+
+  // --decision overrides the mechanical result. The mechanical answer is
+  // still computed above and stored below for audit — this is not a way to
+  // skip the measurement, only to override what it implies (see the
+  // Experiment.mechanical_decision docstring for why: evaluate-experiment
+  // used to derive `decision` purely from the numbers, ignoring the
+  // learning/justification text entirely, and a correctly-argued override
+  // had no CLI path in — only hand-editing the JSON). Requiring a non-empty
+  // justification here means an override always carries its own reason in
+  // the same record, not just implicitly "the agent said so."
+  if (options?.decision !== undefined && !options?.justification?.trim()) {
+    throw new Error(
+      `evaluate-experiment refused: --decision ${options.decision} was passed without ` +
+      `--justification. An override with no stated reason defeats the point of this flag — ` +
+      `pass --justification "<why>" explaining why the mechanical decision ` +
+      `(would have been '${mechanicalDecision}') is wrong here.`,
+    );
+  }
+  const decision: 'keep' | 'discard' = options?.decision ?? mechanicalDecision;
 
   experiment.status = 'completed';
   experiment.completed_at = nowISO();
   experiment.result_value = measuredValue;
   experiment.score = options?.score ?? null;
   experiment.decision = decision;
+  experiment.mechanical_decision = mechanicalDecision;
+  if (options?.decision !== undefined) {
+    experiment.decision_corrected_at = nowISO();
+    experiment.decision_correction_reason = options.justification!.trim();
+  }
 
   if (experiment.baseline_is_placeholder) {
     experiment.needs_manual_review = true;
@@ -525,6 +581,72 @@ export function evaluateExperiment(
     }
   }
 
+  return experiment;
+}
+
+/**
+ * Retroactively fix the stored `decision` on an ALREADY-COMPLETED experiment.
+ *
+ * evaluateExperiment only accepts status='running' (see its own guard above),
+ * so there was previously no CLI path to correct a completed record once its
+ * mechanical decision was shown to be wrong — every real correction incident
+ * in this corpus (murph, adoption, marketing's exp_1787745238_vzgah) was
+ * hand-edited directly in the JSON file, with no audit trail of what changed
+ * or why (task_1789437846265_69785154).
+ *
+ * Refuses on 'running'/'proposed' — those go through evaluate-experiment
+ * --decision instead, which is the first-evaluation path and computes
+ * result_value/mechanical_decision fresh; this function only ever rewrites
+ * `decision` on a record that already has those set.
+ *
+ * Backfills `mechanical_decision` from the record's OLD `decision` value if
+ * `mechanical_decision` is still null — true for every record evaluated
+ * before this fix shipped, which have no way to otherwise recover what the
+ * mechanical rule originally said.
+ */
+export function correctExperimentDecision(
+  agentDir: string,
+  experimentId: string,
+  decision: 'keep' | 'discard',
+  reason: string,
+): Experiment {
+  if (!reason.trim()) {
+    throw new Error(
+      'correct-experiment-decision refused: a reason is required — an undocumented correction ' +
+      'is exactly the problem this command exists to fix.',
+    );
+  }
+
+  const experiment = loadExperiment(agentDir, experimentId);
+
+  if (experiment.status !== 'completed') {
+    throw new Error(
+      `Experiment ${experimentId} is '${experiment.status}', expected 'completed'. ` +
+      `A running or proposed experiment isn't evaluated yet — use ` +
+      `'evaluate-experiment <id> <value> --decision ${decision} --justification "<reason>"' instead.`,
+    );
+  }
+
+  if (experiment.mechanical_decision == null) {
+    // Pre-fix record: the only record of what the mechanical rule originally
+    // said is the (uncorrected) decision it stored at the time. A record
+    // written before this field existed has the key entirely absent from its
+    // JSON (parses as undefined, not null) — loose equality catches both.
+    experiment.mechanical_decision = experiment.decision;
+  }
+
+  experiment.decision = decision;
+  experiment.decision_corrected_at = nowISO();
+  experiment.decision_correction_reason = reason.trim();
+
+  // Same ratchet rule evaluateExperiment uses, applied to the corrected
+  // decision — the effective value is score when present, else result_value.
+  const effectiveValue = experiment.score ?? experiment.result_value;
+  if (effectiveValue !== null && experiment.baseline_value !== null) {
+    experiment.next_baseline_value = decision === 'keep' ? effectiveValue : experiment.baseline_value;
+  }
+
+  saveExperiment(agentDir, experiment);
   return experiment;
 }
 
