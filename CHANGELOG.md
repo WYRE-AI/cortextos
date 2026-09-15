@@ -94,6 +94,14 @@ the same keep/discard ratchet rule `evaluateExperiment` already used. `gatherCon
 recompute the effective baseline from `decision`/`score`/`result_value` on every call rather than
 trusting a possibly-stale stored value.
 
+The dashboard's `GET /api/experiments` had the same staleness gap on a different surface — it read
+`experiments/learnings.md` directly off disk, which `correctExperimentDecision`/`evaluateExperiment`
+never rewrite, so a corrected decision would show its pre-correction text on the dashboard forever
+(caught by CodeRabbit review on this PR). Fixed by regenerating the `learnings` field live from the
+JSON history records on every request, mirroring `formatLearnings()`/`displayBaseline()` in
+`src/bus/experiment.ts` as a local copy (the dashboard already keeps its own local `Experiment` type
+rather than importing root `src/`).
+
 ### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
 
 Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`
