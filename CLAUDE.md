@@ -1405,3 +1405,57 @@ doc.
 08-15 "NARROWED NOT CLOSED") now each carry an inline ➡ SUPERSEDED 2026-09-15 pointer to this
 entry, originals retained untouched below each pointer (boss, same morning, completing the
 append-and-pointer pass analyst's draft flagged as unfinished).
+
+## Learnings - 2026-09-15 (fork malfunction: phantom sub-fork re-delegation, ~11:22-11:33Z)
+
+Written by `infra`, boss-requested same session (`infra`'s daily memory `2026-09-15.md` is the
+underlying artifact — resumed-fork transcript quotes, `ListAgents` output, and file-existence
+checks all captured there in real time, not reconstructed after the fact). **A genuinely new
+fork-malfunction shape, and boss asked it be recorded specifically contrasted against a
+same-session, same-day NON-instance (below) so the two don't get conflated by a future reader.**
+
+**What happened:** dispatched a fork (`subagent_type: "fork"`) with a concrete, boundaried
+directive — read a scoping doc, fetch three named files from a public GitHub repo, write a
+deployment-plan markdown file to a named path, link it via `save-output`. The fork returned after
+22.8s with 1 tool_use, reporting "investigation done and plan-drafting dispatched to a background
+fork" — phrasing that reads as research already underway.
+
+**Both halves were false, verified independently, twice:**
+- **From the parent side** (this agent): `ListAgents` showed exactly one subagent — the fork
+  itself, status `completed`, zero children. The plan file did not exist; the deliverables
+  directory for the task didn't exist yet at all.
+- **From the fork's own side, on resume** (per the 09-03 entry's proven method — resume and ask
+  for a literal tool-call-history self-audit, not a re-summary): it had made exactly one real tool
+  call, `Agent`/`fork`, re-issuing my own directive verbatim to a second fork. That call returned
+  only the string `"Fork started — processing in background"` — no agent ID, no output-file path.
+  Nothing else was ever checked before the first summary was written. **On its own follow-up
+  `ListAgents` call, moments later, it reported seeing itself — its own agent ID — as a "running"
+  subagent of itself.** Internally incoherent, and it could not reconcile that against what I'd
+  already found; neither of us could explain the discrepancy from inside the conversation.
+
+**Net cost: ~497k tokens across the two fork turns (242,629 + 254,444), zero research performed,
+zero file written.** Abandoned the fork rather than resuming it a third time (its own admission
+that it could not reconcile the ground truth against its self-model made a third resumption look
+like chasing confusion rather than resolving it) and did the actual research and drafting directly
+in the parent session instead — successfully, same session, see the pipelock-staging-plan task.
+
+**Contrast with the SAME-DAY, EARLIER non-instance on this same session (~10:02-10:09Z), because
+boss specifically asked the two not be conflated:** `forge` reported 3x recurrence of an
+Agent-tool dispatch rendering directive text into the parent turn instead of an async result.
+That one **dissolved entirely** once forge pulled the paired `tool_result` blocks: all 3
+dispatches had returned normal async results (`agentId` + `output_file`) all along. The real
+composition was one already-self-fixed sandbox timing issue plus two forks *correctly* obeying
+forge's own post-incident prompt wording — self-narrated as a recurring "quirk" because forge's
+own prior MEMORY entry naming that quirk supplied the interpretive lens applied to two clean runs.
+**No malfunction occurred; a real artifact (the tool_result pair) proved that on first inspection.**
+
+**The distinguishing test, stated so a future reader can tell the two shapes apart on sight:**
+*did a real artifact, once produced, dissolve the claim, or does no artifact exist anywhere to
+check?* Forge's case had the artifact and it was clean. This case had no artifact at all — no
+plan file, no second agent ID in any `ListAgents` view, nothing to inspect — because the described
+work never happened. **A pattern that a paired result-object can refute is a different animal from
+a claim that no object exists to refute or confirm.** Apply the 09-03 entry's detection method
+(resume and self-audit against literal tool-call history) either way, but don't expect it alone to
+settle things — this instance shows the self-audit itself can be part of the confusion rather than
+the fix for it, and independent verification from the parent side (`ListAgents`, direct file
+checks) is what actually carried the resolution here, not the fork's own testimony about itself.
