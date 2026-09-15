@@ -9,6 +9,7 @@ import { existsSync, readFileSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { loadAccounts, setActiveAccount, writeTokenToAgents } from '../bus/oauth.js';
+import { attemptGlmFallback, clearGlmFallbackForRecoveredAgents, markGlmFallbackActive, type GlmFallbackAttemptResult } from './glm-fallback.js';
 import type { LimitEvent } from './limit-detector.js';
 
 export type PreflightResult = 'ok' | 'limit' | 'error';
@@ -22,6 +23,12 @@ export interface RotationDeps {
   restartAgent: (name: string) => Promise<void>;
   sendAlert: (text: string) => void;
   log: (msg: string) => void;
+  /**
+   * Injection point for Tier 2 (GLM-5.3 cross-provider fallback), tests only
+   * — defaults to the real glm-fallback.ts implementation. Called exactly
+   * once, from the "every Tier 1 account exhausted" halt branch below.
+   */
+  tryGlmFallback?: (ctxRoot: string, blockedAgents: string[], reason: string, log: (msg: string) => void) => GlmFallbackAttemptResult;
 }
 
 /**
@@ -136,11 +143,14 @@ export function isLimitBlocked(ctxRoot: string, agent: string): boolean {
 
 export class RotationManager {
   private readonly now: () => number;
+  private readonly tryGlmFallback: NonNullable<RotationDeps['tryGlmFallback']>;
   private timer: ReturnType<typeof setInterval> | null = null;
   private rotating = false;
 
   constructor(private readonly deps: RotationDeps) {
     this.now = deps.now ?? (() => Date.now());
+    this.tryGlmFallback = deps.tryGlmFallback ??
+      ((ctxRoot, blockedAgents, reason, log) => attemptGlmFallback(ctxRoot, blockedAgents, reason, { log, now: this.now }));
   }
 
   private save(state: RotationState): void {
@@ -289,6 +299,10 @@ export class RotationManager {
         // Reload: preflights are slow (real inference); more agents may have blocked meanwhile.
         state = loadState(this.deps.ctxRoot);
         const toRestart = Object.keys(state.limitBlocked);
+        // A real Tier 1 account is back — any agent that had fallen to Tier 2
+        // must not keep serving off a stale GLM override once restarted onto
+        // a fresh Tier 1 token.
+        clearGlmFallbackForRecoveredAgents(this.deps.ctxRoot, toRestart);
         for (const agent of toRestart) {
           try {
             await this.deps.restartAgent(agent);
@@ -336,6 +350,7 @@ export class RotationManager {
       if (activeResult === 'ok') {
         state = loadState(this.deps.ctxRoot);
         const toRestart = Object.keys(state.limitBlocked);
+        clearGlmFallbackForRecoveredAgents(this.deps.ctxRoot, toRestart);
         for (const agent of toRestart) {
           try {
             await this.deps.restartAgent(agent);
@@ -392,5 +407,35 @@ export class RotationManager {
     const msg = `⛔ cortextOS: ALL OAuth accounts exhausted. Blocked: ${Object.keys(state.limitBlocked).join(', ') || 'none yet'}. Auto-retry at ${new Date(state.retryAt).toISOString()}.`;
     this.deps.log('[rotation] ' + msg);
     if (alertNeeded) this.deps.sendAlert(msg);
+
+    // Tier 2 (GLM-5.3 cross-provider fallback) — entered ONLY here, having
+    // just verified every Tier 1 account (bench + active recheck) failed
+    // preflight this invocation. Ships disabled; a no-config or
+    // enabled:false fleet gets a guaranteed no-op. See glm-fallback.ts.
+    const blockedNow = Object.keys(state.limitBlocked);
+    if (blockedNow.length > 0) {
+      const glmResult = this.tryGlmFallback(this.deps.ctxRoot, blockedNow, reason, this.deps.log);
+      if (glmResult.candidates.length > 0) {
+        // Mark active ONLY after a confirmed restart (PR #186 review, dev):
+        // marking first and restarting second means a restart failure
+        // leaves the agent permanently stuck — the next attempt's
+        // already-active filter would exclude it from ever being retried.
+        const entered: string[] = [];
+        for (const agent of glmResult.candidates) {
+          try {
+            await this.deps.restartAgent(agent);
+            markGlmFallbackActive(this.deps.ctxRoot, agent, reason, this.now);
+            entered.push(agent);
+          } catch (err) {
+            this.deps.log(`[glm-fallback] restart failed for ${agent}: ${err} — NOT marked Tier-2-active, remains a candidate for the next attempt`);
+          }
+        }
+        if (entered.length > 0) {
+          const glmMsg = `🟡 cortextOS: Tier 2 (GLM-5.3/Z.ai) entered for ${entered.join(', ')} — all Tier 1 accounts exhausted. Held on Tier 1: ${glmResult.excluded.join(', ') || 'none'}.`;
+          this.deps.log('[glm-fallback] ' + glmMsg);
+          this.deps.sendAlert(glmMsg);
+        }
+      }
+    }
   }
 }

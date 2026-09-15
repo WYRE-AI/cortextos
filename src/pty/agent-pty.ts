@@ -4,6 +4,7 @@ import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import { injectMessage as injectMessageIntoPty } from './inject.js';
+import { applyGlmFallbackEnv } from '../daemon/glm-fallback.js';
 
 /**
  * Is `binary` resolvable on PATH and executable RIGHT NOW?
@@ -348,9 +349,15 @@ export class AgentPTY {
    * Runtime-specific env hook. Subclasses such as OpencodePTY use this to add
    * CLI-specific isolation variables while keeping AgentPTY's shared cortextOS
    * env/secrets loading path in one place.
+   *
+   * Default Claude Code runtime: applies the Tier 2 GLM-5.3 (Z.ai) fallback
+   * override when rotation-manager has marked this agent Tier-2-active
+   * (see ../daemon/glm-fallback.ts). No-op — one cheap file check — for
+   * every spawn where the agent isn't on Tier 2, which is the overwhelming
+   * majority of spawns.
    */
-  protected customizeEnv(_env: Record<string, string>): void {
-    // Default Claude Code runtime has no extra env.
+  protected customizeEnv(env: Record<string, string>): void {
+    applyGlmFallbackEnv(env, this.env.ctxRoot, this.env.agentName);
   }
 
   /**
