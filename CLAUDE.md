@@ -1371,11 +1371,15 @@ so the gap stays open and stated rather than forced closed. Future work on it is
 3. **2026-09-15, second generation, condition 2-v2** — same day, full throwaway `$HOME` (matching
    the real no-`CLAUDE_CONFIG_DIR` agents' actual state) instead of a custom config dir, N=3, same
    result. Evidence: `experiments/surfaces/interactive-credential-precedence-test/` (`design.md`,
-   `smoke-test-results.md`, harness scripts). A planned third arm (a valid competing bench-account
-   token, to test identity rather than mere presence) was ruled **unnecessary** by boss before
-   running further: the impossible-token design is strictly the stronger form — a clean 401 proves
-   the env token was used without needing to attribute which credential served, where a
-   valid-token run would only weaken to a harder identity-inference problem.
+   `smoke-test-results.md`, harness scripts). A third arm (a valid competing bench-account token,
+   to test identity rather than mere presence) **was run once and came back ambiguous on identity
+   attribution** (the session header showed neither the predicted team label nor the bench
+   account's), and a native-write feasibility check was also inconclusive (Claude Code performs no
+   native credential write under env-token-only auth). **Further arm-3 attempts were then ruled
+   unnecessary by boss**: the impossible-token design is strictly the stronger form — a clean 401
+   proves the env token was used without needing to attribute which credential served, where a
+   valid-token run can only weaken to a harder identity-inference problem (as its one ambiguous
+   run demonstrated).
 
 **Inversion consequences (this is the actionable part):** the 2026-08-14 "5 of 15 agents are
 outside the rotation mechanism" premise (`adoption`, `grower`, `infra`, `maintainer`, `marketing`
