@@ -1,0 +1,323 @@
+name: Migration Collision Check
+
+# Reusable workflow that detects cross-PR migration-number collisions.
+#
+# Fails the calling PR's check if any migration file the PR INTRODUCES has a
+# number that:
+#   (a) is already used by a migration on the base branch, OR
+#   (b) is already proposed by another open (non-draft) PR in the same repo.
+#
+# The actionable error annotation names the colliding artifact (on main, or
+# in open PR #N).
+#
+# Consumer usage:
+#
+#   # in <consumer>/.github/workflows/migrations.yml
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened]
+#   jobs:
+#     migration-collision-check:
+#       uses: grandamenium/cortextos/.github/workflows/migration-collision-check.yml@main
+#       # optionally override defaults:
+#       # with:
+#       #   migrations-path: db/migrations
+#       #   filename-pattern: '^([0-9]{14})_'
+
+on:
+  workflow_call:
+    inputs:
+      migrations-path:
+        description: >
+          Directory containing migration files, relative to repo root.
+          Default: migrations
+        type: string
+        default: 'migrations'
+      filename-pattern:
+        description: >
+          Regular expression (Python `re` module syntax — this is what the
+          check actually compiles it with, not POSIX ERE) matching migration
+          filenames; capture group 1 must be the migration number. Default
+          matches the 3-digit sequential prefix (NNN_xxx.sql) — the conduit
+          convention. Override for timestamp-style migrations (e.g.
+          '^([0-9]{14})_').
+        type: string
+        default: '^([0-9]{3})_'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  collision-check:
+    name: Detect migration-number collisions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head with full history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect migration-number collisions
+        env:
+          MIGRATIONS_PATH: ${{ inputs.migrations-path }}
+          FILENAME_PATTERN: ${{ inputs.filename-pattern }}
+          BASE_REF: ${{ github.base_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 <<'PYEOF'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          # normpath collapses a leading './' / trailing '/' / doubled slashes so
+          # this matches the API's filename strings ("migrations/001_x.sql"),
+          # which never carry a "./" prefix even when the caller's input does.
+          MIGRATIONS_PATH = os.path.normpath(os.environ['MIGRATIONS_PATH'])
+          FILENAME_PATTERN = os.environ['FILENAME_PATTERN']
+          BASE_REF = os.environ['BASE_REF']
+          PR_NUMBER = int(os.environ['PR_NUMBER'])
+          REPO = os.environ['REPO']
+
+          try:
+              pattern = re.compile(FILENAME_PATTERN)
+          except re.error as e:
+              print(f"::error::Invalid filename-pattern regex: {e}")
+              sys.exit(2)
+          if pattern.groups < 1:
+              print(f"::error::filename-pattern must include capture group 1 for the migration number")
+              sys.exit(2)
+
+
+          def basename_matches(path):
+              return pattern.match(os.path.basename(path)) is not None
+
+
+          def extract_number(path):
+              m = pattern.match(os.path.basename(path))
+              return m.group(1) if m else None
+
+
+          def ls_ref_migrations(ref):
+              """Return list of migration paths in MIGRATIONS_PATH at the given git ref."""
+              try:
+                  out = subprocess.check_output(
+                      ['git', 'ls-tree', '-r', '--name-only', ref, '--', MIGRATIONS_PATH],
+                      text=True,
+                      stderr=subprocess.DEVNULL,
+                  )
+              except subprocess.CalledProcessError:
+                  return []
+              return [line for line in out.splitlines() if line and basename_matches(line)]
+
+
+          # Fetch the base ref so we can diff against it.
+          subprocess.run(
+              ['git', 'fetch', '--no-tags', 'origin', BASE_REF],
+              check=True, capture_output=True,
+          )
+
+          base_files = set(ls_ref_migrations(f'origin/{BASE_REF}'))
+
+          # Map number -> base file.
+          base_by_num = {}
+          for f in base_files:
+              n = extract_number(f)
+              if n is not None:
+                  base_by_num[n] = f
+
+
+          def diff_migration_changes(base_ref, head_ref):
+              """Rename-aware diff of MIGRATIONS_PATH between base_ref and
+              head_ref. Returns (added_paths, renamed_pairs); renamed_pairs is
+              a list of (old_path, new_path) for git-detected renames whose
+              new path matches filename-pattern.
+
+              A plain path-set diff (pr_files - base_files) treats a
+              same-number rename -- e.g. renumbering nothing, just fixing a
+              typo in a migration's descriptive suffix -- as introducing a
+              brand-new migration. That "new" file then collides with the
+              base-branch file it was renamed FROM (same number, still
+              present on base, since only this PR's tree changed), a false
+              positive that would block an unrelated, harmless rename
+              (2026-09-17 CodeRabbit finding on #193). Using git's own rename
+              detection (`-M`) and only treating a rename as a NEW candidate
+              when its extracted number actually changed avoids that, while
+              still catching a rename that changes which number a file
+              claims.
+              """
+              try:
+                  out = subprocess.check_output(
+                      ['git', 'diff', '--name-status', '-M',
+                       f'{base_ref}...{head_ref}', '--', MIGRATIONS_PATH],
+                      text=True, stderr=subprocess.DEVNULL,
+                  )
+              except subprocess.CalledProcessError:
+                  return [], []
+              added, renamed = [], []
+              for line in out.splitlines():
+                  if not line:
+                      continue
+                  parts = line.split('\t')
+                  status = parts[0]
+                  if status == 'A' and len(parts) == 2 and basename_matches(parts[1]):
+                      added.append(parts[1])
+                  elif status.startswith('R') and len(parts) == 3 and basename_matches(parts[2]):
+                      renamed.append((parts[1], parts[2]))
+              return added, renamed
+
+
+          added_paths, renamed_pairs = diff_migration_changes(f'origin/{BASE_REF}', 'HEAD')
+
+          if not added_paths and not renamed_pairs:
+              print(f"No new migrations in {MIGRATIONS_PATH}/ introduced by this PR. Nothing to check.")
+              sys.exit(0)
+
+          # Map number -> our new file. Catch internal duplicates first. A
+          # rename only counts as a new candidate when its number actually
+          # changed -- a same-number rename is the same migration, not a new
+          # one, and must not register as new-vs-base (see
+          # diff_migration_changes above).
+          pr_new_by_num = {}
+
+          def add_candidate(f):
+              n = extract_number(f)
+              if n is None:
+                  return
+              if n in pr_new_by_num:
+                  print(
+                      f"::error file={f}::Migration number {n} appears twice in this PR's "
+                      f"new files: {pr_new_by_num[n]} and {f}"
+                  )
+                  sys.exit(1)
+              pr_new_by_num[n] = f
+
+          for f in sorted(added_paths):
+              add_candidate(f)
+          for old_path, new_path in sorted(renamed_pairs):
+              if extract_number(new_path) != extract_number(old_path):
+                  add_candidate(new_path)
+
+          if not pr_new_by_num:
+              print(f"No new migrations matched filename-pattern. Nothing to check.")
+              sys.exit(0)
+
+          collisions = []  # list of (number, our_file, where_str)
+
+          # Check 1: collide with base branch.
+          for n, f in pr_new_by_num.items():
+              if n in base_by_num:
+                  collisions.append((n, f, f"on {BASE_REF} as {base_by_num[n]}"))
+
+          # Check 2: collide with another open (non-draft) PR.
+          prs_raw = subprocess.check_output(
+              ['gh', 'pr', 'list', '--repo', REPO, '--state', 'open',
+               '--limit', '300', '--json', 'number,isDraft'],
+              text=True,
+          )
+          others = [
+              p for p in json.loads(prs_raw)
+              if not p['isDraft'] and p['number'] != PR_NUMBER
+          ]
+
+
+          def pr_is_closed(number):
+              """True only if a fresh lookup confirms the PR closed/merged since
+              the listing above. Used to distinguish a legitimate skip (the PR
+              is no longer a collision candidate) from an API hiccup that would
+              otherwise silently defeat this check for a PR that is still open."""
+              try:
+                  state = subprocess.check_output(
+                      ['gh', 'pr', 'view', str(number), '--repo', REPO,
+                       '--json', 'state', '-q', '.state'],
+                      text=True, stderr=subprocess.DEVNULL,
+                  ).strip()
+              except subprocess.CalledProcessError:
+                  return False
+              return state in ('CLOSED', 'MERGED')
+
+
+          for p in others:
+              other_num = p['number']
+              try:
+                  # --paginate alone concatenates each page's JSON array as a
+                  # SEPARATE top-level value (page1_array page2_array ...),
+                  # which is not valid JSON as one document — json.loads()
+                  # below would raise on any PR whose file list spans more
+                  # than one page (this endpoint pages at 30) and get treated
+                  # as "malformed", silently skipping exactly the PRs most
+                  # likely to contain a colliding migration. --slurp wraps
+                  # every page into ONE JSON array of page-arrays instead, so
+                  # multi-page output is always valid JSON; page contents are
+                  # flattened below (2026-09-17 CodeRabbit finding on #193).
+                  files_raw = subprocess.check_output(
+                      ['gh', 'api', f'repos/{REPO}/pulls/{other_num}/files', '--paginate', '--slurp'],
+                      text=True,
+                      stderr=subprocess.DEVNULL,
+                  )
+              except subprocess.CalledProcessError:
+                  if pr_is_closed(other_num):
+                      print(f"::warning::PR #{other_num} closed since listing (skipped)")
+                      continue
+                  print(f"::error::Could not enumerate files for open PR #{other_num} — "
+                        f"failing rather than silently skipping a collision check")
+                  sys.exit(1)
+              try:
+                  files_data = [item for page in json.loads(files_raw) for item in page]
+              except json.JSONDecodeError:
+                  if pr_is_closed(other_num):
+                      print(f"::warning::PR #{other_num} closed since listing (skipped)")
+                      continue
+                  print(f"::error::Malformed file listing for open PR #{other_num} — "
+                        f"failing rather than silently skipping a collision check")
+                  sys.exit(1)
+              for fdata in files_data:
+                  status = fdata.get('status')
+                  path = fdata.get('filename', '')
+                  if status == 'added':
+                      old_num = None
+                  elif status == 'renamed':
+                      # The GitHub API reports a rename with status="renamed",
+                      # not "added" -- the old added-only filter skipped these
+                      # entirely, so another open PR could introduce a
+                      # colliding number purely by renaming an existing
+                      # migration (2026-09-17 CodeRabbit finding on #193, the
+                      # false-negative mirror of the base-branch case above).
+                      prev_path = fdata.get('previous_filename', '')
+                      old_num = extract_number(prev_path) if basename_matches(prev_path) else None
+                  else:
+                      continue
+                  if not path.startswith(MIGRATIONS_PATH + '/'):
+                      continue
+                  if not basename_matches(path):
+                      continue
+                  on = extract_number(path)
+                  if on is None or on == old_num:
+                      # A same-number rename in the OTHER pr is that PR's own
+                      # existing migration, not a new number it is
+                      # introducing -- symmetric with the base-branch fix.
+                      continue
+                  if on in pr_new_by_num:
+                      collisions.append(
+                          (on, pr_new_by_num[on], f"in open PR #{other_num} as {path}")
+                      )
+
+          if collisions:
+              print(f"::error::Found {len(collisions)} migration-number collision(s).")
+              for n, f, where in collisions:
+                  print(
+                      f"::error file={f}::Migration number {n} (this PR introduces {f}) "
+                      f"collides {where}. Renumber to the next available value."
+                  )
+              sys.exit(1)
+
+          print(
+              f"Checked {len(pr_new_by_num)} new migration(s) against {len(base_by_num)} "
+              f"base-branch migration(s) and {len(others)} other open PR(s); no collisions."
+          )
+          PYEOF

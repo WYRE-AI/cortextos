@@ -1,0 +1,28 @@
+name: Migration Collision Check (self-test)
+
+# Falsifiability test for migration-collision-check.yml's embedded Python
+# collision logic — same pattern as leak-guard.yml's own test step. This
+# reusable workflow is only ever exercised for real inside a CALLING repo
+# (conduit, etc.), so this repo needs its own runner to prove the logic
+# before it ships. See tests/migration-collision-check.test.sh for why the
+# test extracts the real embedded source rather than a copy.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    name: Prove the collision-check logic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run regression test
+        run: bash tests/migration-collision-check.test.sh
