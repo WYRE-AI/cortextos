@@ -135,6 +135,112 @@ if [ "$rc" -ne 0 ]; then
   fails=1
 fi
 
+# ---- Case (c): a still-OPEN PR whose file listing errors (rate limit,
+#      network, permission) must FAIL the check, not silently skip it ----
+# CodeRabbit finding (2026-09-17, second re-review on #193): before this fix
+# any `gh api .../files` failure was logged as a `::warning::` and skipped
+# exactly like a closed/irrelevant PR — so a transient API hiccup could
+# silently defeat this whole check for the PR most likely to matter. The
+# code now confirms via a fresh `gh pr view` that a PR is actually
+# closed/merged before treating a listing failure as a legitimate skip.
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "pr list "*)
+    echo '[{"number": 997, "isDraft": false}]'
+    ;;
+  "api repos/fake/repo/pulls/997/files --paginate --slurp")
+    exit 1
+    ;;
+  "pr view 997 --repo fake/repo --json state -q .state")
+    echo "OPEN"
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+export PR_NUMBER=1
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "FAIL: script exited 0 for a still-open PR (#997) whose file listing errored — must fail closed, not silently pass"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "::error::Could not enumerate files for open PR #997"; then
+  echo "FAIL: expected an ::error:: annotation naming PR #997's enumeration failure"
+  echo "$out"
+  fails=1
+fi
+
+# ---- Case (d): control — the SAME listing failure for a PR that IS closed
+#      since the initial listing is a legitimate skip, must stay CLEAN ----
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "pr list "*)
+    echo '[{"number": 996, "isDraft": false}]'
+    ;;
+  "api repos/fake/repo/pulls/996/files --paginate --slurp")
+    exit 1
+    ;;
+  "pr view 996 --repo fake/repo --json state -q .state")
+    echo "CLOSED"
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+export PR_NUMBER=1
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "FAIL: script failed for PR #996 which is confirmed CLOSED — this is a legitimate skip, not a defect"
+  echo "$out"
+  fails=1
+fi
+
+# ---- Case (e): a leading "./" on MIGRATIONS_PATH must not disable the
+#      cross-PR collision check ----
+# CodeRabbit finding: MIGRATIONS_PATH only stripped a trailing "/", so a
+# caller-supplied "./migrations" never matched the API's "migrations/x.sql"
+# filenames in the startswith() comparison, silently disabling this half of
+# the check. Now normalized with os.path.normpath.
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "pr list "*)
+    echo '[{"number": 995, "isDraft": false}]'
+    ;;
+  "api repos/fake/repo/pulls/995/files --paginate --slurp")
+    python3 -c 'import json; print(json.dumps([[{"status": "added", "filename": "migrations/030_colliding.sql"}]]))'
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+export MIGRATIONS_PATH="./migrations"
+export PR_NUMBER=1
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "FAIL: script exited 0 with MIGRATIONS_PATH='./migrations' but a real cross-PR collision exists — leading-./ handling regressed"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "collides in open PR #995"; then
+  echo "FAIL: collision not attributed to PR #995 with MIGRATIONS_PATH='./migrations'"
+  echo "$out"
+  fails=1
+fi
+export MIGRATIONS_PATH=migrations
+
 cd - >/dev/null
 
 if [ "$fails" -eq 0 ]; then echo "migration-collision-check.test: PASS"; else echo "migration-collision-check.test: FAIL"; exit 1; fi

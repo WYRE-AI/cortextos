@@ -75,7 +75,10 @@ jobs:
           import subprocess
           import sys
 
-          MIGRATIONS_PATH = os.environ['MIGRATIONS_PATH'].rstrip('/')
+          # normpath collapses a leading './' / trailing '/' / doubled slashes so
+          # this matches the API's filename strings ("migrations/001_x.sql"),
+          # which never carry a "./" prefix even when the caller's input does.
+          MIGRATIONS_PATH = os.path.normpath(os.environ['MIGRATIONS_PATH'])
           FILENAME_PATTERN = os.environ['FILENAME_PATTERN']
           BASE_REF = os.environ['BASE_REF']
           PR_NUMBER = int(os.environ['PR_NUMBER'])
@@ -172,6 +175,23 @@ jobs:
               if not p['isDraft'] and p['number'] != PR_NUMBER
           ]
 
+
+          def pr_is_closed(number):
+              """True only if a fresh lookup confirms the PR closed/merged since
+              the listing above. Used to distinguish a legitimate skip (the PR
+              is no longer a collision candidate) from an API hiccup that would
+              otherwise silently defeat this check for a PR that is still open."""
+              try:
+                  state = subprocess.check_output(
+                      ['gh', 'pr', 'view', str(number), '--repo', REPO,
+                       '--json', 'state', '-q', '.state'],
+                      text=True, stderr=subprocess.DEVNULL,
+                  ).strip()
+              except subprocess.CalledProcessError:
+                  return False
+              return state in ('CLOSED', 'MERGED')
+
+
           for p in others:
               other_num = p['number']
               try:
@@ -191,13 +211,21 @@ jobs:
                       stderr=subprocess.DEVNULL,
                   )
               except subprocess.CalledProcessError:
-                  print(f"::warning::Could not enumerate files for open PR #{other_num} (skipped)")
-                  continue
+                  if pr_is_closed(other_num):
+                      print(f"::warning::PR #{other_num} closed since listing (skipped)")
+                      continue
+                  print(f"::error::Could not enumerate files for open PR #{other_num} — "
+                        f"failing rather than silently skipping a collision check")
+                  sys.exit(1)
               try:
                   files_data = [item for page in json.loads(files_raw) for item in page]
               except json.JSONDecodeError:
-                  print(f"::warning::Malformed file listing for open PR #{other_num} (skipped)")
-                  continue
+                  if pr_is_closed(other_num):
+                      print(f"::warning::PR #{other_num} closed since listing (skipped)")
+                      continue
+                  print(f"::error::Malformed file listing for open PR #{other_num} — "
+                        f"failing rather than silently skipping a collision check")
+                  sys.exit(1)
               for fdata in files_data:
                   if fdata.get('status') != 'added':
                       continue
