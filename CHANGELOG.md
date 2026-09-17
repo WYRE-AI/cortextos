@@ -24,6 +24,29 @@ against a throwaway synthetic repo, proving both failure directions against the 
 before confirming they pass against the fix — never relying on a specific commit existing in this
 repo's own history, which could be rewritten later.
 
+**Two follow-up fixes from CodeRabbit re-review, both mutation-tested against their own pre-fix
+commits before merge.** (1) The same-sha fast path (`$ref_sha == $head_sha`, skip the worktree
+entirely) checked sha equality but not tree cleanliness — a dirty tracked file with an uncommitted
+planted leak was scanned and reported even though `--tree HEAD` was asked about HEAD's actual
+(clean) committed content, the same false-positive bug class as above just hiding behind the
+sha-equality check instead of in front of it. The fast path now additionally requires `git diff
+--quiet HEAD --`, falling through to the worktree path on any dirty tracked file. (2) The
+leftover-worktree sweep added alongside the fast-path fix (finds and removes any abandoned
+`leak-guard-wt.*` worktree from a previously SIGKILLed run) had no liveness check, so two
+concurrent `--tree` invocations against the same checkout — ordinary usage for a fleet running many
+agents against a small number of shared checkouts — could have one invocation's sweep force-remove
+a second invocation's still-active worktree mid-scan; `scan_file()`'s `[ -f "$f" ] || return` then
+silently skipped the now-missing files, so the victim finished and reported "clean" despite
+scanning a real leak. Reproduced decisively (a real planted leak came back exit 0 "clean" once a
+racing sweep deleted the scanning process's worktree out from under it). Fixed by serializing the
+whole worktree lifecycle (stale sweep through final cleanup) behind an `mkdir`-based lock (portable
+— no `flock` binary on macOS) scoped to the repo's shared git-common-dir, so every worktree of a
+given repo contends on the same lock without over-serializing unrelated repos; a lock stuck behind
+a SIGKILLed holder times out loudly (`exit 2`) rather than silently proceeding. `tests/leak-guard.test.sh`
+gained a case racing a real (sed-slowed) invocation against a normal one at the same leaking ref,
+proven to reproduce the exact silent-false-clean failure against the pre-fix scanner before
+confirming both racing invocations correctly detect the leak post-fix.
+
 Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`
 resolved `org` to `''` with no validation (the `validateOrgName` import in `env.ts` was never
 called), `resolvePaths()` silently collapsed an empty org to the un-scoped `ctxRoot` instead of the

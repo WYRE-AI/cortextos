@@ -148,4 +148,60 @@ if ! (cd "$GT" && bash "$GUARD_ABS" --tree HEAD >/dev/null 2>&1); then
 fi
 git -C "$GT" checkout -q -- note.md   # restore clean before any later reuse of $GT
 
+# (g) Concurrency: two `--tree` invocations against the SAME checkout at the
+#     SAME leaking ref, racing the startup stale-worktree sweep against a
+#     still-active worktree. This is ordinary usage for this fleet (many
+#     agents can run leak-guard.sh --tree against a shared checkout at once
+#     — CLAUDE.md's 2026-08-22 shared-binary entry), and it is the exact
+#     scenario this whole file's --tree fix exists to make safe. Before the
+#     lock (CodeRabbit finding + murph's independent repro on #194,
+#     2026-09-17), the sweep force-removed ANY leak-guard-wt.* worktree with
+#     no liveness check, so a fast second invocation's sweep could delete a
+#     slower first invocation's ACTIVE worktree mid-scan; scan_file()'s
+#     `[ -f "$f" ] || return` then silently skipped the now-missing file
+#     instead of failing, so the victim finished and reported "clean"
+#     despite scanning a real leak — a silent false negative, the most
+#     dangerous shape for a security scanner.
+#
+# Build a "slowed" copy of the real shipped script (a sed-inserted sleep
+# right after it materializes its worktree, widening the race window so the
+# result is deterministic rather than timing-dependent — the underlying bug
+# needs no artificial delay to be real). Race it against an unmodified
+# invocation of the same script, both scanning the same leaking ref ($B_SHA)
+# against the same checkout ($GT).
+SLOW_GUARD="$TMP/slow-leak-guard.sh"
+sed 's#cd "\$wt"#cd "$wt"\n    sleep 3#' "$GUARD_ABS" > "$SLOW_GUARD"
+chmod +x "$SLOW_GUARD"
+git -C "$GT" checkout -q "$A_SHA"   # working tree back to clean before racing
+
+(cd "$GT" && bash "$SLOW_GUARD" --tree "$B_SHA" >"$TMP/race-proc1.log" 2>&1; echo "exit=$?" >>"$TMP/race-proc1.log") &
+RACE_P1=$!
+sleep 0.5
+(cd "$GT" && bash "$GUARD_ABS" --tree "$B_SHA" >"$TMP/race-proc2.log" 2>&1; echo "exit=$?" >>"$TMP/race-proc2.log") &
+RACE_P2=$!
+wait "$RACE_P1" "$RACE_P2"
+
+RACE_P1_EXIT=$(grep -oE 'exit=[0-9]+' "$TMP/race-proc1.log" | tail -1 | cut -d= -f2)
+RACE_P2_EXIT=$(grep -oE 'exit=[0-9]+' "$TMP/race-proc2.log" | tail -1 | cut -d= -f2)
+if [ "$RACE_P1_EXIT" != "1" ]; then
+  echo "FAIL: concurrent --tree invocation (the slowed/victim one) reported exit=$RACE_P1_EXIT scanning a real leak — expected exit=1 (a concurrent sweep silently deleted its worktree mid-scan)"
+  echo "--- proc1 log ---"; cat "$TMP/race-proc1.log"
+  fails=1
+fi
+if [ "$RACE_P2_EXIT" != "1" ]; then
+  echo "FAIL: concurrent --tree invocation (the fast one) reported exit=$RACE_P2_EXIT scanning a real leak — expected exit=1"
+  echo "--- proc2 log ---"; cat "$TMP/race-proc2.log"
+  fails=1
+fi
+# No worktree or lock leftovers once both sides have exited cleanly.
+if git -C "$GT" worktree list --porcelain 2>/dev/null | grep -q 'leak-guard-wt\.'; then
+  echo "FAIL: a leak-guard-wt.* worktree survived both racing invocations exiting"
+  fails=1
+fi
+if [ -e "$(git -C "$GT" rev-parse --git-common-dir 2>/dev/null)/leak-guard-wt.lock" ]; then
+  echo "FAIL: the worktree lock directory survived both racing invocations exiting"
+  fails=1
+fi
+git -C "$GT" checkout -q -- note.md 2>/dev/null   # restore clean before any later reuse of $GT
+
 if [ "$fails" -eq 0 ]; then echo "leak-guard.test: PASS"; else echo "leak-guard.test: FAIL"; exit 1; fi

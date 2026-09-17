@@ -160,22 +160,74 @@ if [ "${1:-}" = "--tree" ]; then
     # this never collides with a branch checked out elsewhere) and scan from
     # inside it instead — a fresh worktree checkout is never dirty.
     #
+    # The stale-worktree sweep below, and worktree creation/scanning/cleanup,
+    # all touch this repo's shared `git worktree` registry — which is a
+    # TOCTOU hazard the moment two `--tree` invocations run concurrently
+    # against the same checkout. That is ORDINARY usage here, not a
+    # contrived case: this fleet routinely runs several agents against a
+    # small number of shared checkouts (see CLAUDE.md's 2026-08-22
+    # shared-binary entry), and it is exactly the scenario this whole PR
+    # exists to make safe. Before the lock below, the sweep matched on
+    # directory name only (`leak-guard-wt.*`) with no notion of "in use", so
+    # a second invocation's sweep could force-remove a FIRST invocation's
+    # still-active worktree mid-scan; scan_file()'s `[ -f "$f" ] || return`
+    # then silently skips the now-missing file instead of failing, so the
+    # victim can finish and print "leak-guard: clean" without having
+    # scanned a real leak. Reproduced decisively (2026-09-17, CodeRabbit
+    # finding on #194 + murph's independent repro): a real planted leak
+    # came back exit=0 "clean" once a concurrent invocation's sweep deleted
+    # the scanning process's worktree out from under it mid-read.
+    #
+    # Fix: serialize the whole worktree lifecycle (stale sweep through
+    # final cleanup) behind a lock. `mkdir` is atomic and portable (no
+    # `flock` binary on macOS, and this fleet runs both macOS and Linux
+    # CI); the lock lives under this repo's shared git-common-dir so every
+    # worktree of THIS repo contends on the same lock — exactly the domain
+    # `git worktree` itself operates on — without over-serializing
+    # unrelated repos. A lock that's genuinely stuck (e.g. its holder was
+    # SIGKILLed before its own trap ran) times out loudly rather than
+    # silently proceeding: the bug this fixes is a silent false-clean, so
+    # on doubt this fails closed instead of risking a repeat.
+    #
     # The `trap ... EXIT` below covers every NORMAL exit path (both the
-    # success and the two explicit `exit 2`s), but not a hard SIGKILL mid-scan
-    # -- a killed run can leave both the temp dir and its
-    # `.git/worktrees/<name>` registration behind (`git worktree prune` alone
-    # would not catch this: the directory still physically exists, so it
-    # isn't "pruneable," just abandoned). The recognizable `leak-guard-wt.`
-    # prefix lets a later invocation find and remove exactly its own
-    # leftovers (never someone else's unrelated worktree) before adding a
-    # new one, rather than accumulating orphans across repeated local runs.
+    # success and the two explicit `exit 2`s), but not a hard SIGKILL
+    # mid-scan -- a killed run can leave the temp dir, its
+    # `.git/worktrees/<name>` registration, AND the lock dir behind
+    # (`git worktree prune` alone would not catch the worktree: the
+    # directory still physically exists, so it isn't "pruneable," just
+    # abandoned). The recognizable `leak-guard-wt.` prefix lets a later
+    # invocation find and remove exactly its own worktree leftovers (never
+    # someone else's unrelated worktree) before adding a new one, rather
+    # than accumulating orphans across repeated local runs -- and it is now
+    # safe to do so unconditionally, because holding the lock guarantees no
+    # OTHER invocation can be actively using any leak-guard-wt.* worktree
+    # of this repo at the same time.
+    common_dir=$(git rev-parse --git-common-dir 2>/dev/null)
+    lock_dir="$(cd "$common_dir" 2>/dev/null && pwd)/leak-guard-wt.lock"
+    lock_max_tries="${LEAK_GUARD_LOCK_MAX_TRIES:-150}"
+    lock_sleep="${LEAK_GUARD_LOCK_SLEEP:-0.2}"
+    lock_tries=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+      lock_tries=$((lock_tries + 1))
+      if [ "$lock_tries" -ge "$lock_max_tries" ]; then
+        echo "leak-guard: timed out waiting for worktree lock ($lock_dir) -- a stuck holder? failing rather than risking a race" >&2
+        exit 2
+      fi
+      sleep "$lock_sleep"
+    done
+    orig_dir=$(pwd)
+    cleanup_wt() {
+      cd "$orig_dir" 2>/dev/null
+      [ -n "${wt:-}" ] && git worktree remove --force "$wt" >/dev/null 2>&1
+      [ -n "${wt:-}" ] && rm -rf "$wt"
+      rmdir "$lock_dir" 2>/dev/null || true
+    }
+    trap cleanup_wt EXIT
+
     while IFS= read -r stale_path; do
       [ -n "$stale_path" ] && git worktree remove --force "$stale_path" >/dev/null 2>&1
     done < <(git worktree list --porcelain 2>/dev/null | awk -F' ' '/^worktree /{p=$2} p ~ /leak-guard-wt\./{print p; p=""}')
     wt=$(mktemp -d "${TMPDIR:-/tmp}/leak-guard-wt.XXXXXX")
-    orig_dir=$(pwd)
-    cleanup_wt() { cd "$orig_dir" 2>/dev/null; git worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$wt"; }
-    trap cleanup_wt EXIT
     if ! git worktree add --detach --quiet "$wt" "$ref_sha" >/dev/null 2>&1; then
       echo "leak-guard: cannot create worktree for ref '$ref' ($ref_sha)" >&2
       exit 2
