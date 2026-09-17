@@ -2,7 +2,27 @@
 
 ## [Unreleased]
 
-### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
+### Fixed — `leak-guard.sh --tree <ref>` read file content from the working directory, not from `<ref>` itself
+
+`git ls-tree -r --name-only "$ref"` correctly named the right files, but each was then scanned via
+a plain on-disk `grep`/`awk` against that path — always reading whatever the working directory
+happened to have checked out, regardless of `$ref`. Harmless in the normal CI invocation (a fresh
+checkout's working tree is always exactly at the commit under test), but silently wrong the moment
+`--tree` is run against a different ref than what's currently checked out — the common case for a
+human or agent doing local/manual verification against a shared checkout. Confirmed both failure
+directions are real, not just theoretical: a stale local `main` made `--tree origin/main` report a
+leak that had already been fixed on the real `origin/main` (false positive); the mirror image is
+worse for a security scanner — `--tree <a-commit-with-a-real-leak>` from a later, clean checkout
+wrongly reported clean (false negative).
+
+`--tree` now resolves `$ref` to a sha and compares it against `HEAD`: if they already match (the
+normal CI case), scanning proceeds unchanged with zero added overhead; if they differ, the ref is
+checked out into an isolated `git worktree --detach` (keyed on the resolved sha, never the ref name,
+so it can never collide with a branch checked out elsewhere) and scanned from inside that worktree,
+which is cleaned up via a trap on every exit path. `tests/leak-guard.test.sh` gained three new cases
+against a throwaway synthetic repo, proving both failure directions against the pre-fix scanner
+before confirming they pass against the fix — never relying on a specific commit existing in this
+repo's own history, which could be rewritten later.
 
 Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`
 resolved `org` to `''` with no validation (the `validateOrgName` import in `env.ts` was never

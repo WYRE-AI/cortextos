@@ -79,4 +79,56 @@ bash "$GUARD" "$TMP/prose.md" >/dev/null 2>&1 \
 bash "$GUARD" --tree HEAD >/dev/null 2>&1 \
   || { echo "FAIL: scanner flagged the CLEAN tree (false positive)"; fails=1; }
 
+# (f) `--tree <ref>` must read $ref's own content, not whatever the working
+#     directory happens to be checked out to right now (2026-09-17 real
+#     incident: a stale local `main` made `--tree origin/main` report a leak
+#     that had already been fixed on the real origin/main — a false
+#     positive; the mirror-image false NEGATIVE is worse and equally real,
+#     confirmed the same day against this repo's own history: `--tree
+#     89e706be0` from a later, clean checkout wrongly said "clean" on the
+#     pre-fix code, even though that exact commit has a real leak).
+#
+# Build a throwaway repo with two commits — A (clean) and B (planted leak,
+# generated at runtime, never committed to THIS repo) — so both directions
+# are provable without depending on any specific commit ever existing in
+# this repo's own history (which could be rewritten/squashed later).
+GUARD_ABS="$(cd "$(dirname "$GUARD")" && pwd)/$(basename "$GUARD")"
+GT="$TMP/git-tree-test"; mkdir -p "$GT"
+git -C "$GT" init -q
+git -C "$GT" config user.email test@test; git -C "$GT" config user.name test
+echo "clean content, nothing here" > "$GT/note.md"
+git -C "$GT" add -A; git -C "$GT" commit -q -m "A: clean"
+A_SHA=$(git -C "$GT" rev-parse HEAD)
+printf 'Checked at /Users/%s/cortextos/orgs/acme/agents/foxtrot/AGENTS.md\n' "$U" > "$GT/note.md"
+git -C "$GT" add -A; git -C "$GT" commit -q -m "B: planted leak"
+B_SHA=$(git -C "$GT" rev-parse HEAD)
+git -C "$GT" checkout -q "$A_SHA"   # working tree now sits on the CLEAN commit
+
+# (f-1) False-negative direction: checked out at clean A, ask about leaking
+#       B — MUST fail. Reading the working tree (A) instead of $ref (B)
+#       would wrongly report clean, the bug's most dangerous shape for a
+#       security scanner (a real leak reported as clean).
+if (cd "$GT" && bash "$GUARD_ABS" --tree "$B_SHA" >/dev/null 2>&1); then
+  echo "FAIL: --tree <leaking-ref> passed clean while checked out at a DIFFERENT, clean commit (false negative — the dangerous direction)"
+  fails=1
+fi
+
+# (f-2) Sanity baseline for f-1/f-3: checked out at clean A, ask about clean
+#       A itself via its sha (not "HEAD", so this exercises real ref
+#       resolution rather than reusing check (b) above) — MUST pass.
+if ! (cd "$GT" && bash "$GUARD_ABS" --tree "$A_SHA" >/dev/null 2>&1); then
+  echo "FAIL: --tree <clean-ref>, checked out at that same clean ref, reported a leak (should never happen)"
+  fails=1
+fi
+
+# (f-3) False-positive direction, the actual regression case: checked out at
+#       leaking B, ask about clean A — MUST pass. Reading the working tree
+#       (B) instead of $ref (A) would wrongly report a leak that isn't
+#       there — the direction that actually bit on 2026-09-17.
+git -C "$GT" checkout -q "$B_SHA"   # working tree now sits on the LEAKING commit
+if ! (cd "$GT" && bash "$GUARD_ABS" --tree "$A_SHA" >/dev/null 2>&1); then
+  echo "FAIL: --tree <clean-ref> flagged a leak while checked out at a DIFFERENT, leaking commit (false positive)"
+  fails=1
+fi
+
 if [ "$fails" -eq 0 ]; then echo "leak-guard.test: PASS"; else echo "leak-guard.test: FAIL"; exit 1; fi

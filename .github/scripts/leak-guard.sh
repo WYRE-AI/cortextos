@@ -119,7 +119,40 @@ scan_file() {
 
 if [ "${1:-}" = "--tree" ]; then
   ref="${2:-HEAD}"
-  while IFS= read -r f; do scan_file "$f"; done < <(git ls-tree -r --name-only "$ref")
+  # `git ls-tree` above (unchanged) always names the RIGHT files for $ref.
+  # scan_file(), unchanged, reads each one's CONTENT from a plain on-disk
+  # path — correct only when the working directory is already exactly at
+  # $ref. It is not, in general: a shared/local checkout can sit on any
+  # commit. Resolve both to shas and compare before trusting a raw read.
+  ref_sha=$(git rev-parse "$ref" 2>/dev/null) || {
+    echo "leak-guard: cannot resolve ref '$ref'" >&2
+    exit 2
+  }
+  head_sha=$(git rev-parse HEAD 2>/dev/null)
+  if [ "$ref_sha" = "$head_sha" ]; then
+    # Fast path: already exactly at $ref (the normal case in a fresh CI
+    # checkout) -- no worktree needed, the on-disk reads are already correct.
+    while IFS= read -r f; do scan_file "$f"; done < <(git ls-tree -r --name-only "$ref")
+  else
+    # $ref differs from what's checked out. Reading the working directory
+    # here would silently scan the WRONG content — confirmed 2026-09-17: a
+    # stale local `main` produced a false leak report for content that had
+    # already been fixed on the real origin/main, with no error either way.
+    # Materialize $ref into an isolated, detached worktree (a sha, not the
+    # ref name, so this never collides with a branch checked out elsewhere)
+    # and scan from inside it instead.
+    wt=$(mktemp -d)
+    orig_dir=$(pwd)
+    cleanup_wt() { cd "$orig_dir" 2>/dev/null; git worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$wt"; }
+    trap cleanup_wt EXIT
+    if ! git worktree add --detach --quiet "$wt" "$ref_sha" >/dev/null 2>&1; then
+      echo "leak-guard: cannot create worktree for ref '$ref' ($ref_sha)" >&2
+      exit 2
+    fi
+    cd "$wt"
+    while IFS= read -r f; do scan_file "$f"; done < <(git ls-tree -r --name-only "$ref_sha")
+    cd "$orig_dir"
+  fi
 else
   for f in "$@"; do scan_file "$f"; done
 fi
