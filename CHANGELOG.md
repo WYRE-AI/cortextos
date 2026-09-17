@@ -15,8 +15,9 @@ leak that had already been fixed on the real `origin/main` (false positive); the
 worse for a security scanner — `--tree <a-commit-with-a-real-leak>` from a later, clean checkout
 wrongly reported clean (false negative).
 
-`--tree` now resolves `$ref` to a sha and compares it against `HEAD`: if they already match (the
-normal CI case), scanning proceeds unchanged with zero added overhead; if they differ, the ref is
+`--tree` now resolves `$ref` to a sha and compares it against `HEAD`: if they already match AND no
+tracked file differs from `HEAD` (the normal CI case), scanning proceeds unchanged with zero added
+overhead; otherwise — the sha differs, or it matches but the tracked tree is dirty — the ref is
 checked out into an isolated `git worktree --detach` (keyed on the resolved sha, never the ref name,
 so it can never collide with a branch checked out elsewhere) and scanned from inside that worktree,
 which is cleaned up via a trap on every exit path. `tests/leak-guard.test.sh` gained three new cases

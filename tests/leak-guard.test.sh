@@ -198,7 +198,12 @@ if git -C "$GT" worktree list --porcelain 2>/dev/null | grep -q 'leak-guard-wt\.
   echo "FAIL: a leak-guard-wt.* worktree survived both racing invocations exiting"
   fails=1
 fi
-if [ -e "$(git -C "$GT" rev-parse --git-common-dir 2>/dev/null)/leak-guard-wt.lock" ]; then
+# git-common-dir prints a path relative to $GT (e.g. ".git"), not to this
+# script's own cwd (the repo root) — resolve it to an absolute path from
+# inside $GT before using it as a plain filesystem path, exactly like the
+# production script does (2026-09-17 CodeRabbit finding).
+GT_COMMON_DIR="$(cd "$GT" && cd "$(git rev-parse --git-common-dir 2>/dev/null)" && pwd)"
+if [ -e "$GT_COMMON_DIR/leak-guard-wt.lock" ]; then
   echo "FAIL: the worktree lock directory survived both racing invocations exiting"
   fails=1
 fi
