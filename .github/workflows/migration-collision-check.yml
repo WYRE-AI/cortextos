@@ -35,10 +35,12 @@ on:
         default: 'migrations'
       filename-pattern:
         description: >
-          POSIX extended regex matching migration filenames; capture group 1
-          must be the migration number. Default matches the 3-digit sequential
-          prefix (NNN_xxx.sql) — the conduit convention. Override for
-          timestamp-style migrations (e.g. '^([0-9]{14})_').
+          Regular expression (Python `re` module syntax — this is what the
+          check actually compiles it with, not POSIX ERE) matching migration
+          filenames; capture group 1 must be the migration number. Default
+          matches the 3-digit sequential prefix (NNN_xxx.sql) — the conduit
+          convention. Override for timestamp-style migrations (e.g.
+          '^([0-9]{14})_').
         type: string
         default: '^([0-9]{3})_'
 
@@ -173,8 +175,18 @@ jobs:
           for p in others:
               other_num = p['number']
               try:
+                  # --paginate alone concatenates each page's JSON array as a
+                  # SEPARATE top-level value (page1_array page2_array ...),
+                  # which is not valid JSON as one document — json.loads()
+                  # below would raise on any PR whose file list spans more
+                  # than one page (this endpoint pages at 30) and get treated
+                  # as "malformed", silently skipping exactly the PRs most
+                  # likely to contain a colliding migration. --slurp wraps
+                  # every page into ONE JSON array of page-arrays instead, so
+                  # multi-page output is always valid JSON; page contents are
+                  # flattened below (2026-09-17 CodeRabbit finding on #193).
                   files_raw = subprocess.check_output(
-                      ['gh', 'api', f'repos/{REPO}/pulls/{other_num}/files', '--paginate'],
+                      ['gh', 'api', f'repos/{REPO}/pulls/{other_num}/files', '--paginate', '--slurp'],
                       text=True,
                       stderr=subprocess.DEVNULL,
                   )
@@ -182,7 +194,7 @@ jobs:
                   print(f"::warning::Could not enumerate files for open PR #{other_num} (skipped)")
                   continue
               try:
-                  files_data = json.loads(files_raw)
+                  files_data = [item for page in json.loads(files_raw) for item in page]
               except json.JSONDecodeError:
                   print(f"::warning::Malformed file listing for open PR #{other_num} (skipped)")
                   continue
