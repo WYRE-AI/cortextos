@@ -128,7 +128,10 @@ if [ "${1:-}" = "--tree" ]; then
     echo "leak-guard: cannot resolve ref '$ref'" >&2
     exit 2
   }
-  head_sha=$(git rev-parse HEAD 2>/dev/null)
+  head_sha=$(git rev-parse HEAD 2>/dev/null) || {
+    echo "leak-guard: cannot resolve HEAD" >&2
+    exit 2
+  }
   if [ "$ref_sha" = "$head_sha" ]; then
     # Fast path: already exactly at $ref (the normal case in a fresh CI
     # checkout) -- no worktree needed, the on-disk reads are already correct.
@@ -141,7 +144,20 @@ if [ "${1:-}" = "--tree" ]; then
     # Materialize $ref into an isolated, detached worktree (a sha, not the
     # ref name, so this never collides with a branch checked out elsewhere)
     # and scan from inside it instead.
-    wt=$(mktemp -d)
+    #
+    # The `trap ... EXIT` below covers every NORMAL exit path (both the
+    # success and the two explicit `exit 2`s), but not a hard SIGKILL mid-scan
+    # -- a killed run can leave both the temp dir and its
+    # `.git/worktrees/<name>` registration behind (`git worktree prune` alone
+    # would not catch this: the directory still physically exists, so it
+    # isn't "pruneable," just abandoned). The recognizable `leak-guard-wt.`
+    # prefix lets a later invocation find and remove exactly its own
+    # leftovers (never someone else's unrelated worktree) before adding a
+    # new one, rather than accumulating orphans across repeated local runs.
+    while IFS= read -r stale_path; do
+      [ -n "$stale_path" ] && git worktree remove --force "$stale_path" >/dev/null 2>&1
+    done < <(git worktree list --porcelain 2>/dev/null | awk -F' ' '/^worktree /{p=$2} p ~ /leak-guard-wt\./{print p; p=""}')
+    wt=$(mktemp -d "${TMPDIR:-/tmp}/leak-guard-wt.XXXXXX")
     orig_dir=$(pwd)
     cleanup_wt() { cd "$orig_dir" 2>/dev/null; git worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$wt"; }
     trap cleanup_wt EXIT
