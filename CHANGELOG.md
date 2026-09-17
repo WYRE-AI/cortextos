@@ -2,7 +2,51 @@
 
 ## [Unreleased]
 
-### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
+### Fixed — `leak-guard.sh --tree <ref>` read file content from the working directory, not from `<ref>` itself
+
+`git ls-tree -r --name-only "$ref"` correctly named the right files, but each was then scanned via
+a plain on-disk `grep`/`awk` against that path — always reading whatever the working directory
+happened to have checked out, regardless of `$ref`. Harmless in the normal CI invocation (a fresh
+checkout's working tree is always exactly at the commit under test), but silently wrong the moment
+`--tree` is run against a different ref than what's currently checked out — the common case for a
+human or agent doing local/manual verification against a shared checkout. Confirmed both failure
+directions are real, not just theoretical: a stale local `main` made `--tree origin/main` report a
+leak that had already been fixed on the real `origin/main` (false positive); the mirror image is
+worse for a security scanner — `--tree <a-commit-with-a-real-leak>` from a later, clean checkout
+wrongly reported clean (false negative).
+
+`--tree` now resolves `$ref` to a sha and compares it against `HEAD`: if they already match AND no
+tracked file differs from `HEAD` (the normal CI case), scanning proceeds unchanged with zero added
+overhead; otherwise — the sha differs, or it matches but the tracked tree is dirty — the ref is
+checked out into an isolated `git worktree --detach` (keyed on the resolved sha, never the ref name,
+so it can never collide with a branch checked out elsewhere) and scanned from inside that worktree,
+which is cleaned up via a trap on every exit path. `tests/leak-guard.test.sh` gained three new cases
+against a throwaway synthetic repo, proving both failure directions against the pre-fix scanner
+before confirming they pass against the fix — never relying on a specific commit existing in this
+repo's own history, which could be rewritten later.
+
+**Two follow-up fixes from CodeRabbit re-review, both mutation-tested against their own pre-fix
+commits before merge.** (1) The same-sha fast path (`$ref_sha == $head_sha`, skip the worktree
+entirely) checked sha equality but not tree cleanliness — a dirty tracked file with an uncommitted
+planted leak was scanned and reported even though `--tree HEAD` was asked about HEAD's actual
+(clean) committed content, the same false-positive bug class as above just hiding behind the
+sha-equality check instead of in front of it. The fast path now additionally requires `git diff
+--quiet HEAD --`, falling through to the worktree path on any dirty tracked file. (2) The
+leftover-worktree sweep added alongside the fast-path fix (finds and removes any abandoned
+`leak-guard-wt.*` worktree from a previously SIGKILLed run) had no liveness check, so two
+concurrent `--tree` invocations against the same checkout — ordinary usage for a fleet running many
+agents against a small number of shared checkouts — could have one invocation's sweep force-remove
+a second invocation's still-active worktree mid-scan; `scan_file()`'s `[ -f "$f" ] || return` then
+silently skipped the now-missing files, so the victim finished and reported "clean" despite
+scanning a real leak. Reproduced decisively (a real planted leak came back exit 0 "clean" once a
+racing sweep deleted the scanning process's worktree out from under it). Fixed by serializing the
+whole worktree lifecycle (stale sweep through final cleanup) behind an `mkdir`-based lock (portable
+— no `flock` binary on macOS) scoped to the repo's shared git-common-dir, so every worktree of a
+given repo contends on the same lock without over-serializing unrelated repos; a lock stuck behind
+a SIGKILLed holder times out loudly (`exit 2`) rather than silently proceeding. `tests/leak-guard.test.sh`
+gained a case racing a real (sed-slowed) invocation against a normal one at the same leaking ref,
+proven to reproduce the exact silent-false-clean failure against the pre-fix scanner before
+confirming both racing invocations correctly detect the leak post-fix.
 
 Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`
 resolved `org` to `''` with no validation (the `validateOrgName` import in `env.ts` was never
