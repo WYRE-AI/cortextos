@@ -241,6 +241,130 @@ if ! printf '%s\n' "$out" | grep -q "collides in open PR #995"; then
 fi
 export MIGRATIONS_PATH=migrations
 
+# ---- Rename-awareness (2026-09-17 CodeRabbit finding on #193, third round):
+# the old base_files/pr_files PATH-set diff treated a pure rename (same
+# migration number, cosmetic filename change) as a brand-new migration,
+# which then "collided" with the very file it was renamed FROM -- still
+# present on the (unaffected) base branch. Fixed via git's own rename
+# detection (`-M`), registering a rename as a new candidate ONLY when its
+# extracted number actually changed. Mirrored on the cross-PR (Check 2)
+# side, which previously skipped every `status: renamed` record outright --
+# the opposite gap: another open PR could introduce a colliding number
+# purely by renaming an existing migration and it would never be seen.
+
+# Add a second base migration so a rename-to-a-colliding-number case (g) has
+# a real, different base migration to collide with.
+git checkout -q main
+echo "-- second base migration" > migrations/002_second.sql
+git add -A; git commit -q -m "add second base migration"
+git push -q origin main
+
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "pr list "*)
+    echo '[]'
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+export PR_NUMBER=1
+
+# ---- Case (f): pure same-number rename must NOT false-positive against the
+#      base branch (the false positive CodeRabbit found) ----
+git checkout -q main
+git checkout -q -b rename-same-number
+git mv migrations/001_init.sql migrations/001_init_renamed.sql
+git commit -q -m "rename 001's file, same number"
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "FAIL: a pure same-number rename false-positived as a base-branch collision"
+  echo "$out"
+  fails=1
+fi
+
+# ---- Case (g): control — a rename that CHANGES the number to one that
+#      collides with a DIFFERENT base migration must still be caught. Proves
+#      a rename is genuinely evaluated as a new candidate, not unconditionally
+#      ignored (a detector that always says "clean" would pass case (f) too). ----
+git checkout -q main
+git checkout -q -b rename-changes-number-collides
+git mv migrations/001_init.sql migrations/002_renamed_to_colliding_number.sql
+git commit -q -m "rename 001 -> 002 (collides with base's real 002)"
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "FAIL: renaming a migration to a number that collides with a DIFFERENT base migration was not caught"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "Migration number 002"; then
+  echo "FAIL: the rename-induced collision was not attributed to number 002"
+  echo "$out"
+  fails=1
+fi
+
+# ---- Case (h): a cross-PR rename introducing a colliding number must be
+#      caught — the false-negative mirror of (f): another open PR renaming
+#      an unrelated migration onto OUR PR's new number must not go unseen ----
+git checkout -q pr-head
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "pr list "*)
+    echo '[{"number": 994, "isDraft": false}]'
+    ;;
+  "api repos/fake/repo/pulls/994/files --paginate --slurp")
+    python3 -c 'import json; print(json.dumps([[{"status": "renamed", "previous_filename": "migrations/500_unrelated.sql", "filename": "migrations/030_stolen_via_rename.sql"}]]))'
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "FAIL: another open PR renaming an unrelated migration onto our new number (030) was not caught (status=renamed skipped entirely)"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "collides in open PR #994"; then
+  echo "FAIL: the rename-introduced cross-PR collision was not attributed to PR #994"
+  echo "$out"
+  fails=1
+fi
+
+# ---- Case (i): control — a cross-PR SAME-number rename must NOT
+#      false-positive (proves the fix doesn't overshoot into flagging every
+#      renamed record, only ones that actually change the number) ----
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "pr list "*)
+    echo '[{"number": 993, "isDraft": false}]'
+    ;;
+  "api repos/fake/repo/pulls/993/files --paginate --slurp")
+    python3 -c 'import json; print(json.dumps([[{"status": "renamed", "previous_filename": "migrations/030_old_desc.sql", "filename": "migrations/030_new_desc.sql"}]]))'
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "FAIL: another open PR's cosmetic same-number (030) rename false-positived against our own new 030"
+  echo "$out"
+  fails=1
+fi
+
 cd - >/dev/null
 
 if [ "$fails" -eq 0 ]; then echo "migration-collision-check.test: PASS"; else echo "migration-collision-check.test: FAIL"; exit 1; fi

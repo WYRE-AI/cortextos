@@ -123,21 +123,72 @@ jobs:
           )
 
           base_files = set(ls_ref_migrations(f'origin/{BASE_REF}'))
-          pr_files = set(ls_ref_migrations('HEAD'))
 
-          # New = paths in PR HEAD but not on base.
-          new_files = pr_files - base_files
+          # Map number -> base file.
+          base_by_num = {}
+          for f in base_files:
+              n = extract_number(f)
+              if n is not None:
+                  base_by_num[n] = f
 
-          if not new_files:
+
+          def diff_migration_changes(base_ref, head_ref):
+              """Rename-aware diff of MIGRATIONS_PATH between base_ref and
+              head_ref. Returns (added_paths, renamed_pairs); renamed_pairs is
+              a list of (old_path, new_path) for git-detected renames whose
+              new path matches filename-pattern.
+
+              A plain path-set diff (pr_files - base_files) treats a
+              same-number rename -- e.g. renumbering nothing, just fixing a
+              typo in a migration's descriptive suffix -- as introducing a
+              brand-new migration. That "new" file then collides with the
+              base-branch file it was renamed FROM (same number, still
+              present on base, since only this PR's tree changed), a false
+              positive that would block an unrelated, harmless rename
+              (2026-09-17 CodeRabbit finding on #193). Using git's own rename
+              detection (`-M`) and only treating a rename as a NEW candidate
+              when its extracted number actually changed avoids that, while
+              still catching a rename that changes which number a file
+              claims.
+              """
+              try:
+                  out = subprocess.check_output(
+                      ['git', 'diff', '--name-status', '-M',
+                       f'{base_ref}...{head_ref}', '--', MIGRATIONS_PATH],
+                      text=True, stderr=subprocess.DEVNULL,
+                  )
+              except subprocess.CalledProcessError:
+                  return [], []
+              added, renamed = [], []
+              for line in out.splitlines():
+                  if not line:
+                      continue
+                  parts = line.split('\t')
+                  status = parts[0]
+                  if status == 'A' and len(parts) == 2 and basename_matches(parts[1]):
+                      added.append(parts[1])
+                  elif status.startswith('R') and len(parts) == 3 and basename_matches(parts[2]):
+                      renamed.append((parts[1], parts[2]))
+              return added, renamed
+
+
+          added_paths, renamed_pairs = diff_migration_changes(f'origin/{BASE_REF}', 'HEAD')
+
+          if not added_paths and not renamed_pairs:
               print(f"No new migrations in {MIGRATIONS_PATH}/ introduced by this PR. Nothing to check.")
               sys.exit(0)
 
-          # Map number -> our new file. Catch internal duplicates first.
+          # Map number -> our new file. Catch internal duplicates first. A
+          # rename only counts as a new candidate when its number actually
+          # changed -- a same-number rename is the same migration, not a new
+          # one, and must not register as new-vs-base (see
+          # diff_migration_changes above).
           pr_new_by_num = {}
-          for f in sorted(new_files):
+
+          def add_candidate(f):
               n = extract_number(f)
               if n is None:
-                  continue
+                  return
               if n in pr_new_by_num:
                   print(
                       f"::error file={f}::Migration number {n} appears twice in this PR's "
@@ -146,16 +197,15 @@ jobs:
                   sys.exit(1)
               pr_new_by_num[n] = f
 
+          for f in sorted(added_paths):
+              add_candidate(f)
+          for old_path, new_path in sorted(renamed_pairs):
+              if extract_number(new_path) != extract_number(old_path):
+                  add_candidate(new_path)
+
           if not pr_new_by_num:
               print(f"No new migrations matched filename-pattern. Nothing to check.")
               sys.exit(0)
-
-          # Map number -> base file.
-          base_by_num = {}
-          for f in base_files:
-              n = extract_number(f)
-              if n is not None:
-                  base_by_num[n] = f
 
           collisions = []  # list of (number, our_file, where_str)
 
@@ -227,15 +277,32 @@ jobs:
                         f"failing rather than silently skipping a collision check")
                   sys.exit(1)
               for fdata in files_data:
-                  if fdata.get('status') != 'added':
-                      continue
+                  status = fdata.get('status')
                   path = fdata.get('filename', '')
+                  if status == 'added':
+                      old_num = None
+                  elif status == 'renamed':
+                      # The GitHub API reports a rename with status="renamed",
+                      # not "added" -- the old added-only filter skipped these
+                      # entirely, so another open PR could introduce a
+                      # colliding number purely by renaming an existing
+                      # migration (2026-09-17 CodeRabbit finding on #193, the
+                      # false-negative mirror of the base-branch case above).
+                      prev_path = fdata.get('previous_filename', '')
+                      old_num = extract_number(prev_path) if basename_matches(prev_path) else None
+                  else:
+                      continue
                   if not path.startswith(MIGRATIONS_PATH + '/'):
                       continue
                   if not basename_matches(path):
                       continue
                   on = extract_number(path)
-                  if on and on in pr_new_by_num:
+                  if on is None or on == old_num:
+                      # A same-number rename in the OTHER pr is that PR's own
+                      # existing migration, not a new number it is
+                      # introducing -- symmetric with the base-branch fix.
+                      continue
+                  if on in pr_new_by_num:
                       collisions.append(
                           (on, pr_new_by_num[on], f"in open PR #{other_num} as {path}")
                       )
