@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Fixed — `migration-collision-check.yml`'s cross-PR scan had no base-branch filter and a hardcoded 300-PR cap
+
+Check 2 (the cross-PR migration-number collision scan) called `gh pr list --repo REPO --state open
+--limit 300 --json number,isDraft` with two real gaps (both CodeRabbit findings on #193's follow-up
+review): (1) no base-branch filter, so a PR targeting an unrelated, long-lived branch that can never
+actually land alongside the PR under test was still scanned as a collision candidate — a false
+positive risk; (2) a hardcoded `--limit 300` silently excluded any PR beyond the cap with no error or
+warning, so a repo with more than 300 simultaneously open PRs would go quietly blind to collisions
+among them.
+
+Replaced `gh pr list` with a direct call to the REST list-PRs endpoint (`gh api repos/<repo>/pulls
+--paginate --slurp -f state=open -f base=<base-ref> -f per_page=100`): `base=` filters server-side
+(closing gap 1), and `--paginate` walks every page with no artificial cap (closing gap 2). `--slurp`
+is required for the same reason it already was on the per-PR file listing — `--paginate` alone
+concatenates each page's JSON array as a separate top-level value rather than one valid document.
+
+`tests/migration-collision-check.test.sh` gained a new case proving a collision visible only on page
+2 of the PR listing is still caught (the pagination-cap regression case), and every existing case's
+fake-`gh` matcher now requires the exact `-f base=<ref>` argument to be present — verified this
+genuinely discriminates: reverted to the pre-fix `gh pr list` call and confirmed every single test
+case fails with an `unexpected fake gh invocation` diagnostic; separately reverted just the `-f
+base=` flag alone (keeping pagination) and confirmed that alone is also caught. Full suite passes
+against the fix.
+
 ### Fixed — `leak-guard.sh --tree <ref>` read file content from the working directory, not from `<ref>` itself
 
 `git ls-tree -r --name-only "$ref"` correctly named the right files, but each was then scanned via

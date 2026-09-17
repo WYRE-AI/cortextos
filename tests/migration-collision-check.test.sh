@@ -45,7 +45,7 @@ fi
 sed -n "$((START+1)),$((END-1))p" "$WORKFLOW" | sed 's/^          //' > "$TMP/collision_check.py"
 
 # ---- Fake `gh` on PATH ----
-# gh pr list -> one other open, non-draft PR (#999).
+# gh api repos/.../pulls (paginated, base+state filtered) -> one other open, non-draft PR (#999).
 # gh api .../pulls/999/files --paginate --slurp -> a REAL 2-page slurped
 # shape ([[page1 items],[page2 items]]), page 1 all non-colliding filler,
 # page 2 holding the ONE file that collides with our PR's new migration
@@ -55,8 +55,8 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "pr list "*)
-    echo '[{"number": 999, "isDraft": false}]'
+  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+    echo '[[{"number": 999, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/999/files --paginate --slurp")
     python3 - <<'PYGEN'
@@ -146,8 +146,8 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "pr list "*)
-    echo '[{"number": 997, "isDraft": false}]'
+  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+    echo '[[{"number": 997, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/997/files --paginate --slurp")
     exit 1
@@ -180,8 +180,8 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "pr list "*)
-    echo '[{"number": 996, "isDraft": false}]'
+  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+    echo '[[{"number": 996, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/996/files --paginate --slurp")
     exit 1
@@ -213,8 +213,8 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "pr list "*)
-    echo '[{"number": 995, "isDraft": false}]'
+  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+    echo '[[{"number": 995, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/995/files --paginate --slurp")
     python3 -c 'import json; print(json.dumps([[{"status": "added", "filename": "migrations/030_colliding.sql"}]]))'
@@ -262,8 +262,8 @@ git push -q origin main
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "pr list "*)
-    echo '[]'
+  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+    echo '[[]]'
     ;;
   *)
     echo "unexpected fake gh invocation: $*" >&2
@@ -314,8 +314,8 @@ git checkout -q pr-head
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "pr list "*)
-    echo '[{"number": 994, "isDraft": false}]'
+  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+    echo '[[{"number": 994, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/994/files --paginate --slurp")
     python3 -c 'import json; print(json.dumps([[{"status": "renamed", "previous_filename": "migrations/500_unrelated.sql", "filename": "migrations/030_stolen_via_rename.sql"}]]))'
@@ -345,8 +345,8 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "pr list "*)
-    echo '[{"number": 993, "isDraft": false}]'
+  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+    echo '[[{"number": 993, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/993/files --paginate --slurp")
     python3 -c 'import json; print(json.dumps([[{"status": "renamed", "previous_filename": "migrations/030_old_desc.sql", "filename": "migrations/030_new_desc.sql"}]]))'
@@ -361,6 +361,47 @@ chmod +x "$TMP/bin/gh"
 out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "FAIL: another open PR's cosmetic same-number (030) rename false-positived against our own new 030"
+  echo "$out"
+  fails=1
+fi
+
+# ---- Case (j): the colliding PR is visible only on PAGE 2 of the top-level
+#      PR listing -- proves --paginate genuinely walks every page rather
+#      than relying on a single bounded call (the old `--limit 300` cap
+#      this fix removes; 2026-09-17 CodeRabbit finding on #193 follow-up).
+#      Page 1 holds two filler, non-colliding PRs; the real colliding PR
+#      (#992) exists ONLY on page 2. This tests the STRUCTURE (a multi-page
+#      --slurp response must be flattened, not just page 1 read) rather than
+#      literally reproducing a >300-PR repo -- the same page-boundary shape
+#      as the per-PR file-listing pagination test above. A regression back
+#      to a capped/single-page call would never see page 2 at all.
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+    python3 -c 'import json; print(json.dumps([[{"number": 990, "draft": False}, {"number": 991, "draft": False}], [{"number": 992, "draft": False}]]))'
+    ;;
+  "api repos/fake/repo/pulls/990/files --paginate --slurp"|"api repos/fake/repo/pulls/991/files --paginate --slurp")
+    echo '[[]]'
+    ;;
+  "api repos/fake/repo/pulls/992/files --paginate --slurp")
+    python3 -c 'import json; print(json.dumps([[{"status": "added", "filename": "migrations/030_colliding.sql"}]]))'
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "FAIL: a colliding PR (#992) visible only on page 2 of the PR listing was not detected -- pagination cap regressed"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "collides in open PR #992"; then
+  echo "FAIL: the page-2-only collision was not attributed to PR #992"
   echo "$out"
   fails=1
 fi
