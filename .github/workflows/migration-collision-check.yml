@@ -214,15 +214,36 @@ jobs:
               if n in base_by_num:
                   collisions.append((n, f, f"on {BASE_REF} as {base_by_num[n]}"))
 
-          # Check 2: collide with another open (non-draft) PR.
+          # Check 2: collide with another open (non-draft) PR targeting the
+          # SAME base branch. Two gaps here, both from `gh pr list --limit
+          # 300 --json number,isDraft` (2026-09-17 CodeRabbit findings, #193
+          # follow-up):
+          #   (1) No base-branch filter — a PR targeting an unrelated,
+          #       long-lived branch (e.g. a feature branch that will never
+          #       land alongside this one) got scanned as a collision
+          #       candidate anyway. Two PRs that can never actually merge
+          #       together cannot actually collide.
+          #   (2) A hardcoded `--limit 300` silently excludes any PR beyond
+          #       the cap with no error or warning — a repo with >300
+          #       simultaneously open PRs would have this check go quietly
+          #       blind for the PRs past #300.
+          # Fixed by calling the REST list-PRs endpoint directly instead of
+          # `gh pr list`: `base=` filters server-side (gap 1), and
+          # `--paginate` walks every page with no artificial cap (gap 2).
+          # `--slurp` is required for the same reason it already is on the
+          # per-PR file listing below — `--paginate` alone concatenates each
+          # page's JSON array as a separate top-level value, not one valid
+          # document; `--slurp` wraps every page into one array of
+          # page-arrays instead, flattened just below.
           prs_raw = subprocess.check_output(
-              ['gh', 'pr', 'list', '--repo', REPO, '--state', 'open',
-               '--limit', '300', '--json', 'number,isDraft'],
+              ['gh', 'api', f'repos/{REPO}/pulls', '--paginate', '--slurp',
+               '-f', 'state=open', '-f', f'base={BASE_REF}',
+               '-f', 'per_page=100'],
               text=True,
           )
           others = [
-              p for p in json.loads(prs_raw)
-              if not p['isDraft'] and p['number'] != PR_NUMBER
+              p for page in json.loads(prs_raw) for p in page
+              if not p['draft'] and p['number'] != PR_NUMBER
           ]
 
 
