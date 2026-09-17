@@ -61,7 +61,13 @@ function createDatabase(): Database.Database {
 }
 
 function initializeSchema(db: Database.Database): void {
-  db.exec(`
+  // Wrapped in a transaction so a SQLITE_BUSY partway through (e.g. after
+  // `tasks` lands but before a later table/index does) rolls back the whole
+  // batch instead of leaving a partially-applied schema. This is what makes
+  // createDatabase()'s recovery check safe: table_info('tasks') existing now
+  // implies the ENTIRE schema committed, not just that one table.
+  const createSchema = db.transaction(() => {
+    db.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -188,6 +194,8 @@ function initializeSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_org ON messages(org);
     CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
   `);
+  });
+  createSchema();
 }
 
 // globalThis singleton survives Next.js hot reload
