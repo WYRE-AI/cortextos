@@ -204,6 +204,12 @@ if [ "${1:-}" = "--tree" ]; then
     # of this repo at the same time.
     common_dir=$(git rev-parse --git-common-dir 2>/dev/null)
     lock_dir="$(cd "$common_dir" 2>/dev/null && pwd)/leak-guard-wt.lock"
+    # Defaults bound the wait to "tens of seconds", not a precise figure:
+    # 150*0.2s isn't a reliable ~30s estimate -- measured on macOS, `sleep
+    # 0.2` itself actually sleeps ~0.35s (timer-coalescing/granularity, not
+    # this loop's overhead), so the real wall-clock wait here measured ~53s
+    # (murph, 2026-09-17). Correctness doesn't depend on the exact figure --
+    # it only has to be bounded and loud, which it is on every platform.
     lock_max_tries="${LEAK_GUARD_LOCK_MAX_TRIES:-150}"
     lock_sleep="${LEAK_GUARD_LOCK_SLEEP:-0.2}"
     lock_tries=0
