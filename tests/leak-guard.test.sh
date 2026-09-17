@@ -131,4 +131,21 @@ if ! (cd "$GT" && bash "$GUARD_ABS" --tree "$A_SHA" >/dev/null 2>&1); then
   fails=1
 fi
 
+# (f-4) Same-sha fast path with a DIRTY tracked file — same sha is necessary
+#       but not sufficient for trusting the on-disk read (murph's catch on
+#       #194's own CodeRabbit re-review, reproduced directly before fixing):
+#       checked out at clean A, then dirty an already-tracked file with a
+#       planted leak WITHOUT committing — `--tree HEAD` (ref resolves to the
+#       same sha that's checked out) must still report CLEAN, because HEAD
+#       itself is clean; scanning the dirty on-disk content instead would be
+#       the exact same bug class as f-1/f-3, just hiding behind the
+#       sha-equality check instead of in front of it.
+git -C "$GT" checkout -q "$A_SHA"
+printf 'Checked at /Users/%s/cortextos/orgs/acme/agents/foxtrot/AGENTS.md\n' "$U" > "$GT/note.md"   # dirty, uncommitted
+if ! (cd "$GT" && bash "$GUARD_ABS" --tree HEAD >/dev/null 2>&1); then
+  echo "FAIL: --tree HEAD scanned a DIRTY tracked file instead of HEAD's actual (clean) committed content"
+  fails=1
+fi
+git -C "$GT" checkout -q -- note.md   # restore clean before any later reuse of $GT
+
 if [ "$fails" -eq 0 ]; then echo "leak-guard.test: PASS"; else echo "leak-guard.test: FAIL"; exit 1; fi

@@ -132,18 +132,33 @@ if [ "${1:-}" = "--tree" ]; then
     echo "leak-guard: cannot resolve HEAD" >&2
     exit 2
   }
-  if [ "$ref_sha" = "$head_sha" ]; then
-    # Fast path: already exactly at $ref (the normal case in a fresh CI
-    # checkout) -- no worktree needed, the on-disk reads are already correct.
+  # Same sha is necessary but NOT sufficient for the fast path: `git diff
+  # --quiet HEAD --` also has to be clean, or a dirty tracked file makes the
+  # fast path scan on-disk content that doesn't match what's actually
+  # committed at $ref_sha — the exact bug class the ref-differs branch below
+  # exists to fix, just hiding behind the sha-equality check instead of in
+  # front of it (murph's catch on #194's own CodeRabbit re-review,
+  # 2026-09-17, reproduced directly: a dirty tracked file with a planted
+  # leak was scanned and reported even though `--tree HEAD` was asked about
+  # the CLEAN committed content). Untracked files are correctly irrelevant
+  # here — `git ls-tree` never names them, so scan_file is never asked to
+  # read one in --tree mode.
+  if [ "$ref_sha" = "$head_sha" ] && git diff --quiet HEAD -- 2>/dev/null; then
+    # Fast path: already exactly at $ref AND the tree is clean (the normal
+    # case in a fresh CI checkout) -- no worktree needed, the on-disk reads
+    # are already correct.
     while IFS= read -r f; do scan_file "$f"; done < <(git ls-tree -r --name-only "$ref")
   else
-    # $ref differs from what's checked out. Reading the working directory
-    # here would silently scan the WRONG content — confirmed 2026-09-17: a
-    # stale local `main` produced a false leak report for content that had
-    # already been fixed on the real origin/main, with no error either way.
-    # Materialize $ref into an isolated, detached worktree (a sha, not the
-    # ref name, so this never collides with a branch checked out elsewhere)
-    # and scan from inside it instead.
+    # $ref differs from what's checked out, OR it matches but the working
+    # tree is dirty. Either way, reading the working directory here would
+    # risk silently scanning the WRONG content — confirmed 2026-09-17 (two
+    # separate incidents, same underlying bug class): a stale local `main`
+    # made `--tree origin/main` report a leak already fixed on the real
+    # origin/main; a dirty tracked file made `--tree HEAD` report on
+    # uncommitted content instead of what HEAD actually names. Materialize
+    # $ref into an isolated, detached worktree (a sha, not the ref name, so
+    # this never collides with a branch checked out elsewhere) and scan from
+    # inside it instead — a fresh worktree checkout is never dirty.
     #
     # The `trap ... EXIT` below covers every NORMAL exit path (both the
     # success and the two explicit `exit 2`s), but not a hard SIGKILL mid-scan
