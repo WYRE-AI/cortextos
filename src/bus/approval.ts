@@ -85,12 +85,14 @@ function postApprovalToActivityChannel(
   return postActivity(orgDir, paths.ctxRoot, org, message, buildApprovalKeyboard(approvalId))
     .then((posted) => {
       if (!posted) {
-        // postActivity returns false when activity-channel.env is missing
-        // or cannot be parsed. Surface this visibly — the silent-false
-        // pattern is what hid tonight's path-resolution bug for hours.
+        // postActivity returns false when activity-channel.env / secrets.env
+        // is missing or cannot be parsed. Surface this visibly — the
+        // silent-false pattern is what hid tonight's path-resolution bug
+        // for hours.
         console.warn(
           `[approval] Activity-channel post failed for ${approvalId} — ` +
-          `check ${orgDir}/activity-channel.env (must define ACTIVITY_BOT_TOKEN + ACTIVITY_CHAT_ID).`,
+          `check ${orgDir}/activity-channel.env (must define ACTIVITY_SLACK_CHANNEL_ID) ` +
+          `and ${orgDir}/secrets.env (must define SLACK_BOT_TOKEN).`,
         );
       }
     })
