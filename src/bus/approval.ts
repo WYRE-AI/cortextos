@@ -5,6 +5,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { parseEnvFile } from '../utils/env.js';
 import { randomString } from '../utils/random.js';
 import { validateApprovalCategory } from '../utils/validate.js';
+import { resolveOrchestratorTarget } from '../utils/orchestrator.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { sendMessage } from './message.js';
 import { postActivity } from './system.js';
@@ -26,8 +27,10 @@ function buildApprovalKeyboard(approvalId: string): object {
 
 /**
  * Post a newly-created approval to the org's activity channel with
- * Approve/Deny inline buttons. Returns a promise that resolves once the
- * post attempt has settled.
+ * Approve/Deny inline buttons. Returns a promise that resolves to whether
+ * the post actually sent — the caller uses this to decide whether ANY
+ * notification path succeeded (see the loud-warning check in
+ * createApproval below).
  *
  * Path resolution: activity-channel.env lives under the FRAMEWORK root
  * (frameworkRoot/orgs/<org>/activity-channel.env), NOT the runtime state
@@ -60,14 +63,14 @@ function postApprovalToActivityChannel(
   agentName: string,
   context: string | undefined,
   frameworkRoot: string | undefined,
-): Promise<void> {
+): Promise<boolean> {
   const root = frameworkRoot ?? process.env.CTX_FRAMEWORK_ROOT;
   if (!root) {
     console.warn(
       `[approval] No frameworkRoot available for ${approvalId} — skipping activity-channel post. ` +
       `Set CTX_FRAMEWORK_ROOT env var or pass frameworkRoot explicitly.`,
     );
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
 
   const orgDir = join(root, 'orgs', org);
@@ -95,8 +98,9 @@ function postApprovalToActivityChannel(
           `and ${orgDir}/secrets.env (must define SLACK_BOT_TOKEN).`,
         );
       }
+      return posted;
     })
-    .catch(() => undefined); // Thrown rejections still suppressed — activity-channel unreachable must not fail approval creation.
+    .catch(() => false); // Thrown rejections still suppressed — activity-channel unreachable must not fail approval creation.
 }
 
 /**
@@ -114,6 +118,11 @@ function postApprovalToActivityChannel(
  *
  * Errors from the network round-trip are suppressed: a Telegram outage
  * must not block approval creation.
+ *
+ * Returns whether the ping actually sent — every skip path (no agentDir,
+ * no .env, missing keys, thrown/rejected send) resolves to false, INCLUDING
+ * the benign bot-less-agent case. The caller cares whether a human was
+ * actually notified via this channel, not why it didn't fire.
  */
 function pingAgentChatId(
   agentDir: string | undefined,
@@ -122,16 +131,16 @@ function pingAgentChatId(
   category: ApprovalCategory,
   agentName: string,
   context: string | undefined,
-): Promise<void> {
+): Promise<boolean> {
   if (!agentDir) {
     console.warn(
       `[approval] No agentDir available for ${approvalId} — skipping agent-bot Telegram ping.`,
     );
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
   const envPath = join(agentDir, '.env');
   if (!existsSync(envPath)) {
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
   const env = parseEnvFile(envPath);
   const botToken = env.BOT_TOKEN;
@@ -140,7 +149,7 @@ function pingAgentChatId(
     console.warn(
       `[approval] BOT_TOKEN or CHAT_ID missing in ${envPath} — skipping agent-bot Telegram ping for ${approvalId}.`,
     );
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
 
   const lines = [
@@ -157,8 +166,48 @@ function pingAgentChatId(
 
   const api = new TelegramAPI(botToken);
   return api.sendMessage(chatId, message, undefined, { parseMode: null })
-    .then(() => undefined)
-    .catch(() => undefined); // Telegram outage must not fail approval creation.
+    .then(() => true)
+    .catch(() => false); // Telegram outage must not fail approval creation.
+}
+
+/**
+ * Best-effort: message the org orchestrator whenever a new approval is
+ * created, regardless of whether the activity-channel post or the
+ * requesting agent's own Telegram ping succeeded. Those two are the
+ * human-facing push channels and both can be unconfigured or unreachable;
+ * the orchestrator's bus inbox (and the dashboard, which reads the same
+ * approval files) is the one path that does not depend on either.
+ *
+ * Shares resolveOrchestratorTarget() with hook-loop-detector.ts's
+ * notifyOrchestrator (same no-op predicate: CTX_ORCHESTRATOR_AGENT unset,
+ * or equal to agentName) but calls sendMessage directly rather than
+ * shelling out — this module already has direct bus access, unlike a hook
+ * process.
+ *
+ * sendMessage validates `to`/`from`/`priority` and writes to disk
+ * synchronously, so it can throw (e.g. a malformed CTX_ORCHESTRATOR_AGENT).
+ * Caught here per this file's own convention: a notification path failing
+ * must never fail approval creation.
+ */
+function notifyOrchestratorOfApproval(
+  paths: BusPaths,
+  agentName: string,
+  approvalId: string,
+  title: string,
+): void {
+  const orchestrator = resolveOrchestratorTarget(agentName);
+  if (!orchestrator) return;
+  try {
+    sendMessage(
+      paths,
+      'system',
+      orchestrator,
+      'high',
+      `New approval from ${agentName}: ${title}\napproval_id: ${approvalId}`,
+    );
+  } catch (err) {
+    console.warn(`[approval] Failed to notify orchestrator (${orchestrator}) of ${approvalId}: ${err}`);
+  }
 }
 
 /**
@@ -213,20 +262,38 @@ export async function createApproval(
   ensureDir(pendingDir);
   atomicWriteSync(join(pendingDir, `${approvalId}.json`), JSON.stringify(approval));
 
-  // Fan-out to the activity channel so the operator can approve/deny from
-  // Telegram without opening the dashboard. AWAITED so short-lived CLI callers do
-  // not exit before the Telegram post fetch completes. Errors are
-  // suppressed inside postApprovalToActivityChannel — activity-channel
-  // unreachable must not block approval creation. Callbacks route back
-  // via the orchestrator's activity-channel poller (see
-  // daemon/agent-manager.ts).
-  await postApprovalToActivityChannel(paths, org, approvalId, title, category, agentName, context, frameworkRoot);
+  // Always notify the orchestrator, independent of whether either
+  // human-facing push channel below succeeds — see helper doc. Fired
+  // immediately (it's synchronous and shares no data dependency with the
+  // two Telegram pushes) so dashboard/bus visibility never waits on them.
+  notifyOrchestratorOfApproval(paths, agentName, approvalId, title);
 
-  // Best-effort ping to the requesting agent's own Telegram bot (the
-  // operator's 1:1 conversation with the agent). Closes the gap where
-  // operators not in the activity channel would miss approvals entirely
-  // (the 50h+ Repo-B-style stall). Errors suppressed — see helper.
-  await pingAgentChatId(agentDir, approvalId, title, category, agentName, context);
+  // Fan out to the two best-effort Telegram channels in parallel — the
+  // activity channel (so the operator can approve/deny without opening the
+  // dashboard) and the requesting agent's own bot (closes the gap where
+  // operators not in the activity channel would miss approvals entirely,
+  // the 50h+ Repo-B-style stall). Neither depends on the other's outcome.
+  // Both helpers swallow their own errors and resolve to a boolean rather
+  // than rejecting, so Promise.all is safe here. AWAITED so short-lived CLI
+  // callers do not exit before the Telegram fetches complete. Callbacks
+  // route back via the orchestrator's activity-channel poller (see
+  // daemon/agent-manager.ts).
+  const [postedToActivityChannel, pingedAgentChat] = await Promise.all([
+    postApprovalToActivityChannel(paths, org, approvalId, title, category, agentName, context, frameworkRoot),
+    pingAgentChatId(agentDir, approvalId, title, category, agentName, context),
+  ]);
+
+  if (!postedToActivityChannel && !pingedAgentChat) {
+    // Neither push channel reached a human. Unlike the per-path warns
+    // above (which explain ONE channel's failure), this must stand out —
+    // it means the approval is currently invisible outside the
+    // orchestrator's bus inbox and the dashboard.
+    console.error(
+      `[approval] ${approvalId} ("${title}") could not be pushed to any Telegram channel — ` +
+      `it is now visible ONLY via the orchestrator's bus inbox and the dashboard. ` +
+      `Check activity-channel.env and ${agentDir ?? '<agentDir>'}/.env (BOT_TOKEN/CHAT_ID) to restore Telegram delivery.`,
+    );
+  }
 
   return approvalId;
 }

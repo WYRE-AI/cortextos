@@ -6,8 +6,9 @@ const postActivitySpy = vi.fn().mockResolvedValue(true);
 vi.mock('../../../src/bus/system', () => ({
   postActivity: (...args: unknown[]) => postActivitySpy(...args),
 }));
+const sendMessageSpy = vi.fn().mockReturnValue('mocked-msg-id');
 vi.mock('../../../src/bus/message', () => ({
-  sendMessage: vi.fn(),
+  sendMessage: (...args: unknown[]) => sendMessageSpy(...args),
 }));
 
 // Mock TelegramAPI so the agent-bot ping is observable without hitting the
@@ -64,13 +65,17 @@ beforeEach(() => {
   telegramSendMessageSpy.mockClear();
   telegramSendMessageSpy.mockResolvedValue({ result: { message_id: 1 } });
   telegramConstructorSpy.mockClear();
+  sendMessageSpy.mockClear();
+  sendMessageSpy.mockReturnValue('mocked-msg-id');
   delete process.env.CTX_FRAMEWORK_ROOT;
+  delete process.env.CTX_ORCHESTRATOR_AGENT;
 });
 
 afterEach(() => {
   rmSync(testDir, { recursive: true, force: true });
   rmSync(frameworkRoot, { recursive: true, force: true });
   delete process.env.CTX_FRAMEWORK_ROOT;
+  delete process.env.CTX_ORCHESTRATOR_AGENT;
 });
 
 describe('createApproval', () => {
@@ -390,6 +395,113 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
     // The ping must point operators at the action surface — they cannot
     // act from the per-agent bot, so the body tells them where to go.
     expect(text).toMatch(/orchestrator|dashboard/i);
+  });
+});
+
+// Closes the silent-notification gap: create-approval had no fail-loud
+// signal when EVERY human-facing push channel (activity channel + the
+// requesting agent's own Telegram bot) was unconfigured or unreachable,
+// and never notified the org orchestrator at all. The orchestrator's bus
+// inbox does not depend on either Telegram path, so it must always hear
+// about a new approval — and when it is the ONLY channel that fired, the
+// caller must be told loudly, not left to infer it from silence.
+describe('createApproval — orchestrator notification + fail-loud warning', () => {
+  it('messages the orchestrator even when both push channels succeed', async () => {
+    process.env.CTX_ORCHESTRATOR_AGENT = 'boss';
+
+    const id = await createApproval(paths, 'alice', 'TestOrg', 'Both channels fine', 'deployment', 'ctx', frameworkRoot);
+
+    expect(sendMessageSpy).toHaveBeenCalledTimes(1);
+    const [sentPaths, from, to, priority, text] = sendMessageSpy.mock.calls[0] as [
+      BusPaths,
+      string,
+      string,
+      string,
+      string,
+    ];
+    expect(sentPaths).toBe(paths);
+    expect(from).toBe('system');
+    expect(to).toBe('boss');
+    expect(priority).toBe('high');
+    expect(text).toContain('alice');
+    expect(text).toContain('Both channels fine');
+    expect(text).toContain(id);
+  });
+
+  it('messages the orchestrator even when both push channels fail', async () => {
+    process.env.CTX_ORCHESTRATOR_AGENT = 'boss';
+    postActivitySpy.mockResolvedValueOnce(false);
+
+    // No agentDir passed at all -> pingAgentChatId also resolves false.
+    await createApproval(paths, 'alice', 'TestOrg', 'Both channels down', 'deployment', 'ctx', frameworkRoot);
+
+    expect(sendMessageSpy).toHaveBeenCalledTimes(1);
+    const [, , to] = sendMessageSpy.mock.calls[0] as [unknown, unknown, string];
+    expect(to).toBe('boss');
+  });
+
+  it('no-ops safely (no throw, no send) when CTX_ORCHESTRATOR_AGENT is unset', async () => {
+    // beforeEach already deletes the var; assert explicitly for clarity.
+    delete process.env.CTX_ORCHESTRATOR_AGENT;
+
+    await createApproval(paths, 'alice', 'TestOrg', 'No orchestrator configured', 'deployment', 'ctx', frameworkRoot);
+
+    expect(sendMessageSpy).not.toHaveBeenCalled();
+  });
+
+  it('no-ops when the orchestrator IS the requesting agent (self-notify is a no-op, not a bug)', async () => {
+    process.env.CTX_ORCHESTRATOR_AGENT = 'alice';
+
+    await createApproval(paths, 'alice', 'TestOrg', 'Orchestrator requesting its own approval', 'deployment', 'ctx', frameworkRoot);
+
+    expect(sendMessageSpy).not.toHaveBeenCalled();
+  });
+
+  it('a throwing sendMessage does not fail approval creation — warns instead', async () => {
+    process.env.CTX_ORCHESTRATOR_AGENT = 'boss';
+    sendMessageSpy.mockImplementationOnce(() => {
+      throw new Error('invalid agent name');
+    });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const id = await createApproval(paths, 'alice', 'TestOrg', 'sendMessage throws', 'deployment', 'ctx', frameworkRoot);
+
+    const pendingFile = join(paths.approvalDir, 'pending', `${id}.json`);
+    expect(existsSync(pendingFile)).toBe(true);
+    const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
+    expect(warnCalls.some((w) => w.includes('[approval]') && w.includes('orchestrator') && w.includes(id))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  // REGRESSION GUARD: the loud console.error must fire on EXACTLY the
+  // both-fail cell of this 2x2 truth table — any other combination means
+  // at least one human-facing channel still reached someone, so it must
+  // stay silent (the per-path console.warns already cover that case).
+  it.each([
+    { label: 'both channels fail', activityOk: false, pingOk: false, expectError: true },
+    { label: 'only activity fails, ping succeeds', activityOk: false, pingOk: true, expectError: false },
+    { label: 'only ping fails, activity succeeds', activityOk: true, pingOk: false, expectError: false },
+    { label: 'both channels succeed', activityOk: true, pingOk: true, expectError: false },
+  ])('fail-loud only when BOTH push channels fail ($label)', async ({ activityOk, pingOk, expectError }) => {
+    delete process.env.CTX_ORCHESTRATOR_AGENT; // isolate the fail-loud check from orchestrator noise
+    postActivitySpy.mockResolvedValueOnce(activityOk);
+    let agentDir: string | undefined;
+    if (pingOk) {
+      agentDir = join(testDir, `agent-with-bot-${Math.random().toString(36).slice(2)}`);
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(join(agentDir, '.env'), 'BOT_TOKEN=t\nCHAT_ID=c\n');
+    }
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const id = await createApproval(paths, 'alice', 'TestOrg', 'Truth-table test', 'deployment', 'ctx', frameworkRoot, agentDir);
+
+    expect(errorSpy).toHaveBeenCalledTimes(expectError ? 1 : 0);
+    if (expectError) {
+      const errorCalls = errorSpy.mock.calls.map((c) => c.join(' '));
+      expect(errorCalls.some((w) => w.includes('[approval]') && w.includes(id))).toBe(true);
+      expect(errorCalls.some((w) => w.includes('orchestrator') && w.includes('dashboard'))).toBe(true);
+    }
+    errorSpy.mockRestore();
   });
 });
 
