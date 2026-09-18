@@ -82,6 +82,32 @@ const WEEKDAY_ABBR_TO_NUM: Record<string, number> = {
   Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
 };
 
+/** Cron-relevant calendar fields for one candidate instant. */
+interface CronFields { minute: number; hour: number; day: number; month: number; weekday: number }
+
+/**
+ * Fast path for the default UTC timezone, using native Date getters instead of
+ * Intl.DateTimeFormat. Semantically identical — these getters ARE UTC, and UTC
+ * has no DST for the Intl path to be "DST-native" about — but dramatically
+ * cheaper, which matters because nextFireFromCron walks minute-by-minute for up
+ * to a year.
+ *
+ * Measured over the 291K candidate minutes that "0 0 31 1,2 *" scans (Jul 2026
+ * → Jan 2027): 9,382ms via formatToParts vs 340ms via these getters — 27.6x.
+ * That was enough to push a single next-fire computation past 10s under load.
+ * Since UTC is the default, this is the path essentially every cron takes.
+ */
+function utcFields(ms: number): CronFields {
+  const d = new Date(ms);
+  return {
+    minute: d.getUTCMinutes(),
+    hour: d.getUTCHours(),
+    day: d.getUTCDate(),
+    month: d.getUTCMonth() + 1, // getUTCMonth is 0-11; cron months are 1-12
+    weekday: d.getUTCDay(),
+  };
+}
+
 /**
  * Extract cron-relevant calendar fields (minute/hour/day/month/weekday) for
  * `ms` in whatever timezone `formatter` was constructed with. Timezone-aware
@@ -92,7 +118,7 @@ const WEEKDAY_ABBR_TO_NUM: Record<string, number> = {
 function fieldsFromFormatter(
   formatter: Intl.DateTimeFormat,
   ms: number,
-): { minute: number; hour: number; day: number; month: number; weekday: number } {
+): CronFields {
   const parts = formatter.formatToParts(new Date(ms));
   const map: Record<string, string> = {};
   for (const p of parts) map[p.type] = p.value;
@@ -149,20 +175,30 @@ export function nextFireFromCron(expr: string, fromMs: number, timezone: string 
     return NaN;
   }
 
-  // Build the Intl formatter once (throws RangeError on an invalid IANA
-  // timezone string — caught here so an invalid cron.timezone in crons.json
-  // fails safe as NaN rather than crashing the daemon's scheduler tick).
-  let formatter: Intl.DateTimeFormat;
-  try {
-    formatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: timezone,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit',
-      hourCycle: 'h23',
-      weekday: 'short',
-    });
-  } catch {
-    return NaN;
+  // Pick the field extractor. UTC — the default, so essentially every cron —
+  // uses native getters; anything else builds an Intl formatter once (which
+  // throws RangeError on an invalid IANA timezone string, caught here so a bad
+  // cron.timezone in crons.json fails safe as NaN rather than crashing the
+  // daemon's scheduler tick). Only the exact default constant takes the fast
+  // path; an equivalent spelling like "Etc/UTC" goes through Intl and is still
+  // correct, just slower.
+  let fieldsAt: (ms: number) => CronFields;
+  if (timezone === DEFAULT_CRON_TIMEZONE) {
+    fieldsAt = utcFields;
+  } else {
+    let formatter: Intl.DateTimeFormat;
+    try {
+      formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit',
+        hourCycle: 'h23',
+        weekday: 'short',
+      });
+    } catch {
+      return NaN;
+    }
+    fieldsAt = (ms) => fieldsFromFormatter(formatter, ms);
   }
 
   // Start from the next whole minute after fromMs
@@ -173,7 +209,7 @@ export function nextFireFromCron(expr: string, fromMs: number, timezone: string 
   let candidate = startMs;
 
   for (let i = 0; i < MAX_MINUTES; i++) {
-    const { minute: m, hour: h, day: dy, month: mo, weekday: dw } = fieldsFromFormatter(formatter, candidate);
+    const { minute: m, hour: h, day: dy, month: mo, weekday: dw } = fieldsAt(candidate);
 
     if (
       months.includes(mo) &&
