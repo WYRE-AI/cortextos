@@ -75,6 +75,7 @@ const QUIET_SUPPRESSED_TYPES = new Set([
   'user-disable',
   'user-stop',
   'rate-limited',
+  'rotation-recovered',
 ]);
 
 function isQuietHoursLA(now: Date): boolean {
@@ -308,6 +309,11 @@ async function main(): Promise<void> {
     { file: '.user-restart', type: 'user-restart' },
     { file: '.user-disable', type: 'user-disable' },
     { file: '.user-stop', type: 'user-stop' },
+    // Written by rotation-manager.ts before it restarts a previously
+    // limit-blocked agent onto a newly-available account (or the active
+    // account recovering in place) — a routine, expected daemon action, not
+    // a crash. See task_1789351994840_86202746.
+    { file: '.rotation-recovered', type: 'rotation-recovered' },
     // .daemon-crashed wins over .daemon-stop when both are present — a crash
     // during shutdown is the more important signal. Written by the daemon's
     // uncaughtException handler in src/daemon/index.ts.
@@ -452,6 +458,9 @@ async function main(): Promise<void> {
       break;
     case 'rate-limited':
       message = `⏳ ${agentName} paused — Anthropic rate limit hit. Will resume when the window resets.`;
+      break;
+    case 'rotation-recovered':
+      message = `🔄 ${agentName} restarted — OAuth rotation recovery: ${reason || 'no reason given'}`;
       break;
     case 'crash':
       message = `🚨 CRASH: ${agentName} died unexpectedly.`;

@@ -5,7 +5,7 @@
 // state/oauth/rotation-state.json. Preflight is an inference ping — the usage
 // API 403s on setup-tokens (no user:profile scope).
 
-import { existsSync, readFileSync, chmodSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { loadAccounts, setActiveAccount, writeTokenToAgents } from '../bus/oauth.js';
@@ -149,6 +149,46 @@ export class RotationManager {
     try { chmodSync(statePath(this.deps.ctxRoot), 0o600); } catch { /* ignore */ }
   }
 
+  /**
+   * Write a hook-crash-alert.ts-recognized `.rotation-recovered` marker
+   * before restarting a previously limit-blocked agent, so the SessionEnd
+   * hook classifies the restart correctly instead of falling through to the
+   * `crash` default (or getting caught by the rate-limit substring scan) —
+   * see task_1789351994840_86202746. Mirrors soft-restart-all's `.user-restart`
+   * write (src/cli/bus.ts) — write the marker synchronously BEFORE the
+   * restart call, since that's what actually kills the old PTY session.
+   * Best-effort: a failed write only costs classification accuracy on this
+   * one restart, same as before this fix — it must never block the restart.
+   */
+  private writeRestartMarker(agent: string, reason: string): void {
+    try {
+      const stateDir = join(this.deps.ctxRoot, 'state', agent);
+      ensureDir(stateDir);
+      writeFileSync(join(stateDir, '.rotation-recovered'), reason);
+    } catch { /* best-effort — see doc comment above */ }
+  }
+
+  /**
+   * Restart every currently limit-blocked agent (writing its
+   * `.rotation-recovered` marker first) and clear it from `state.limitBlocked`
+   * on success. Shared by both doRotation() recovery branches — rotating onto
+   * a newly-available candidate account, and the active account recovering in
+   * place — which were previously two copies of this same loop.
+   */
+  private async restartBlockedAgents(state: RotationState, markerReason: string): Promise<string[]> {
+    const toRestart = Object.keys(state.limitBlocked);
+    for (const agent of toRestart) {
+      try {
+        this.writeRestartMarker(agent, markerReason);
+        await this.deps.restartAgent(agent);
+        delete state.limitBlocked[agent];
+      } catch (err) {
+        this.deps.log(`[rotation] restart failed for ${agent}: ${err} — stays blocked for next tick`);
+      }
+    }
+    return toRestart;
+  }
+
   start(): void {
     this.timer = setInterval(() => { void this.tick(); }, TICK_MS);
     // Don't hold the process open for the rotation tick alone.
@@ -288,15 +328,7 @@ export class RotationManager {
         writeTokenToAgents(this.deps.frameworkRoot, this.deps.org, store.accounts[name].access_token);
         // Reload: preflights are slow (real inference); more agents may have blocked meanwhile.
         state = loadState(this.deps.ctxRoot);
-        const toRestart = Object.keys(state.limitBlocked);
-        for (const agent of toRestart) {
-          try {
-            await this.deps.restartAgent(agent);
-            delete state.limitBlocked[agent];
-          } catch (err) {
-            this.deps.log(`[rotation] restart failed for ${agent}: ${err} — stays blocked for next tick`);
-          }
-        }
+        const toRestart = await this.restartBlockedAgents(state, `rotation recovery: account "${name}" now active (${reason})`);
         state.lastRotationAt = this.now();
         state.retryAt = null;
         state.alertedHalt = false;
@@ -335,15 +367,7 @@ export class RotationManager {
       attempted += 1;
       if (activeResult === 'ok') {
         state = loadState(this.deps.ctxRoot);
-        const toRestart = Object.keys(state.limitBlocked);
-        for (const agent of toRestart) {
-          try {
-            await this.deps.restartAgent(agent);
-            delete state.limitBlocked[agent];
-          } catch (err) {
-            this.deps.log(`[rotation] restart failed for ${agent}: ${err} — stays blocked for next tick`);
-          }
-        }
+        const toRestart = await this.restartBlockedAgents(state, `rotation recovery: account "${store.active}" recovered (${reason})`);
         state.lastRotationAt = this.now();
         state.retryAt = null;
         state.alertedHalt = false;
