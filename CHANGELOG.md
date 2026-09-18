@@ -71,6 +71,38 @@ a SIGKILLed holder times out loudly (`exit 2`) rather than silently proceeding. 
 gained a case racing a real (sed-slowed) invocation against a normal one at the same leaking ref,
 proven to reproduce the exact silent-false-clean failure against the pre-fix scanner before
 confirming both racing invocations correctly detect the leak post-fix.
+### Added — `evaluate-experiment --decision` override and `correct-experiment-decision` for retroactive fixes
+
+`evaluate-experiment` derived `decision` (keep/discard) purely from `result_value`/`score` vs
+`baseline_value`, ignoring the `--justification`/`--learning` text entirely — 3+ confirmed live
+instances where the mechanical decision contradicted the agent's own written reasoning (most
+concrete: marketing's `exp_1787745238_vzgah`, stored `decision=discard` against a corrupted
+`baseline_value=64.3` while `learning` argued KEEP with full reasoning). There was no CLI path to
+correct a stored decision after the fact — every real correction in this corpus (murph, adoption)
+was a hand-edit directly on the JSON file, with no audit trail of what changed or why
+(task_1789437846265_69785154).
+
+`evaluate-experiment` now accepts `--decision <keep|discard>`, which still computes the mechanical
+decision (stored in a new `mechanical_decision` field for audit) but makes the override value
+authoritative; it requires a non-empty `--justification` so an override always carries its stated
+reason in the same record. A new `correct-experiment-decision <id> <keep|discard> <reason>` command
+retroactively fixes an already-completed experiment's `decision` (refusing on running/proposed,
+pointing the caller at `--decision` instead), backfilling `mechanical_decision` from the old
+`decision` value on pre-fix records that don't have it. Both recompute `next_baseline_value` using
+the same keep/discard ratchet rule `evaluateExperiment` already used. `gatherContext`'s derived
+`results.tsv`/`learnings.md` views self-correct with no further changes, since they already
+recompute the effective baseline from `decision`/`score`/`result_value` on every call rather than
+trusting a possibly-stale stored value.
+
+The dashboard's `GET /api/experiments` had the same staleness gap on a different surface — it read
+`experiments/learnings.md` directly off disk, which `correctExperimentDecision`/`evaluateExperiment`
+never rewrite, so a corrected decision would show its pre-correction text on the dashboard forever
+(caught by CodeRabbit review on this PR). Fixed by regenerating the `learnings` field live from the
+JSON history records on every request, mirroring `formatLearnings()`/`displayBaseline()` in
+`src/bus/experiment.ts` as a local copy (the dashboard already keeps its own local `Experiment` type
+rather than importing root `src/`).
+
+### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
 
 Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`
 resolved `org` to `''` with no validation (the `validateOrgName` import in `env.ts` was never

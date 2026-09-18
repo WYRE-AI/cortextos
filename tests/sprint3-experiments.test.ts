@@ -6,6 +6,7 @@ import {
   createExperiment,
   runExperiment,
   evaluateExperiment,
+  correctExperimentDecision,
   listExperiments,
   listAllExperiments,
   gatherContext,
@@ -579,6 +580,146 @@ describe('Sprint 3: Experiment Framework', () => {
         expect(newCols[8]).toBe('7'); // score, trailing
       });
     });
+
+    describe('--decision override (task_1789437846265_69785154, marketing exp_1787745238_vzgah shape)', () => {
+      it('mechanical_decision is null until evaluated, then equals decision when no override is given', () => {
+        const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 20);
+        expect(result.decision).toBe('keep');
+        expect(result.mechanical_decision).toBe('keep');
+        expect(result.decision_corrected_at).toBeNull();
+        expect(result.decision_correction_reason).toBeNull();
+      });
+
+      it('refuses --decision without --justification', () => {
+        const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+        runExperiment(testDir, id);
+        expect(() => evaluateExperiment(testDir, id, 20, { decision: 'discard' })).toThrow(
+          'without --justification',
+        );
+      });
+
+      it('refuses --decision with a blank/whitespace-only --justification', () => {
+        const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+        runExperiment(testDir, id);
+        expect(() =>
+          evaluateExperiment(testDir, id, 20, { decision: 'discard', justification: '   ' }),
+        ).toThrow('without --justification');
+      });
+
+      it('overrides a mechanical keep to discard, preserving the mechanical answer for audit', () => {
+        const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 20, {
+          decision: 'discard',
+          justification: 'measurement was contaminated by a bot spike',
+        });
+        expect(result.decision).toBe('discard');
+        expect(result.mechanical_decision).toBe('keep'); // what the numbers alone said
+        expect(result.decision_corrected_at).not.toBeNull();
+        expect(result.decision_correction_reason).toBe('measurement was contaminated by a bot spike');
+      });
+
+      it('overrides a mechanical discard to keep — the marketing exp_1787745238_vzgah shape', () => {
+        const id = createExperiment(testDir, 'testbot', 'kb_ingest_fleet_freshness', 'h', { baseline: 64.3 });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 50, {
+          decision: 'keep',
+          justification: 'baseline_value was corrupted (see 09-04 fix lineage) — the real comparison favors keep',
+        });
+        expect(result.mechanical_decision).toBe('discard'); // 50 < 64.3, direction=higher
+        expect(result.decision).toBe('keep');
+      });
+
+      it('next_baseline_value uses the FINAL (override) decision, not the mechanical one', () => {
+        const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+        runExperiment(testDir, id);
+        // mechanical would be discard (5 < 10), override forces keep
+        const result = evaluateExperiment(testDir, id, 5, {
+          decision: 'keep',
+          justification: 'override for ratchet test',
+        });
+        expect(result.next_baseline_value).toBe(5); // effectiveValue, per keep ratchet semantics
+      });
+
+      it('an override still respects the --score effective-value rule for the ratchet', () => {
+        const id = createExperiment(testDir, 'testbot', 'tone', 'h', { baseline: 5 });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 0, {
+          score: 3,
+          decision: 'keep',
+          justification: 'qualitative override',
+        });
+        expect(result.mechanical_decision).toBe('discard'); // score 3 < baseline 5
+        expect(result.decision).toBe('keep');
+        expect(result.next_baseline_value).toBe(3); // score is the effective value, not measuredValue 0
+      });
+    });
+  });
+
+  describe('correctExperimentDecision (post-hoc fix for an already-completed experiment)', () => {
+    it('refuses on a running experiment — direct the caller to evaluate-experiment --decision instead', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+      runExperiment(testDir, id);
+      expect(() => correctExperimentDecision(testDir, id, 'keep', 'because')).toThrow(
+        "expected 'completed'",
+      );
+    });
+
+    it('refuses on a proposed experiment', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+      expect(() => correctExperimentDecision(testDir, id, 'keep', 'because')).toThrow(
+        "expected 'completed'",
+      );
+    });
+
+    it('refuses an empty reason', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+      runExperiment(testDir, id);
+      evaluateExperiment(testDir, id, 20);
+      expect(() => correctExperimentDecision(testDir, id, 'discard', '  ')).toThrow('reason is required');
+    });
+
+    it('flips a completed discard to keep, sets audit fields, recomputes next_baseline_value', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+      runExperiment(testDir, id);
+      const evaluated = evaluateExperiment(testDir, id, 5); // mechanical discard
+      expect(evaluated.decision).toBe('discard');
+
+      const corrected = correctExperimentDecision(testDir, id, 'keep', 'baseline was corrupted at eval time');
+      expect(corrected.decision).toBe('keep');
+      expect(corrected.mechanical_decision).toBe('discard'); // backfilled from the old decision
+      expect(corrected.decision_correction_reason).toBe('baseline was corrupted at eval time');
+      expect(corrected.decision_corrected_at).not.toBeNull();
+      expect(corrected.next_baseline_value).toBe(5); // ratchet recomputed for the corrected decision
+    });
+
+    it('backfills mechanical_decision from the OLD decision on a pre-fix record that has it null', () => {
+      // Simulate a record written before mechanical_decision existed: no
+      // mechanical_decision field at all in the persisted JSON.
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+      runExperiment(testDir, id);
+      evaluateExperiment(testDir, id, 20); // mechanical keep
+      const filePath = join(testDir, 'experiments', 'history', `${id}.json`);
+      const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+      delete raw.mechanical_decision;
+      writeFileSync(filePath, JSON.stringify(raw, null, 2), 'utf-8');
+
+      const corrected = correctExperimentDecision(testDir, id, 'discard', 'pre-fix record correction');
+      expect(corrected.mechanical_decision).toBe('keep'); // backfilled from the stored (old) decision
+      expect(corrected.decision).toBe('discard');
+    });
+
+    it('a second correction overwrites decision_corrected_at/reason (latest correction wins)', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h', { baseline: 10 });
+      runExperiment(testDir, id);
+      evaluateExperiment(testDir, id, 20);
+      correctExperimentDecision(testDir, id, 'discard', 'first correction');
+      const second = correctExperimentDecision(testDir, id, 'keep', 'second correction supersedes the first');
+      expect(second.decision).toBe('keep');
+      expect(second.decision_correction_reason).toBe('second correction supersedes the first');
+    });
   });
 
   describe('listExperiments', () => {
@@ -687,6 +828,27 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(ctx.keeps).toBe(0);
       expect(ctx.results_tsv).toContain(`${id}\ttestbot\tmanual_steps\t8\t9\tdiscard`);
       expect(ctx.learnings).toContain(`## ${id} (discard)`);
+    });
+
+    it('reflects a correctExperimentDecision fix without any hand-editing (task_1789437846265_69785154)', () => {
+      const id = createExperiment(testDir, 'testbot', 'kb_ingest_fleet_freshness', 'test', {
+        direction: 'higher',
+        baseline: 64.3,
+      });
+      runExperiment(testDir, id);
+      evaluateExperiment(testDir, id, 50); // mechanical discard (50 < 64.3)
+
+      let ctx = gatherContext(testDir, 'testbot');
+      expect(ctx.discards).toBe(1);
+      expect(ctx.keeps).toBe(0);
+
+      correctExperimentDecision(testDir, id, 'keep', 'baseline_value was corrupted');
+
+      ctx = gatherContext(testDir, 'testbot');
+      expect(ctx.keeps).toBe(1);
+      expect(ctx.discards).toBe(0);
+      expect(ctx.results_tsv).toContain(`${id}\ttestbot\tkb_ingest_fleet_freshness\t50\t50\tkeep`);
+      expect(ctx.learnings).toContain(`## ${id} (keep)`);
     });
 
     it('reads IDENTITY.md and GOALS.md if present', () => {
