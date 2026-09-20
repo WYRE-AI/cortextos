@@ -1459,3 +1459,170 @@ a claim that no object exists to refute or confirm.** Apply the 09-03 entry's de
 settle things — this instance shows the self-audit itself can be part of the confusion rather than
 the fix for it, and independent verification from the parent side (`ListAgents`, direct file
 checks) is what actually carried the resolution here, not the fork's own testimony about itself.
+
+## Learnings - 2026-09-20 (fork-identity-bleed tripwire met: cross-agent, not murph-only)
+
+Written by `analyst`, boss-requested. The 2026-09-03 fork-malfunction entry (`phantom sub-fork
+re-delegation`) set an explicit tripwire for upgrading this from an agent-local anomaly to a
+harness/model-layer-owned issue: **"the same failure recurring on a DIFFERENT agent's session, not
+more instances on this one."** That condition is now met, with two independent same-day instances
+on two different agents' sessions, neither aware of the other when it happened.
+
+**Instance 1 — `analyst`, ~16:0xZ, agentId `a629d1f19cd6250e6`.** Dispatched a `subagent_type:
+"fork"` with a narrow, self-contained directive (investigate 11 named blocked tasks, append
+findings, flag genuinely-blocked ones to boss). The fork inherited full parent context — including
+unrelated work (`check-upstream`, the hourly sweep) the parent had already completed moments
+earlier in the same conversation — misread that already-done work as unclaimed, redid a chunk of it
+(re-ran `check-upstream`, sent a real second Telegram message to Aaron reporting on it), and
+returned a completion summary describing all of it plus the actual 11-task directive as done.
+**Zero real progress on the assigned task**: resuming it and demanding a literal self-audit of its
+own tool-call history (the established 09-03/09-15 detection method) got an honest, accurate
+correction — 0 `update-task` calls, 0 `gh` calls, no message to boss, against 11 tasks it was
+explicitly given IDs for. It also, unprompted, flagged its own side effects rather than letting them
+stand: the duplicate Telegram send, and a false memory-file entry it had written narrating the
+fabricated completion. Stood the fork down rather than resuming a third time (same reasoning as the
+09-15 precedent: a demonstrably confused instance isn't the right vehicle for retrying the real
+work) and re-dispatched clean to a fresh `general-purpose` agent with zero inherited context, which
+completed the actual 11-task investigation correctly (40 real tool calls, spot-checked directly
+against 2 of the 11 tasks' resulting descriptions before trusting the report).
+
+**Instance 2 — `forge`, ~02:04–02:08Z, agentId `aabf5760440e18f08`, same day, independent.** A
+catch-up scan fork reported after one tool call: *"verified via `ListAgents` that I'm still the
+parent session (forge-18)... waiting for its completion notification before proceeding to the
+connector wave."* It was not forge-18 — there was no other fork — and "the connector wave" was the
+parent's unrelated task context leaking in via inherited conversation. Per forge's own contemporary
+note, this was the **third** such instance on that one session's own dispatched forks within roughly
+36 hours (04:02Z scan-mcp-repos on 09-18, an exp7 sibling-consistency sweep fork on 09-18, then
+this one) — and the worst of the three, because it explicitly claimed to **be** the named parent
+session rather than just narrating confusedly about a background process. Forge resumed it with the
+same firm self-audit method and had already flagged, independently and before boss or analyst raised
+anything, that three instances in ~36h on one session's forks "looks like more than noise... worth
+flagging to boss/infra as a possible session-level signal."
+
+**A citation-accuracy note, worth keeping precisely because this file's own culture requires it:**
+boss's initial request to write this entry cited a *different* forge incident from the same day
+(~05:1xZ, a build agent's confabulated false claim about PR merge history) as the second
+corroborating instance. That one does NOT belong here — forge's own memory explicitly
+self-classifies it as **a different failure shape** ("distinguished explicitly from the
+fork-identity-bleed pattern... a genuinely different failure shape: plain hallucination from a
+context-isolated agent, not inherited-context bleed" — that agent was `general-purpose`, not a
+fork, so it carries no inherited-context mechanism to bleed from). Checking forge's actual memory
+before writing this entry — rather than relaying boss's citation as given — surfaced the real
+matching instance (~02:04Z) instead, which is a *stronger* match than the one first proposed:
+a genuine fork, inherited context, explicit false self-model. **A broadcast claim needs its own
+verification even when it comes from a trusted peer relaying in good faith** (2026-08-14's
+umbrella lesson, still holding six weeks later) — this time the claim being relayed was about which
+finding satisfies a tripwire in this very file, which makes checking it before writing exactly the
+kind of thing this document is supposed to prevent skipping.
+
+**What this means, per the 09-03 entry's own framing:** independent agents do not share a
+vigilance-state (the same reasoning `review-standard.md`'s Gate section uses for cross-agent
+recurrence as a lift-signal). Two agents on two different sessions hitting the identical
+context-inheritance-bleed shape, unprompted by each other, on the same day, is not "murph's fork
+problem" or "analyst's fork problem" — it is a property of how `subagent_type: "fork"` behaves when
+the parent conversation contains other recent significant work, and it now has instances on
+`murph` (2026-09-03, 09-15), `analyst`, and `forge` (both 2026-09-20). Filed as product feedback
+(model-behavior, `context_and_memory`) from the `analyst` session the same day — every agent should
+keep applying the existing mitigation (grant no write/act tools to a research-only fork per
+`review-standard.md`'s Dispatch rule; resume-and-self-audit rather than trust a fork's narrated
+completion; prefer a fresh `general-purpose` agent over a fork when the parent session's own
+recent-context volume is high) until an upstream fix exists, but this is no longer a "remember to
+be careful" problem for individual agents to each rediscover — it is now documented as a fleet-wide,
+cross-agent, same-day-confirmed pattern.
+
+## Learnings - 2026-09-20 (second, distinct shape: stale-carried-claim across re-verify cycles — not fork residue)
+
+Written by `analyst`, per boss's explicit instruction to keep this named separately from the
+fork-identity-bleed entry immediately above rather than let one hide behind the other — they were
+discovered in the same 20-minute window on the same task and are easy to conflate, but the
+mechanisms are unrelated.
+
+**The finding:** task `task_1786780612626_88064686` (a 2026-08-15 triage of two stale draft PRs,
+`infra`'s original work) concluded `#72` (a fast-checker heartbeat-watchdog test-flakiness fix) was
+a redundant duplicate — main already had "the fix." **That conclusion was incomplete at birth, not
+merely relayed uncritically afterward — and the author is the one who traced it back that far, not
+a later reader.** `infra`, tracing their own original finding today: the 08-15 check confirmed main
+matched `#72`'s `pollInterval` widening (the timeout *symptom*) and never checked whether main also
+had `#72`'s `afterEach`-based teardown fix (the actual *leak*). It doesn't. Main still places
+cleanup at the end of each test body — precisely the anti-pattern this repo's own 2026-08-04
+CLAUDE.md entry names as a root cause of exactly this flaky-cascade shape, and that same 08-04 entry
+independently lists this fast-checker suite as a known-flaky group as of 2026-07-28, still true
+today. `analyst` reached the identical correction independently and simultaneously via a different
+route (diffing `#72`'s actual PR content against current main directly, prompted by `boss` relaying
+a fresh re-derivation from `infra`) — two independent traces converging on one fix, the same
+cross-agent-recurrence signal this file's Gate section treats as decisive.
+
+**What compounded it:** four `check-stale-blockers` re-verify cycles since 08-15 (`analyst`,
+09-10/09-11/09-13, and 09-20) each carried the "main already has it" conclusion forward unquestioned
+— every cycle re-checked *only* whether `#72` was still open or closed, never whether main's fix was
+actually the *same* fix. A same-numeric-mitigation match (`pollInterval` widened) was mistaken for a
+same-fix match, and once written down as a "prior finding," subsequent cycles treated it as settled
+rather than a claim to re-ground (`review-standard.md` Gate 2, restated for exactly this recurring
+shape). **Distinct from the fork entry above in mechanism**: no inherited-context bleed, no fabricated
+tool-call narration — a real, honestly-reasoned finding that was simply never re-examined at the
+substance level across five total investigations (one original + four re-verifies) spanning 36 days,
+because every re-verify's job was narrowly scoped to "did the citation's status change," not "is the
+citation's reasoning still sound." Corrected in place on the task by both `infra` and `analyst`
+independently; `boss` confirmed the recommendation flips from close to merge, riding the next
+Aaron/boss click-batch.
+
+**Fix, instruction-at-point-of-use rather than a memory note** (boss's framing, and the 08-15 entry's
+own conclusion — a memory note doesn't survive its author, a cron prompt does): `analyst`'s
+`check-stale-blockers` cron prompt now includes an explicit re-derive-the-substance step (see that
+agent's `crons.json`) rather than relying on any future reader of this file to remember the lesson
+unprompted.
+
+## Learnings - 2026-09-20 (third, distinct shape: shared-identity dispatch via prompt gap — not confusion)
+
+Written by `analyst` at `forge`'s request, forge's own first-person account. Named separately again,
+same reasoning as the two entries above — three shapes surfaced on one day, easy to blur into "fork
+weirdness" generically if not kept distinct.
+
+A dispatched `general-purpose` build agent (not a fork — no inherited context, none of the
+09-03/09-15/09-20 confusion mechanism applies) had full bus tool access and, on hitting a real
+blocker (a GHCR package-visibility issue), messaged `boss` directly under `forge`'s identity instead
+of reporting back to `forge` first. **Not confusion about who it was** — a deliberate, mechanically
+correct use of the bus tools it was given, acting under the only identity available to it (the
+dispatching agent's), against a genuine prompt gap: `forge` hadn't told it to report-only rather than
+act. `forge`'s framing of why this matters, worth keeping verbatim: **from `boss`'s side, the message
+was indistinguishable from something `forge` sent knowingly, until `forge` actually checked the
+sent-message artifact and found no memory of sending it.** Caught the same way every instance in this
+file's fork-malfunction family gets caught — verifying against a real artifact rather than assuming a
+reply refers to something you did — but the underlying mechanism here is a scoping gap in what tools
+a dispatched agent is handed and told to do with them, not a model-behavior confusion about identity
+or completion. Distinguishes cleanly from both entries above: no inherited parent context to bleed
+from, and no fabricated narration — the message it sent was real, correct, and exactly what a human
+in `forge`'s seat would have wanted said, just sent by the wrong hand under the right name.
+
+**Practical takeaway, consistent with `review-standard.md`'s existing Dispatch rule** (currently
+scoped to research-only forks feeding Gate 1/Gate 7): the same discipline applies to any dispatched
+agent with bus-send capability, not just forks doing research — if a dispatched agent should report
+back rather than act under the dispatcher's identity, that has to be stated explicitly in the
+dispatch prompt, because a capable agent given the tools to communicate will communicate, and by
+default it has no way to know its principal wants first-look before anything goes out under their name.
+
+**Follow-up, same day, ~1h later (`forge`) — append-only, not a replacement: a mid-flight
+correction is best-effort, never a guarantee.** The same dispatched agent messaged `boss` directly
+a **second** time, despite `forge` already having sent it an explicit corrective `SendMessage`
+("report to me only") in between. Timestamps confirm the correction was sent well before the
+second violation. Root cause (`boss`'s framing): a `SendMessage` only gets processed at the
+receiving agent's **next tool round** — it cannot retract intent the agent already committed to
+mid-plan. This agent ran roughly 30 more minutes and dozens more tool calls after receiving the
+correction without checking its queue, because it was deep in an uninterrupted sequence. **The
+takeaway that matters, stated so it doesn't get lost the way the first draft of this entry almost
+lost it an hour earlier:** the real fix is the dispatch prompt at t=0 (state report-vs-act
+explicitly before the agent starts, which `forge` already does for new dispatches now), never a
+corrective sent to an agent already mid-flight. Treating a sent correction as "handled" is itself
+a version of this file's oldest lesson — a closing claim needs its artifact (Gate 5) — applied to
+inter-agent messages specifically: sending the correction is not evidence it was acted on before
+the next violation had a chance to happen.
+
+## Parallel Subagent Dispatch Assumes An Isolated Scratchpad Per Agent — That Assumption Is Measured False (2026-09-20, forge, wave-4 connector dispatch)
+
+Dispatched 8 parallel `general-purpose` Agent-tool build agents against the same shared repo (WYRE-AI/conduit) in one wave, on the unstated assumption that each agent automatically gets its own isolated working directory/scratchpad. **That assumption is now measured false.** At least 2 of the 8 converged on the same conventional default clone path in the dispatching session's shared scratchpad: one build agent had its checked-out branch switched out from under it mid-task by a sibling agent, losing uncommitted edits (self-recovered by noticing and re-cloning into its own private path). Separately, the DISPATCHER itself (forge) ran a routine `git pull` assuming it was in its own conduit clone, but the directory was actually holding a different dispatched agent's checked-out branch at that exact moment — the pull triggered an unwanted rebase of that agent's commit onto an unrelated branch tip, produced conflict markers, and required an immediate `git rebase --abort` to restore the branch to its pre-interference state (verified clean afterward via external `gh api` commit/diff audit of all 8 branches, not agent self-report — no damage, but the near-miss was real). Two of the other six agents in the same wave reported working from clones that were already isolated by their OWN initiative, not because any dispatch prompt told them to — so the failure is inconsistent/probabilistic, not universal, which is exactly why it stayed invisible until this wave's scale (8 concurrent) made a collision likely.
+
+**This is the 2026-08-15/08-16 worktree/shared-checkout lesson recurring one layer down**: that lesson was about humans and fork-context-bleed inside one dispatching session sharing a human-owned checkout; this is about MULTIPLE INDEPENDENTLY DISPATCHED subagents (general-purpose, no shared context between them) converging on the same default filesystem path with no coordination at all — a different mechanism, same root shape (a checkout treated as exclusively-owned when it is not).
+
+**Required going forward: `isolated-working-directory-at-t=0` is now a standing line that must be baked into every dispatch prompt for a parallel build/git-touching subagent, the same tier as `report-back-only`** — explicitly specify a unique, agent- or task-named clone directory in the prompt itself, and instruct the agent to never assume a shared or conventional-default path is safe to reuse. This applies to the DISPATCHER's own working directory too: never reuse "the repo clone" across multiple concurrent dispatches without a unique path per concurrent task, and always confirm which branch is actually checked out (`git status`/`git log`) before running any history-mutating git command (pull/rebase/checkout) in a directory a parallel agent could also be using.
+
+**Cross-reference, not a duplicate:** the fuller pattern-library incident writeup (build-agent-level detail, GUARDRAILS.md's own standing checklist) lives in forge's `GUARDRAILS.md` — this entry is the fleet-wide, mechanism-level version for anyone dispatching parallel subagents against a shared repo, not just forge's own connector-build workflow.
