@@ -413,3 +413,45 @@ export function ensureKBDirs(instanceId: string, frameworkRoot: string, org: str
     mkdirSync(chromaDir, { recursive: true });
   }
 }
+
+/**
+ * List knowledge base collections and document counts for an org.
+ *
+ * Extracted from `kb-collections`'s own inline shell-out (src/cli/bus.ts) so
+ * there is one place that knows how to build the KB env and invoke
+ * `mmrag.py collections`, matching every other verb in this module —
+ * task_1790023815341 (KB Notion re-plumb, Phase 2 prep): before this,
+ * `kb-collections` was a second independent code path to the Python
+ * backend, duplicating buildKBEnv's env-construction logic inline rather
+ * than calling it. `stdio: 'inherit'` (not JSON-parsed) matches
+ * `ingestKnowledgeBase`'s convention — this prints mmrag.py's own table
+ * output directly rather than returning a parsed result, since no caller
+ * currently needs the parsed shape.
+ */
+export function listKnowledgeBaseCollections(
+  options: {
+    org: string;
+    frameworkRoot: string;
+    instanceId: string;
+  },
+): void {
+  const { frameworkRoot, instanceId } = options;
+  const org = normalizeOrgName(frameworkRoot, options.org);
+
+  const env = buildKBEnv(frameworkRoot, org, instanceId);
+
+  const kbRoot = join(homedir(), '.cortextos', instanceId, 'orgs', org, 'knowledge-base');
+  const chromaDir = join(kbRoot, 'chromadb');
+  if (!existsSync(chromaDir)) {
+    console.log('No collections found. Run kb-ingest first.');
+    return;
+  }
+
+  const pythonPath = getVenvPython(frameworkRoot);
+  const mmragPath = join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
+
+  execFileSync(pythonPath, [mmragPath, 'collections'], {
+    stdio: 'inherit',
+    env,
+  });
+}

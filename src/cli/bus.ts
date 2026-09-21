@@ -22,7 +22,7 @@ import { createReminder, listReminders, ackReminder, pruneReminders } from '../b
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron, computeReferenceMs } from '../daemon/cron-scheduler.js';
-import { queryKnowledgeBase, ingestKnowledgeBase, deleteFromKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
+import { queryKnowledgeBase, ingestKnowledgeBase, deleteFromKnowledgeBase, ensureKBDirs, listKnowledgeBaseCollections } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, setActiveAccount, writeTokenToAgents, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { loadRotationState } from '../daemon/rotation-manager.js';
 import { mintInstallationToken, shouldRefuseInteractivePrint, redactForJson } from '../bus/github-app.js';
@@ -1888,63 +1888,11 @@ busCommand
       process.exit(1);
     }
 
-    const { execFileSync } = require('child_process');
-    const { existsSync, readFileSync } = require('fs');
-    const { join: pjoin } = require('path');
-    const { homedir: hdir } = require('os');
-
-    const frameworkRoot = env.frameworkRoot || process.cwd();
-    const instanceId = env.instanceId;
-    const kbRoot = pjoin(hdir(), '.cortextos', instanceId, 'orgs', org, 'knowledge-base');
-    const chromaDir = pjoin(kbRoot, 'chromadb');
-    const isWin = process.platform === 'win32';
-    const venvBin = isWin ? 'Scripts' : 'bin';
-    const pythonExe = isWin ? 'python.exe' : 'python3';
-    const pythonPath = pjoin(frameworkRoot, 'knowledge-base', 'venv', venvBin, pythonExe);
-    const mmragPath = pjoin(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
-
-    // Load .env and secrets.env (same as bash `source`)
-    const envFiles = [
-      pjoin(frameworkRoot, '.env'),
-      pjoin(frameworkRoot, 'orgs', org, 'secrets.env'),
-    ];
-    const extraVars: Record<string, string> = {};
-    for (const ef of envFiles) {
-      if (existsSync(ef)) {
-        for (const line of readFileSync(ef, 'utf-8').split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const idx = trimmed.indexOf('=');
-          if (idx > 0) {
-            let val = trimmed.slice(idx + 1);
-            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-              val = val.slice(1, -1);
-            }
-            extraVars[trimmed.slice(0, idx)] = val;
-          }
-        }
-      }
-    }
-
-    if (!existsSync(chromaDir)) {
-      console.log('No collections found. Run kb-ingest first.');
-      process.exit(0);
-    }
-
-    const envVars: Record<string, string | undefined> = {
-      ...process.env,
-      ...extraVars,
-      CTX_ORG: org,
-      CTX_INSTANCE_ID: instanceId,
-      CTX_FRAMEWORK_ROOT: frameworkRoot,
-      MMRAG_DIR: kbRoot,
-      MMRAG_CHROMADB_DIR: chromaDir,
-      MMRAG_CONFIG: pjoin(kbRoot, 'config.json'),
-    };
     try {
-      execFileSync(pythonPath, [mmragPath, 'collections'], {
-        stdio: 'inherit',
-        env: envVars,
+      listKnowledgeBaseCollections({
+        org,
+        frameworkRoot: env.frameworkRoot || process.cwd(),
+        instanceId: env.instanceId,
       });
     } catch {
       // python printed error already
