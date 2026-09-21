@@ -191,6 +191,17 @@ of another file's outcome — a `MEMORY.md` miss is not a reason to skip the dai
 2026-08-20).
 
 This does **not** replace the 503/429 retry rules elsewhere in this section — those cover an intermittent
+
+<!-- KB-INGEST-429-RULE-v2 -->
+🔴 **429 RULE (2026-09-03, infra, task_1788420454462_38838015) — this file referenced a 429 rule above
+but never contained one; added now.** `429 RESOURCE_EXHAUSTED` is QUOTA, not availability — do not apply
+the 503 retry-once rule to it blindly. Measured 2026-09-03 by direct reproduction against the live
+embedding API: the constraint clears within single-digit minutes, not a full 4h cycle. **On a 429: wait
+a short JITTERED delay (60-180s, e.g. `sleep $((60 + RANDOM % 121))`) and retry ONCE.** If the retry
+also fails, stop: skip the file, report it, retry at the next heartbeat. **Verified: ONE Gemini key at
+framework level, ZERO per-agent overrides — the embedding quota is a SINGLE SHARED POOL across all 15
+agents**, so jitter matters — an immediate retry would re-collide with whatever just caused the 429. A
+429 can still return `rc=0` with `Errors:1` — check per-file, never the exit code.
 embedding-service-availability failure (2026-08-18), a different phenomenon from the size-scaling problem
 this rule fixes. Both can be true in the same cycle; one diagnosis does not rule out the other.
 
