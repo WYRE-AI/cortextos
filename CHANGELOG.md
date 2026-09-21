@@ -1691,6 +1691,74 @@ unnoticed because the hang-detector happened to rescue it.
   stay in sync with `start()`: a gap longer than the slow tier is itself the
   signal that the previous outage ended, and the next failure starts fresh.
 
+### Fixed — FM-8 cron tests still asserted the pre-#21 local-time contract
+
+PR #21 (`1e24108d`) deliberately moved cron-expression evaluation off the
+daemon's ambient timezone and into the cron's `timezone` field, defaulting to
+UTC. It updated the `nextFireFromCron` unit tests but missed the FM-8
+integration block in `tests/integration/phase5-failure-modes.test.ts`, which
+kept asserting the superseded contract — its comment still read *"The scheduler
+uses `Date.getHours()` (local wall clock)"*.
+
+The block only passed on a host whose local time was UTC: on the fleet host
+(EDT) `fixed-hour cron expression fires at the correct local hour` failed, and
+under `TZ=Pacific/Auckland` the weekday case failed too — it had been passing
+under EDT by coincidence, not because it was timezone-agnostic.
+
+- Rewritten against pinned absolute UTC instants (`Date.UTC`), so the tests
+  assert the real contract and pass identically on any host timezone —
+  verified green under `Pacific/Auckland` (UTC+12), `UTC`, and `Asia/Kolkata`
+  (UTC+5:30).
+- Added a declared-timezone case: `0 3 * * *` with
+  `timezone: "America/New_York"` must NOT fire at 03:00 UTC and must fire at
+  07:00 UTC (EDT). This is the half of #21's contract that had no
+  scheduler-level integration coverage — it proves `timezone` threads through
+  `CronScheduler`, not just `nextFireFromCron`.
+
+### Fixed — `nextFireFromCron` took a 27.6x-slower path for the default (UTC) timezone
+
+Since PR #21, every candidate minute in `nextFireFromCron`'s scan went through
+`Intl.DateTimeFormat.formatToParts()`, including for the default UTC timezone —
+correct, but needlessly expensive: `formatToParts` exists for genuine
+timezone-conversion, and UTC has no DST for it to be doing any real work on.
+A sparse expression (`0 0 31 1,2 *`) scans up to ~291K candidate minutes;
+measured 9,382ms for that scan via `formatToParts` vs 340ms via native `Date`
+UTC getters — enough to push a single next-fire computation past the daemon's
+own tick budget under load.
+
+Added a `utcFields()` fast path using `getUTCMinutes`/`getUTCHours`/etc.
+directly, taken only when `timezone === DEFAULT_CRON_TIMEZONE` (the exact
+default constant) — an equivalent spelling like `Etc/UTC` still goes through
+`Intl` and is unaffected, just not accelerated. Added an equivalence test
+(`UTC` vs `Etc/UTC` must agree on every candidate) and a timing regression
+guard so a future change can't silently regress this path back onto `Intl`.
+
+### Fixed — dashboard health endpoint ignored a cron's declared `timezone`
+
+`dashboard/src/app/api/workflows/health/route.ts` carried its own inline
+`nextFireFromCronExpr`, duplicated from (and drifted independently of)
+`dashboard/src/app/api/workflows/crons/route.ts` — both predating the
+`timezone` field PR #21 added to the daemon's own evaluator. Health's
+duplicate evaluated every cron expression against ambient local getters
+(`getHours`/`getDay`/etc.), so a cron declaring `timezone: "America/New_York"`
+showed its next-fire time in the *dashboard host's* local time, not the
+timezone the cron actually fires in — a silent mismatch between what the
+daemon does and what the health page reports.
+
+Removed health's inline duplicate and moved a `timezone`-aware
+`nextFireFromCronExpr` into the shared `dashboard/src/lib/cron-utils.ts`
+(matching the daemon's `nextFireFromCron` semantics: UTC by default, `Intl`-based
+for a declared IANA zone). `computeNextFire` now threads `cron.timezone`
+through. Added a cross-implementation test importing both the daemon's and the
+dashboard's evaluators and asserting agreement across every field, including
+EST/EDT and Asia/Tokyo.
+
+**Known gap, not addressed here:** `dashboard/src/app/api/workflows/crons/route.ts`
+still carries its own separate inline duplicate (also local-getter-based,
+also ignoring `cron.timezone`) — this fix only reached the health endpoint.
+Flagged for a follow-up to consolidate `crons/route.ts` onto the same shared
+`cron-utils.ts` function.
+
 ### Added — canonical branch protection on `main`
 
 `main` previously had zero branch protection (no required status checks, no
