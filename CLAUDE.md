@@ -1637,3 +1637,36 @@ Dispatched 8 parallel `general-purpose` Agent-tool build agents against the same
 **Required going forward: `isolated-working-directory-at-t=0` is now a standing line that must be baked into every dispatch prompt for a parallel build/git-touching subagent, the same tier as `report-back-only`** — explicitly specify a unique, agent- or task-named clone directory in the prompt itself, and instruct the agent to never assume a shared or conventional-default path is safe to reuse. This applies to the DISPATCHER's own working directory too: never reuse "the repo clone" across multiple concurrent dispatches without a unique path per concurrent task, and always confirm which branch is actually checked out (`git status`/`git log`) before running any history-mutating git command (pull/rebase/checkout) in a directory a parallel agent could also be using.
 
 **Cross-reference, not a duplicate:** the fuller pattern-library incident writeup (build-agent-level detail, GUARDRAILS.md's own standing checklist) lives in forge's `GUARDRAILS.md` — this entry is the fleet-wide, mechanism-level version for anyone dispatching parallel subagents against a shared repo, not just forge's own connector-build workflow.
+
+## Azure CLI `caller` Attribution Is Not Per-Agent/Per-Process — Same Shared-Identity Shape As The Git-Checkout Lesson, On A Different Substrate (2026-09-23, infra, UK South multi-region provisioning)
+
+While debugging a UK South Conduit gateway crash-loop, infra attributed a live Postgres firewall-rule
+write to maintainer because Azure's activity log showed `caller=aaron@wyre.ai` — documented as
+maintainer's Azure identity for this work. **Wrong.** Maintainer checked their own command history
+(zero matching writes) and their `~/.azure/` config (default unscoped path, single OS user on this
+Mac) and correctly pointed out: any process on this machine invoking a default `az` call —
+another agent's session, a script, or Aaron himself working directly at his terminal — authenticates
+as `aaron@wyre.ai` identically. **The `caller` field cannot discriminate which of those actually ran
+a given command; it identifies the credential, not the process or the agent using it.**
+
+Nobody has root-caused who actually made that specific write (working theory: Aaron, who was live in
+the thread all day) — not chased further, since it caused no harm and blocked nothing. The mechanism
+is what's worth keeping.
+
+**This is the 2026-08-15/08-16 shared-git-checkout "third writer" lesson recurring on a different
+substrate.** That lesson was about a shared working tree where `git status`/branch state could be
+silently altered by a concurrent writer with no attribution signal distinguishing who. Here the
+shared resource is Azure CLI credential state (`~/.azure/`) on one Mac with one default OS-level
+identity path, and the "who wrote this" signal (activity-log `caller`) looks authoritative — a real
+email, a real timestamp — but is **structurally incapable of the discrimination it appears to make**,
+the same way a wrong-namespace `gh` query or a wrong-context secret lookup resolves cleanly and
+answers an adjacent question instead of failing loudly (2026-08-14 umbrella lesson).
+
+**Required going forward, same tier as `isolated-working-directory-at-t=0` above:** before any two
+agents (or an agent + Aaron) run `az` commands against the same subscription in the same window,
+coordinate through the bus first — announce intent, or use a scoped/non-default `az` login context
+per agent if the tooling supports it. Do not trust `caller` alone to reconstruct who did what after
+the fact; treat it the way an activity log without a genuinely per-identity credential is treated —
+suggestive, not evidence. This matters most during exactly the kind of concurrent, time-pressured
+multi-region provisioning work that surfaced it — the conditions that make a "who touched this"
+question urgent are the same conditions that make the shared-identity substrate likeliest to be hit.
