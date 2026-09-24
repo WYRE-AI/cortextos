@@ -156,17 +156,45 @@ export class AgentPTY {
     });
 
     // Claude Code shows interactive prompts on first run that must be auto-accepted
-    // when running headless (no human at the PTY). There are TWO distinct screens:
-    //   1. "trust this folder?"      — default is "Yes, I trust"  -> bare Enter accepts.
+    // when running headless (no human at the PTY). There are TWO distinct screens,
+    // and BOTH now default to the declining option (confirmed against the actual
+    // 2.1.261 TUI on 2026-09-24 — a fleet-wide exit-code-1 crash storm traced back
+    // to this — the "trust" screen used to default to "Yes, I trust" and a bare
+    // Enter no longer safe to assume):
+    //   1. "trust this folder?" — options are "1. No, exit" (DEFAULT) and
+    //      "2. Yes, I trust this folder". A bare Enter now selects "No, exit".
     //   2. "Bypass Permissions mode" (Claude Code 2.1.x+) — options are
     //      "1. No, exit" (DEFAULT) and "2. Yes, I accept". A bare Enter here would
     //      select "No, exit" and QUIT the agent (exit code 1) — the headless
     //      crash-loop. We must move the selection DOWN then confirm: Down-arrow
     //      (\x1b[B) + Enter.
-    // The screens render a few seconds apart, so poll briefly and handle each once.
-    // The TUI separates words with cursor-positioning escape codes, so we strip ANSI
-    // and match on CO-OCCURRING, prompt-specific tokens (not stray single words) so
-    // normal agent output can never trigger a stray keystroke.
+    // Both screens need the identical Down+Enter treatment. The screens render a
+    // few seconds apart, so poll briefly and handle each once. The TUI separates
+    // words with cursor-positioning escape codes, so we strip ANSI and match on
+    // CO-OCCURRING, prompt-specific tokens (not stray single words) so normal
+    // agent output can never trigger a stray keystroke.
+    //
+    // Directly reproduced on 2026-09-24 against the live 2.1.261 TUI (a
+    // fleet-wide exit-code-1 crash storm traced back to this): sending the
+    // Down-arrow the INSTANT the prompt text is first detected is too early —
+    // the widget hasn't finished mounting its key listener yet and silently
+    // drops the keystroke, so the later Enter confirms the still-default
+    // "No, exit" and the agent exits instantly. A ~1s settle delay before the
+    // Down-arrow, THEN a further ~1.5s before Enter, reproduced reliably
+    // (3/3) against the live binary; a bare 350ms confirm-delay with no
+    // settle delay failed 3/3 the same way production did.
+    const acceptDecliningDefaultPrompt = (onDone: () => void) => {
+      setTimeout(() => {
+        if (!this.pty) return;
+        this.pty.write('\x1b[B'); // arrow down to the accepting option
+        setTimeout(() => {
+          // Hardening: bootstrap-guard the deferred confirm so a late session
+          // bootstrap cannot swallow the CR into the live session.
+          if (this.pty && !this.outputBuffer.isBootstrapped()) this.pty.write('\r');
+          onDone();
+        }, 1500);
+      }, 1000);
+    };
     let trustHandled = false;
     let bypassHandled = false;
     const promptPoll = setInterval(() => {
@@ -178,22 +206,24 @@ export class AgentPTY {
         // Bypass screen: default selection is "1. No, exit". Move DOWN to
         // "2. Yes, I accept", then confirm. Bare Enter here would quit the agent.
         bypassHandled = true;
-        this.pty.write('\x1b[B'); // arrow down to "Yes, I accept"
-        setTimeout(() => {
-          // Hardening: bootstrap-guard the deferred confirm so a late session
-          // bootstrap cannot swallow the CR into the live session.
-          if (this.pty && !this.outputBuffer.isBootstrapped()) this.pty.write('\r');
+        acceptDecliningDefaultPrompt(() => {
           // Hardening: the only hazardous injection (Down+Enter) is now consumed —
           // stop polling immediately so no keystroke can reach the live session,
           // WITHOUT relying on the case-sensitive 'permissions' status-bar halt
           // (that coupling is fragile to Claude Code TUI text changes).
           clearInterval(promptPoll);
-        }, 350);
+        });
         return;
       }
       if (showingTrust && !trustHandled) {
+        // Trust screen: default selection is now "1. No, exit" (see note above).
+        // Move DOWN to "2. Yes, I trust this folder", then confirm. Bare Enter
+        // here would quit the agent instantly.
         trustHandled = true;
-        this.pty.write('\r');     // trust screen default is "Yes, I trust"
+        acceptDecliningDefaultPrompt(() => {
+          // Do NOT clear the interval here — the Bypass Permissions screen can
+          // still render a few seconds after this one and needs the same poll.
+        });
         return;
       }
       // No first-run prompt pending and the real session is up -> stop polling so we
