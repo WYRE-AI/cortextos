@@ -27,17 +27,23 @@ set -euo pipefail
 
 # The standard PATH-shim trick: strip this script's own directory out of a
 # COPY of PATH before resolving `gh`, so we find the real binary instead of
-# recursing into ourselves. Relies on this directory being PATH-prepended
-# with a trailing separator (true for how it's installed via agent .env).
-SHIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# recursing into ourselves. Compares each PATH entry's REAL (symlink- and
+# trailing-slash-resolved) directory against this script's real directory,
+# not a literal string match, so a differently-spelled or symlinked PATH
+# entry for this same directory is still caught -- this runs on every `gh`
+# call fleet-wide, so the common exact-match case is checked first (zero
+# forks) and only a non-matching entry pays for the realpath resolution.
+realpath_of() { (cd "$1" 2>/dev/null && pwd -P); } # empty output on a missing dir
+SHIM_DIR="$(realpath_of "$(dirname "${BASH_SOURCE[0]}")")"
 CLEAN_PATH=""
 IFS=: read -ra _path_entries <<< "$PATH"
 for _dir in "${_path_entries[@]}"; do
-  [[ -n "$_dir" && "$(cd "$_dir" 2>/dev/null && pwd -P)" == "$SHIM_DIR" ]] && continue
+  if [[ "$_dir" == "$SHIM_DIR" ]]; then continue; fi
+  if [[ -n "$_dir" && "$(realpath_of "$_dir")" == "$SHIM_DIR" ]]; then continue; fi
   CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$_dir"
 done
 REAL_GH="$(PATH="$CLEAN_PATH" command -v gh || true)"
-if [[ -z "$REAL_GH" || "$(cd "$(dirname "$REAL_GH")" 2>/dev/null && pwd -P)" == "$SHIM_DIR" ]]; then
+if [[ -z "$REAL_GH" || "$(realpath_of "${REAL_GH%/*}")" == "$SHIM_DIR" ]]; then
   echo "gh-shim: no real 'gh' binary found on PATH behind this shim" >&2
   exit 127
 fi
@@ -73,12 +79,10 @@ for arg in "$@"; do
     ORG="$(owner_of "$arg")"
     break
   fi
-  if [[ "$arg" == --repo=* || "$arg" == -R?* ]]; then
-    repo_val="${arg#--repo=}"
-    repo_val="${repo_val#-R}"
-    ORG="$(owner_of "$repo_val")"
-    break
-  fi
+  case "$arg" in
+    --repo=*) ORG="$(owner_of "${arg#--repo=}")"; break ;;
+    -R?*) ORG="$(owner_of "${arg#-R}")"; break ;;
+  esac
   # 2) `gh api repos/OWNER/REPO/...` — the canonical form for calls made
   # outside any checkout (no --repo flag at all). Without this, e.g.
   # `gh api repos/WYRE-AI/conduit/pulls/123/comments` from a non-checkout

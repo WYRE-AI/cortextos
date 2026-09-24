@@ -9,8 +9,7 @@ import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
 import { WsUnixJsonRpcClient, type JsonRpcResponse } from '../utils/ws-unix-client.js';
-import { applyEnvAssignment } from './agent-pty.js';
-import { parseEnvFile } from '../utils/env.js';
+import { loadEnvFileInto } from './agent-pty.js';
 
 interface IPty {
   pid: number;
@@ -1004,9 +1003,9 @@ export class CodexAppServerPTY {
     env['CTX_PROJECT_ROOT'] = this._env.projectRoot;
 
     if (this._env.org && this._env.projectRoot) {
-      this.loadEnvFile(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env);
+      loadEnvFileInto(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env);
     }
-    this.loadEnvFile(join(this._env.agentDir, '.env'), env);
+    loadEnvFileInto(join(this._env.agentDir, '.env'), env);
 
     if (env['CHAT_ID']) env['CTX_TELEGRAM_CHAT_ID'] = env['CHAT_ID'];
     if (this._config.timezone) {
@@ -1015,17 +1014,6 @@ export class CodexAppServerPTY {
     }
 
     return env;
-  }
-
-  private loadEnvFile(path: string, env: Record<string, string>): void {
-    // Use the shared parser (handles BOM/CRLF/quotes/inline-comments) rather
-    // than a hand-rolled split/trim — a quoted PATH value (e.g. from a
-    // shared secrets.env) must have its quotes stripped before
-    // applyEnvAssignment prepends it, or the shim directory it names is
-    // never found on PATH.
-    for (const [key, value] of Object.entries(parseEnvFile(path))) {
-      applyEnvAssignment(env, key, value);
-    }
   }
 
   private getPackageVersion(): string {
