@@ -41,4 +41,28 @@ TOKEN="$(cortex-secret run --context conduit -- cortextos bus gh-app-token --org
   || die "failed to mint a GitHub App token for org \"$ORG\" (check GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY via cortex-secret --context conduit)"
 [[ -z "$TOKEN" ]] && die "gh-app-token returned no token for org \"$ORG\""
 
+# GH_TOKEN only authenticates gh's OWN API calls (creating the PR/comment
+# object itself). A command that also needs to push an unpushed branch
+# (e.g. `gh pr create`) shells out to system `git`, which authenticates
+# that push over whatever protocol `origin` uses -- an SSH-configured
+# origin (the default on this shared Mac: `git@github.com:...`) pushes
+# with the LOCAL machine's SSH key, silently using the ambient personal
+# identity despite this wrapper's entire purpose (caught by CodeRabbit on
+# PR #202; confirmed this repo's own origin is in fact SSH-configured).
+#
+# Force every git-level network op made by this one process tree onto
+# HTTPS with the same bot token, via env-scoped git config overrides
+# (GIT_CONFIG_*, the same mechanism GitHub Actions' own checkout action
+# uses). These apply ONLY to this exec'd `gh` process and its children --
+# never touching the shared repo's or global git config file -- so they
+# are safe to set on a checkout other agents use concurrently. A push
+# over an already-HTTPS origin is authenticated the same way, closing the
+# same gap there too (an HTTPS origin's own credential helper might
+# otherwise supply a stale personal credential instead of this token).
+AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')"
+GIT_CONFIG_COUNT=2 \
+GIT_CONFIG_KEY_0="url.https://github.com/.insteadOf" \
+GIT_CONFIG_VALUE_0="git@github.com:" \
+GIT_CONFIG_KEY_1="http.https://github.com/.extraheader" \
+GIT_CONFIG_VALUE_1="$AUTH_HEADER" \
 GH_TOKEN="$TOKEN" exec gh "$@"

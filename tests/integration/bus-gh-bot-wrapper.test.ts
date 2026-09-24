@@ -153,6 +153,51 @@ echo "ARGS: $*"
     expect(stderr).toMatch(/could not determine the org/);
   });
 
+  it("forces git-level pushes onto HTTPS with the bot token, even over an SSH origin", async () => {
+    // `gh pr create` can push via system `git`, which authenticates
+    // per the origin's protocol -- an SSH origin (this repo's own real
+    // default) would otherwise push with the local SSH key, not the bot
+    // token. The wrapper must hand `gh`'s child `git` process env-scoped
+    // config that redirects github.com SSH URLs to HTTPS and attaches the
+    // token as an Authorization header (verified end-to-end with a real
+    // `git ls-remote` + GIT_TRACE against a fake SSH origin in a separate,
+    // non-mocked check; here we assert the wrapper actually sets it).
+    await initGitRepo("git@github.com:WYRE-AI/conduit.git");
+    writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "push-safe-token"));
+    writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+    writeFakeExe(
+      "gh",
+      `
+echo "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT"
+echo "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0"
+echo "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0"
+echo "GIT_CONFIG_KEY_1=$GIT_CONFIG_KEY_1"
+echo "GIT_CONFIG_VALUE_1=$GIT_CONFIG_VALUE_1"
+`,
+    );
+
+    const { stdout, code } = await runWrapper(
+      ["pr", "create", "--title", "x"],
+      fakeRepo,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GIT_CONFIG_COUNT=2");
+    expect(stdout).toContain(
+      "GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf",
+    );
+    expect(stdout).toContain("GIT_CONFIG_VALUE_0=git@github.com:");
+    expect(stdout).toContain(
+      "GIT_CONFIG_KEY_1=http.https://github.com/.extraheader",
+    );
+    expect(stdout).toContain("GIT_CONFIG_VALUE_1=AUTHORIZATION: basic ");
+    // The token must actually be in the header (base64 of
+    // x-access-token:push-safe-token), not just any header.
+    const expectedAuth = Buffer.from("x-access-token:push-safe-token").toString(
+      "base64",
+    );
+    expect(stdout).toContain(expectedAuth);
+  });
+
   it("fails loudly, and never runs gh, when token minting fails", async () => {
     await initGitRepo("git@github.com:WYRE-AI/conduit.git");
     writeFakeExe("cortextos", `echo "boom: bad creds" >&2; exit 1`);
