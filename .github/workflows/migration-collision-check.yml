@@ -74,6 +74,7 @@ jobs:
           import re
           import subprocess
           import sys
+          from urllib.parse import quote
 
           # normpath collapses a leading './' / trailing '/' / doubled slashes so
           # this matches the API's filename strings ("migrations/001_x.sql"),
@@ -209,6 +210,41 @@ jobs:
 
           collisions = []  # list of (number, our_file, where_str)
 
+          def emit_collisions():
+              """Print one annotation per accumulated collision. Returns True
+              when there was at least one. Used both at the end and if the
+              open-PR listing fails, so a base-branch collision already found
+              via git is not swallowed by an API error."""
+              if not collisions:
+                  return False
+              print(f"::error::Found {len(collisions)} migration-number collision(s).")
+              for n, f, where in collisions:
+                  print(
+                      f"::error file={f}::Migration number {n} (this PR introduces {f}) "
+                      f"collides {where}. Renumber to the next available value."
+                  )
+              return True
+
+
+          def fail_open_pr_listing(endpoint, detail):
+              """Listing other open PRs failed. Fail closed, and still report
+              any base-branch collisions already accumulated (that check uses
+              git, not the API)."""
+              detail = ' '.join((detail or '').split())
+              if len(detail) > 500:
+                  detail = detail[:500] + '...'
+              if not detail:
+                  detail = 'gh exited non-zero with no output'
+              # Workflow-command data: a literal % in stderr is an escape.
+              detail = detail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(
+                  f"::error::Failed to list open pull requests (GET {endpoint}). "
+                  f"This is an API failure, not a detected migration collision. {detail}"
+              )
+              emit_collisions()
+              sys.exit(1)
+
+
           # Check 1: collide with base branch.
           for n, f in pr_new_by_num.items():
               if n in base_by_num:
@@ -235,14 +271,37 @@ jobs:
           # page's JSON array as a separate top-level value, not one valid
           # document; `--slurp` wraps every page into one array of
           # page-arrays instead, flattened just below.
-          prs_raw = subprocess.check_output(
-              ['gh', 'api', f'repos/{REPO}/pulls', '--paginate', '--slurp',
-               '-f', 'state=open', '-f', f'base={BASE_REF}',
-               '-f', 'per_page=100'],
-              text=True,
+          #
+          # Those filters MUST be a query string on a GET. `gh api -f` /
+          # `--raw-field` defaults to POST whenever any field is present
+          # (gh help: adding request parameters switches the method to POST;
+          # `--method GET` is required to send them as a query string).
+          # POST /repos/{owner}/{repo}/pulls creates a pull request, which
+          # GITHUB_TOKEN cannot do, so the call fails HTTP 403 "Resource not
+          # accessible by integration". That 403 is not a permissions gap on
+          # GET listing and not a migration collision. Putting the parameters
+          # in the URL keeps the call a GET even if a later edit drops a
+          # method flag. `quote` keeps a base ref containing `/` inside the
+          # `base` value.
+          list_endpoint = (
+              f"repos/{REPO}/pulls?state=open&base={quote(BASE_REF, safe='')}&per_page=100"
           )
+          list_proc = subprocess.run(
+              ['gh', 'api', list_endpoint, '--paginate', '--slurp'],
+              text=True,
+              capture_output=True,
+          )
+          if list_proc.returncode != 0:
+              fail_open_pr_listing(
+                  list_endpoint,
+                  list_proc.stderr or list_proc.stdout or '',
+              )
+          try:
+              pr_pages = json.loads(list_proc.stdout)
+          except json.JSONDecodeError as e:
+              fail_open_pr_listing(list_endpoint, f"malformed JSON from open-PR listing: {e}")
           others = [
-              p for page in json.loads(prs_raw) for p in page
+              p for page in pr_pages for p in page
               if not p['draft'] and p['number'] != PR_NUMBER
           ]
 
@@ -287,6 +346,7 @@ jobs:
                       continue
                   print(f"::error::Could not enumerate files for open PR #{other_num} — "
                         f"failing rather than silently skipping a collision check")
+                  emit_collisions()
                   sys.exit(1)
               try:
                   files_data = [item for page in json.loads(files_raw) for item in page]
@@ -296,6 +356,7 @@ jobs:
                       continue
                   print(f"::error::Malformed file listing for open PR #{other_num} — "
                         f"failing rather than silently skipping a collision check")
+                  emit_collisions()
                   sys.exit(1)
               for fdata in files_data:
                   status = fdata.get('status')
@@ -328,13 +389,7 @@ jobs:
                           (on, pr_new_by_num[on], f"in open PR #{other_num} as {path}")
                       )
 
-          if collisions:
-              print(f"::error::Found {len(collisions)} migration-number collision(s).")
-              for n, f, where in collisions:
-                  print(
-                      f"::error file={f}::Migration number {n} (this PR introduces {f}) "
-                      f"collides {where}. Renumber to the next available value."
-                  )
+          if emit_collisions():
               sys.exit(1)
 
           print(
