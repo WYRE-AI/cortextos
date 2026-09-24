@@ -4,6 +4,30 @@ import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import { injectMessage as injectMessageIntoPty } from './inject.js';
+import { parseEnvFile } from '../utils/env.js';
+
+/**
+ * Applies one `KEY=value` pair parsed from an org secrets.env / agent .env
+ * file (see parseEnvFile in ../utils/env.js) onto a PTY environment map.
+ *
+ * PATH is special-cased to PREPEND rather than overwrite. getBaseEnv()
+ * seeds ptyEnv.PATH from the daemon's own process.env.PATH (node, git,
+ * homebrew, etc.); a plain assignment here would silently replace that
+ * whole value with just the .env line's contents, breaking every other
+ * binary lookup for that agent. parseEnvFile has no shell semantics, so a
+ * line like `PATH="/dir:$PATH"` can't be used to express a prepend either
+ * — $PATH is never expanded. A bare `PATH=/dir` line is the correct and
+ * only form; this function is what makes it mean "prepend /dir",
+ * consistently for both the org- and agent-level loaders in buildPtyEnv.
+ * See task_1790244063432 (gh CLI PATH-shim).
+ */
+export function applyEnvAssignment(ptyEnv: Record<string, string>, key: string, value: string): void {
+  if (key === 'PATH') {
+    ptyEnv['PATH'] = ptyEnv['PATH'] ? `${value}:${ptyEnv['PATH']}` : value;
+    return;
+  }
+  ptyEnv[key] = value;
+}
 
 /**
  * Is `binary` resolvable on PATH and executable RIGHT NOW?
@@ -96,80 +120,7 @@ export class AgentPTY {
 
     const cwd = this.config.working_directory || this.env.agentDir || process.cwd();
 
-    // Build environment variables for the PTY process
-    const ptyEnv: Record<string, string> = {
-      ...this.getBaseEnv(),
-      CTX_INSTANCE_ID: this.env.instanceId,
-      CTX_ROOT: this.env.ctxRoot,
-      CTX_FRAMEWORK_ROOT: this.env.frameworkRoot,
-      CTX_AGENT_NAME: this.env.agentName,
-      CTX_ORG: this.env.org,
-      CTX_AGENT_DIR: this.env.agentDir,
-      CTX_PROJECT_ROOT: this.env.projectRoot,
-      // Backward compat
-      CRM_AGENT_NAME: this.env.agentName,
-      CRM_TEMPLATE_ROOT: this.env.frameworkRoot,
-    };
-
-    // Source org-level shared secrets (orgs/{org}/secrets.env).
-    // These are shared across all agents in the org: OPENAI_KEY, APIFY_TOKEN, GEMINI_API_KEY, etc.
-    // Agent .env is loaded after and overrides org values — agent-specific keys win.
-    if (this.env.org && this.env.projectRoot) {
-      const orgEnvFile = join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env');
-      if (existsSync(orgEnvFile)) {
-        const content = readFileSync(orgEnvFile, 'utf-8');
-        for (const line of content.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const eqIdx = trimmed.indexOf('=');
-          if (eqIdx > 0) {
-            ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-          }
-        }
-      }
-    }
-
-    // Source agent .env file (overrides org secrets.env for same key names).
-    // Contains agent-specific secrets: BOT_TOKEN, CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN.
-    const agentEnvFile = join(this.env.agentDir, '.env');
-    if (existsSync(agentEnvFile)) {
-      const content = readFileSync(agentEnvFile, 'utf-8');
-      for (const line of content.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const eqIdx = trimmed.indexOf('=');
-        if (eqIdx > 0) {
-          ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-        }
-      }
-    }
-
-    // Add convenience CTX_* aliases used throughout agent templates.
-    // CTX_TELEGRAM_CHAT_ID: alias for CHAT_ID from the agent's .env
-    if (ptyEnv['CHAT_ID']) {
-      ptyEnv['CTX_TELEGRAM_CHAT_ID'] = ptyEnv['CHAT_ID'];
-    }
-    // CTX_TIMEZONE: from config.json timezone field, falls back to system TZ
-    const configTimezone = this.config.timezone;
-    if (configTimezone) {
-      ptyEnv['CTX_TIMEZONE'] = configTimezone;
-      ptyEnv['TZ'] = configTimezone; // also set TZ so date/time system calls use correct zone
-    } else if (process.env.TZ) {
-      ptyEnv['CTX_TIMEZONE'] = process.env.TZ;
-    }
-    // CTX_ORCHESTRATOR_AGENT: read from org context.json so agents can route to orchestrator
-    if (this.env.projectRoot && this.env.org) {
-      try {
-        const contextPath = join(this.env.projectRoot, 'orgs', this.env.org, 'context.json');
-        if (existsSync(contextPath)) {
-          const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
-          if (ctx.orchestrator) {
-            ptyEnv['CTX_ORCHESTRATOR_AGENT'] = ctx.orchestrator;
-          }
-        }
-      } catch { /* leave unset if context.json is missing or malformed */ }
-    }
-
+    const ptyEnv = this.buildPtyEnv();
     this.customizeEnv(ptyEnv);
 
     // Spawn the agent binary directly (no shell wrapper) — cross-platform, no shell escaping needed.
@@ -419,6 +370,74 @@ export class AgentPTY {
   /**
    * Get a clean base environment (excluding potentially harmful vars).
    */
+  /**
+   * Builds the full PTY environment: base env, CTX_ and CRM_ identity vars,
+   * org secrets.env, agent .env (each layer overriding the previous for
+   * shared keys — PATH excepted, see applyEnvAssignment), and derived
+   * CTX_* aliases. Extracted from spawn() so it's independently testable
+   * without touching node-pty.
+   */
+  private buildPtyEnv(): Record<string, string> {
+    const ptyEnv: Record<string, string> = {
+      ...this.getBaseEnv(),
+      CTX_INSTANCE_ID: this.env.instanceId,
+      CTX_ROOT: this.env.ctxRoot,
+      CTX_FRAMEWORK_ROOT: this.env.frameworkRoot,
+      CTX_AGENT_NAME: this.env.agentName,
+      CTX_ORG: this.env.org,
+      CTX_AGENT_DIR: this.env.agentDir,
+      CTX_PROJECT_ROOT: this.env.projectRoot,
+      // Backward compat
+      CRM_AGENT_NAME: this.env.agentName,
+      CRM_TEMPLATE_ROOT: this.env.frameworkRoot,
+    };
+
+    // Source org-level shared secrets (orgs/{org}/secrets.env).
+    // These are shared across all agents in the org: OPENAI_KEY, APIFY_TOKEN, GEMINI_API_KEY, etc.
+    // Agent .env is loaded after and overrides org values — agent-specific keys win.
+    if (this.env.org && this.env.projectRoot) {
+      const orgEnvFile = join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env');
+      for (const [key, value] of Object.entries(parseEnvFile(orgEnvFile))) {
+        applyEnvAssignment(ptyEnv, key, value);
+      }
+    }
+
+    // Source agent .env file (overrides org secrets.env for same key names).
+    // Contains agent-specific secrets: BOT_TOKEN, CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN.
+    const agentEnvFile = join(this.env.agentDir, '.env');
+    for (const [key, value] of Object.entries(parseEnvFile(agentEnvFile))) {
+      applyEnvAssignment(ptyEnv, key, value);
+    }
+
+    // Add convenience CTX_* aliases used throughout agent templates.
+    // CTX_TELEGRAM_CHAT_ID: alias for CHAT_ID from the agent's .env
+    if (ptyEnv['CHAT_ID']) {
+      ptyEnv['CTX_TELEGRAM_CHAT_ID'] = ptyEnv['CHAT_ID'];
+    }
+    // CTX_TIMEZONE: from config.json timezone field, falls back to system TZ
+    const configTimezone = this.config.timezone;
+    if (configTimezone) {
+      ptyEnv['CTX_TIMEZONE'] = configTimezone;
+      ptyEnv['TZ'] = configTimezone; // also set TZ so date/time system calls use correct zone
+    } else if (process.env.TZ) {
+      ptyEnv['CTX_TIMEZONE'] = process.env.TZ;
+    }
+    // CTX_ORCHESTRATOR_AGENT: read from org context.json so agents can route to orchestrator
+    if (this.env.projectRoot && this.env.org) {
+      try {
+        const contextPath = join(this.env.projectRoot, 'orgs', this.env.org, 'context.json');
+        if (existsSync(contextPath)) {
+          const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
+          if (ctx.orchestrator) {
+            ptyEnv['CTX_ORCHESTRATOR_AGENT'] = ctx.orchestrator;
+          }
+        }
+      } catch { /* leave unset if context.json is missing or malformed */ }
+    }
+
+    return ptyEnv;
+  }
+
   private getBaseEnv(): Record<string, string> {
     const env: Record<string, string> = {};
     // Copy essential env vars
