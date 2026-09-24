@@ -30,6 +30,19 @@ export function applyEnvAssignment(ptyEnv: Record<string, string>, key: string, 
 }
 
 /**
+ * Parses an env file and applies every assignment onto a PTY environment
+ * map via applyEnvAssignment (so PATH is prepended, never overwritten).
+ * Shared by both PTY implementations (AgentPTY.buildPtyEnv and
+ * CodexAppServerPTY.buildEnv) so a fix to either the parser or the PATH
+ * special-case only has to be made once.
+ */
+export function loadEnvFileInto(filePath: string, ptyEnv: Record<string, string>): void {
+  for (const [key, value] of Object.entries(parseEnvFile(filePath))) {
+    applyEnvAssignment(ptyEnv, key, value);
+  }
+}
+
+/**
  * Is `binary` resolvable on PATH and executable RIGHT NOW?
  *
  * Used by AgentProcess.handleExit() to tell "the agent crashed" apart from
@@ -44,8 +57,7 @@ export function applyEnvAssignment(ptyEnv: Record<string, string>, key: string, 
  * in-flight installer) fails the X_OK check and is likewise reported missing.
  */
 export function isBinaryAvailable(binary: string): boolean {
-  const sep = platform() === 'win32' ? ';' : ':';
-  const pathDirs = (process.env.PATH || '').split(sep).filter(Boolean);
+  const pathDirs = (process.env.PATH || '').split(delimiter).filter(Boolean);
   for (const dir of pathDirs) {
     const candidate = join(dir, binary);
     if (!existsSync(candidate)) continue;
@@ -432,17 +444,13 @@ export class AgentPTY {
     // Agent .env is loaded after and overrides org values — agent-specific keys win.
     if (this.env.org && this.env.projectRoot) {
       const orgEnvFile = join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env');
-      for (const [key, value] of Object.entries(parseEnvFile(orgEnvFile))) {
-        applyEnvAssignment(ptyEnv, key, value);
-      }
+      loadEnvFileInto(orgEnvFile, ptyEnv);
     }
 
     // Source agent .env file (overrides org secrets.env for same key names).
     // Contains agent-specific secrets: BOT_TOKEN, CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN.
     const agentEnvFile = join(this.env.agentDir, '.env');
-    for (const [key, value] of Object.entries(parseEnvFile(agentEnvFile))) {
-      applyEnvAssignment(ptyEnv, key, value);
-    }
+    loadEnvFileInto(agentEnvFile, ptyEnv);
 
     // Add convenience CTX_* aliases used throughout agent templates.
     // CTX_TELEGRAM_CHAT_ID: alias for CHAT_ID from the agent's .env
