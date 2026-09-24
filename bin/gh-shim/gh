@@ -29,9 +29,15 @@ set -euo pipefail
 # COPY of PATH before resolving `gh`, so we find the real binary instead of
 # recursing into ourselves. Relies on this directory being PATH-prepended
 # with a trailing separator (true for how it's installed via agent .env).
-SHIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REAL_GH="$(PATH="${PATH//$SHIM_DIR:/}" command -v gh || true)"
-if [[ -z "$REAL_GH" || "$REAL_GH" == "${BASH_SOURCE[0]}" ]]; then
+SHIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+CLEAN_PATH=""
+IFS=: read -ra _path_entries <<< "$PATH"
+for _dir in "${_path_entries[@]}"; do
+  [[ -n "$_dir" && "$(cd "$_dir" 2>/dev/null && pwd -P)" == "$SHIM_DIR" ]] && continue
+  CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$_dir"
+done
+REAL_GH="$(PATH="$CLEAN_PATH" command -v gh || true)"
+if [[ -z "$REAL_GH" || "$(cd "$(dirname "$REAL_GH")" 2>/dev/null && pwd -P)" == "$SHIM_DIR" ]]; then
   echo "gh-shim: no real 'gh' binary found on PATH behind this shim" >&2
   exit 127
 fi
@@ -48,18 +54,29 @@ is_allowlisted() {
   return 1
 }
 
+# [HOST/]OWNER/REPO -> OWNER (strips an optional leading host segment, e.g.
+# "github.com/WYRE-AI/conduit" or the attached "-R" form below).
+owner_of() {
+  local val="$1"
+  if [[ "$val" == */*/* ]]; then val="${val#*/}"; fi
+  printf '%s' "${val%%/*}"
+}
+
 # 1) --repo/-R OWNER/REPO anywhere in the args (gh's own flag for "not
 #    inside a checkout" calls -- e.g. `gh pr view 123 --repo OWNER/REPO`).
+#    Handles --repo=OWNER/REPO, an attached -ROWNER/REPO, and an optional
+#    HOST/ prefix on any of these forms.
 ORG=""
 prev=""
 for arg in "$@"; do
   if [[ "$prev" == "--repo" || "$prev" == "-R" ]]; then
-    ORG="${arg%%/*}"
+    ORG="$(owner_of "$arg")"
     break
   fi
-  if [[ "$arg" == --repo=* ]]; then
-    ORG="${arg#--repo=}"
-    ORG="${ORG%%/*}"
+  if [[ "$arg" == --repo=* || "$arg" == -R?* ]]; then
+    repo_val="${arg#--repo=}"
+    repo_val="${repo_val#-R}"
+    ORG="$(owner_of "$repo_val")"
     break
   fi
   # 2) `gh api repos/OWNER/REPO/...` — the canonical form for calls made
@@ -68,8 +85,9 @@ for arg in "$@"; do
   # cwd falls through to the origin-remote check below, finds nothing, and
   # silently uses ambient auth — reproducing the exact bug this shim
   # exists to fix, with no signal (unlike bus/gh-bot.sh, which dies loudly
-  # on an undetermined org).
-  if [[ "$arg" =~ ^repos/([^/]+)/ ]]; then
+  # on an undetermined org). Also accepts a leading slash (`gh api` allows
+  # both `repos/...` and `/repos/...`).
+  if [[ "$arg" =~ ^/?repos/([^/]+)/ ]]; then
     ORG="${BASH_REMATCH[1]}"
     break
   fi
@@ -125,9 +143,10 @@ if [[ -z "$TOKEN" ]]; then
     # file, never a partial write -- no locking needed. mkdir here (not
     # unconditionally at startup) since a warm cache hit never needs it.
     mkdir -p "$CACHE_DIR" 2>/dev/null || true
-    TMP="$(mktemp "$CACHE_DIR/.${ORG,,}.token.XXXXXX")"
-    printf '%s\n%s\n' "$NOW" "$TOKEN" > "$TMP"
-    mv -f "$TMP" "$CACHE_FILE"
+    if TMP="$(mktemp "$CACHE_DIR/.${ORG,,}.token.XXXXXX" 2>/dev/null)"; then
+      { printf '%s\n%s\n' "$NOW" "$TOKEN" > "$TMP" && mv -f "$TMP" "$CACHE_FILE"; } 2>/dev/null \
+        || rm -f "$TMP"
+    fi
   else
     echo "gh-shim: WARNING -- failed to mint a wyre-agent-fleet token for org \"$ORG\"; falling back to ambient gh auth for this call (check GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY via cortex-secret --context conduit)" >&2
     # Also log-event, not just stderr -- a stderr line inside some other

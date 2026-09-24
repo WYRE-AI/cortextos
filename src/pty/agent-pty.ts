@@ -1,4 +1,4 @@
-import { join } from 'path';
+import { join, delimiter } from 'path';
 import { existsSync, readFileSync, readdirSync, accessSync, constants } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
@@ -23,7 +23,7 @@ import { parseEnvFile } from '../utils/env.js';
  */
 export function applyEnvAssignment(ptyEnv: Record<string, string>, key: string, value: string): void {
   if (key === 'PATH') {
-    ptyEnv['PATH'] = ptyEnv['PATH'] ? `${value}:${ptyEnv['PATH']}` : value;
+    ptyEnv['PATH'] = ptyEnv['PATH'] ? `${value}${delimiter}${ptyEnv['PATH']}` : value;
     return;
   }
   ptyEnv[key] = value;
@@ -184,13 +184,18 @@ export class AgentPTY {
     // (3/3) against the live binary; a bare 350ms confirm-delay with no
     // settle delay failed 3/3 the same way production did.
     const acceptDecliningDefaultPrompt = (onDone: () => void) => {
+      // Bind both delayed writes to the PTY that actually showed this prompt.
+      // A kill()+respawn() inside the 1-2.5s delay window replaces `this.pty`
+      // with an unrelated live session; without this identity check the
+      // Down/Enter keystrokes meant for the dead prompt would land there.
+      const promptPty = this.pty;
       setTimeout(() => {
-        if (!this.pty) return;
+        if (!this.pty || this.pty !== promptPty || this.outputBuffer.isBootstrapped()) return;
         this.pty.write('\x1b[B'); // arrow down to the accepting option
         setTimeout(() => {
           // Hardening: bootstrap-guard the deferred confirm so a late session
           // bootstrap cannot swallow the CR into the live session.
-          if (this.pty && !this.outputBuffer.isBootstrapped()) this.pty.write('\r');
+          if (this.pty && this.pty === promptPty && !this.outputBuffer.isBootstrapped()) this.pty.write('\r');
           onDone();
         }, 1500);
       }, 1000);

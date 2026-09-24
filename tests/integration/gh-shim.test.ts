@@ -97,6 +97,11 @@ async function runShim(
       cwd,
       env: {
         ...process.env,
+        // Clear any ambient GH_TOKEN/GITHUB_TOKEN from the dev/CI shell —
+        // otherwise the "no token injected" assertions below can pass or
+        // fail depending on what the running shell happens to export.
+        GH_TOKEN: "",
+        GITHUB_TOKEN: "",
         // Shim dir first (as installed), real fakes behind it — exercises
         // the shim's own self-exclusion PATH-stripping logic for real.
         PATH: `${shimDir}:${realBin}:${process.env.PATH}`,
@@ -193,6 +198,45 @@ describe.skipIf(!existsSync(SHIM))("bin/gh-shim/gh", () => {
     );
     expect(code).toBe(0);
     expect(stdout).toContain("GH_TOKEN=minted-token-api");
+  });
+
+  it("mints a token for an allowlisted org via a `gh api /repos/OWNER/REPO/...` path with a leading slash", async () => {
+    writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "minted-token-leading-slash"));
+    writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+    writeFakeExe("gh", `echo "GH_TOKEN=$GH_TOKEN"`);
+
+    const { stdout, code } = await runShim(
+      ["api", "/repos/WYRE-AI/conduit/pulls/123/comments"],
+      fakeRepo,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GH_TOKEN=minted-token-leading-slash");
+  });
+
+  it("mints a token for an allowlisted org via a host-prefixed `--repo HOST/OWNER/REPO`", async () => {
+    writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "minted-token-host-prefixed"));
+    writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+    writeFakeExe("gh", `echo "GH_TOKEN=$GH_TOKEN"`);
+
+    const { stdout, code } = await runShim(
+      ["pr", "view", "123", "--repo", "github.com/WYRE-AI/conduit"],
+      fakeRepo,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GH_TOKEN=minted-token-host-prefixed");
+  });
+
+  it("mints a token for an allowlisted org via the attached `-ROWNER/REPO` form", async () => {
+    writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "minted-token-attached-R"));
+    writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+    writeFakeExe("gh", `echo "GH_TOKEN=$GH_TOKEN"`);
+
+    const { stdout, code } = await runShim(
+      ["pr", "view", "123", "-RWYRE-AI/conduit"],
+      fakeRepo,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GH_TOKEN=minted-token-attached-R");
   });
 
   it("mints a token for an allowlisted org via cwd's origin remote", async () => {
