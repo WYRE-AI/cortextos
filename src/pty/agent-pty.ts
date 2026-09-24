@@ -1,9 +1,46 @@
-import { join } from 'path';
+import { join, delimiter } from 'path';
 import { existsSync, readFileSync, readdirSync, accessSync, constants } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import { injectMessage as injectMessageIntoPty } from './inject.js';
+import { parseEnvFile } from '../utils/env.js';
+
+/**
+ * Applies one `KEY=value` pair parsed from an org secrets.env / agent .env
+ * file (see parseEnvFile in ../utils/env.js) onto a PTY environment map.
+ *
+ * PATH is special-cased to PREPEND rather than overwrite. getBaseEnv()
+ * seeds ptyEnv.PATH from the daemon's own process.env.PATH (node, git,
+ * homebrew, etc.); a plain assignment here would silently replace that
+ * whole value with just the .env line's contents, breaking every other
+ * binary lookup for that agent. parseEnvFile has no shell semantics, so a
+ * line like `PATH="/dir:$PATH"` can't be used to express a prepend either
+ * — $PATH is never expanded. A bare `PATH=/dir` line is the correct and
+ * only form; this function is what makes it mean "prepend /dir",
+ * consistently for both the org- and agent-level loaders in buildPtyEnv.
+ * See task_1790244063432 (gh CLI PATH-shim).
+ */
+export function applyEnvAssignment(ptyEnv: Record<string, string>, key: string, value: string): void {
+  if (key === 'PATH') {
+    ptyEnv['PATH'] = ptyEnv['PATH'] ? `${value}${delimiter}${ptyEnv['PATH']}` : value;
+    return;
+  }
+  ptyEnv[key] = value;
+}
+
+/**
+ * Parses an env file and applies every assignment onto a PTY environment
+ * map via applyEnvAssignment (so PATH is prepended, never overwritten).
+ * Shared by both PTY implementations (AgentPTY.buildPtyEnv and
+ * CodexAppServerPTY.buildEnv) so a fix to either the parser or the PATH
+ * special-case only has to be made once.
+ */
+export function loadEnvFileInto(filePath: string, ptyEnv: Record<string, string>): void {
+  for (const [key, value] of Object.entries(parseEnvFile(filePath))) {
+    applyEnvAssignment(ptyEnv, key, value);
+  }
+}
 
 /**
  * Is `binary` resolvable on PATH and executable RIGHT NOW?
@@ -20,8 +57,7 @@ import { injectMessage as injectMessageIntoPty } from './inject.js';
  * in-flight installer) fails the X_OK check and is likewise reported missing.
  */
 export function isBinaryAvailable(binary: string): boolean {
-  const sep = platform() === 'win32' ? ';' : ':';
-  const pathDirs = (process.env.PATH || '').split(sep).filter(Boolean);
+  const pathDirs = (process.env.PATH || '').split(delimiter).filter(Boolean);
   for (const dir of pathDirs) {
     const candidate = join(dir, binary);
     if (!existsSync(candidate)) continue;
@@ -96,80 +132,7 @@ export class AgentPTY {
 
     const cwd = this.config.working_directory || this.env.agentDir || process.cwd();
 
-    // Build environment variables for the PTY process
-    const ptyEnv: Record<string, string> = {
-      ...this.getBaseEnv(),
-      CTX_INSTANCE_ID: this.env.instanceId,
-      CTX_ROOT: this.env.ctxRoot,
-      CTX_FRAMEWORK_ROOT: this.env.frameworkRoot,
-      CTX_AGENT_NAME: this.env.agentName,
-      CTX_ORG: this.env.org,
-      CTX_AGENT_DIR: this.env.agentDir,
-      CTX_PROJECT_ROOT: this.env.projectRoot,
-      // Backward compat
-      CRM_AGENT_NAME: this.env.agentName,
-      CRM_TEMPLATE_ROOT: this.env.frameworkRoot,
-    };
-
-    // Source org-level shared secrets (orgs/{org}/secrets.env).
-    // These are shared across all agents in the org: OPENAI_KEY, APIFY_TOKEN, GEMINI_API_KEY, etc.
-    // Agent .env is loaded after and overrides org values — agent-specific keys win.
-    if (this.env.org && this.env.projectRoot) {
-      const orgEnvFile = join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env');
-      if (existsSync(orgEnvFile)) {
-        const content = readFileSync(orgEnvFile, 'utf-8');
-        for (const line of content.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const eqIdx = trimmed.indexOf('=');
-          if (eqIdx > 0) {
-            ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-          }
-        }
-      }
-    }
-
-    // Source agent .env file (overrides org secrets.env for same key names).
-    // Contains agent-specific secrets: BOT_TOKEN, CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN.
-    const agentEnvFile = join(this.env.agentDir, '.env');
-    if (existsSync(agentEnvFile)) {
-      const content = readFileSync(agentEnvFile, 'utf-8');
-      for (const line of content.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const eqIdx = trimmed.indexOf('=');
-        if (eqIdx > 0) {
-          ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-        }
-      }
-    }
-
-    // Add convenience CTX_* aliases used throughout agent templates.
-    // CTX_TELEGRAM_CHAT_ID: alias for CHAT_ID from the agent's .env
-    if (ptyEnv['CHAT_ID']) {
-      ptyEnv['CTX_TELEGRAM_CHAT_ID'] = ptyEnv['CHAT_ID'];
-    }
-    // CTX_TIMEZONE: from config.json timezone field, falls back to system TZ
-    const configTimezone = this.config.timezone;
-    if (configTimezone) {
-      ptyEnv['CTX_TIMEZONE'] = configTimezone;
-      ptyEnv['TZ'] = configTimezone; // also set TZ so date/time system calls use correct zone
-    } else if (process.env.TZ) {
-      ptyEnv['CTX_TIMEZONE'] = process.env.TZ;
-    }
-    // CTX_ORCHESTRATOR_AGENT: read from org context.json so agents can route to orchestrator
-    if (this.env.projectRoot && this.env.org) {
-      try {
-        const contextPath = join(this.env.projectRoot, 'orgs', this.env.org, 'context.json');
-        if (existsSync(contextPath)) {
-          const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
-          if (ctx.orchestrator) {
-            ptyEnv['CTX_ORCHESTRATOR_AGENT'] = ctx.orchestrator;
-          }
-        }
-      } catch { /* leave unset if context.json is missing or malformed */ }
-    }
-
+    const ptyEnv = this.buildPtyEnv();
     this.customizeEnv(ptyEnv);
 
     // Spawn the agent binary directly (no shell wrapper) — cross-platform, no shell escaping needed.
@@ -205,17 +168,50 @@ export class AgentPTY {
     });
 
     // Claude Code shows interactive prompts on first run that must be auto-accepted
-    // when running headless (no human at the PTY). There are TWO distinct screens:
-    //   1. "trust this folder?"      — default is "Yes, I trust"  -> bare Enter accepts.
+    // when running headless (no human at the PTY). There are TWO distinct screens,
+    // and BOTH now default to the declining option (confirmed against the actual
+    // 2.1.261 TUI on 2026-09-24 — a fleet-wide exit-code-1 crash storm traced back
+    // to this — the "trust" screen used to default to "Yes, I trust" and a bare
+    // Enter no longer safe to assume):
+    //   1. "trust this folder?" — options are "1. No, exit" (DEFAULT) and
+    //      "2. Yes, I trust this folder". A bare Enter now selects "No, exit".
     //   2. "Bypass Permissions mode" (Claude Code 2.1.x+) — options are
     //      "1. No, exit" (DEFAULT) and "2. Yes, I accept". A bare Enter here would
     //      select "No, exit" and QUIT the agent (exit code 1) — the headless
     //      crash-loop. We must move the selection DOWN then confirm: Down-arrow
     //      (\x1b[B) + Enter.
-    // The screens render a few seconds apart, so poll briefly and handle each once.
-    // The TUI separates words with cursor-positioning escape codes, so we strip ANSI
-    // and match on CO-OCCURRING, prompt-specific tokens (not stray single words) so
-    // normal agent output can never trigger a stray keystroke.
+    // Both screens need the identical Down+Enter treatment. The screens render a
+    // few seconds apart, so poll briefly and handle each once. The TUI separates
+    // words with cursor-positioning escape codes, so we strip ANSI and match on
+    // CO-OCCURRING, prompt-specific tokens (not stray single words) so normal
+    // agent output can never trigger a stray keystroke.
+    //
+    // Directly reproduced on 2026-09-24 against the live 2.1.261 TUI (a
+    // fleet-wide exit-code-1 crash storm traced back to this): sending the
+    // Down-arrow the INSTANT the prompt text is first detected is too early —
+    // the widget hasn't finished mounting its key listener yet and silently
+    // drops the keystroke, so the later Enter confirms the still-default
+    // "No, exit" and the agent exits instantly. A ~1s settle delay before the
+    // Down-arrow, THEN a further ~1.5s before Enter, reproduced reliably
+    // (3/3) against the live binary; a bare 350ms confirm-delay with no
+    // settle delay failed 3/3 the same way production did.
+    const acceptDecliningDefaultPrompt = (onDone: () => void) => {
+      // Bind both delayed writes to the PTY that actually showed this prompt.
+      // A kill()+respawn() inside the 1-2.5s delay window replaces `this.pty`
+      // with an unrelated live session; without this identity check the
+      // Down/Enter keystrokes meant for the dead prompt would land there.
+      const promptPty = this.pty;
+      setTimeout(() => {
+        if (!this.pty || this.pty !== promptPty || this.outputBuffer.isBootstrapped()) return;
+        this.pty.write('\x1b[B'); // arrow down to the accepting option
+        setTimeout(() => {
+          // Hardening: bootstrap-guard the deferred confirm so a late session
+          // bootstrap cannot swallow the CR into the live session.
+          if (this.pty && this.pty === promptPty && !this.outputBuffer.isBootstrapped()) this.pty.write('\r');
+          onDone();
+        }, 1500);
+      }, 1000);
+    };
     let trustHandled = false;
     let bypassHandled = false;
     const promptPoll = setInterval(() => {
@@ -227,22 +223,24 @@ export class AgentPTY {
         // Bypass screen: default selection is "1. No, exit". Move DOWN to
         // "2. Yes, I accept", then confirm. Bare Enter here would quit the agent.
         bypassHandled = true;
-        this.pty.write('\x1b[B'); // arrow down to "Yes, I accept"
-        setTimeout(() => {
-          // Hardening: bootstrap-guard the deferred confirm so a late session
-          // bootstrap cannot swallow the CR into the live session.
-          if (this.pty && !this.outputBuffer.isBootstrapped()) this.pty.write('\r');
+        acceptDecliningDefaultPrompt(() => {
           // Hardening: the only hazardous injection (Down+Enter) is now consumed —
           // stop polling immediately so no keystroke can reach the live session,
           // WITHOUT relying on the case-sensitive 'permissions' status-bar halt
           // (that coupling is fragile to Claude Code TUI text changes).
           clearInterval(promptPoll);
-        }, 350);
+        });
         return;
       }
       if (showingTrust && !trustHandled) {
+        // Trust screen: default selection is now "1. No, exit" (see note above).
+        // Move DOWN to "2. Yes, I trust this folder", then confirm. Bare Enter
+        // here would quit the agent instantly.
         trustHandled = true;
-        this.pty.write('\r');     // trust screen default is "Yes, I trust"
+        acceptDecliningDefaultPrompt(() => {
+          // Do NOT clear the interval here — the Bypass Permissions screen can
+          // still render a few seconds after this one and needs the same poll.
+        });
         return;
       }
       // No first-run prompt pending and the real session is up -> stop polling so we
@@ -419,6 +417,70 @@ export class AgentPTY {
   /**
    * Get a clean base environment (excluding potentially harmful vars).
    */
+  /**
+   * Builds the full PTY environment: base env, CTX_ and CRM_ identity vars,
+   * org secrets.env, agent .env (each layer overriding the previous for
+   * shared keys — PATH excepted, see applyEnvAssignment), and derived
+   * CTX_* aliases. Extracted from spawn() so it's independently testable
+   * without touching node-pty.
+   */
+  private buildPtyEnv(): Record<string, string> {
+    const ptyEnv: Record<string, string> = {
+      ...this.getBaseEnv(),
+      CTX_INSTANCE_ID: this.env.instanceId,
+      CTX_ROOT: this.env.ctxRoot,
+      CTX_FRAMEWORK_ROOT: this.env.frameworkRoot,
+      CTX_AGENT_NAME: this.env.agentName,
+      CTX_ORG: this.env.org,
+      CTX_AGENT_DIR: this.env.agentDir,
+      CTX_PROJECT_ROOT: this.env.projectRoot,
+      // Backward compat
+      CRM_AGENT_NAME: this.env.agentName,
+      CRM_TEMPLATE_ROOT: this.env.frameworkRoot,
+    };
+
+    // Source org-level shared secrets (orgs/{org}/secrets.env).
+    // These are shared across all agents in the org: OPENAI_KEY, APIFY_TOKEN, GEMINI_API_KEY, etc.
+    // Agent .env is loaded after and overrides org values — agent-specific keys win.
+    if (this.env.org && this.env.projectRoot) {
+      const orgEnvFile = join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env');
+      loadEnvFileInto(orgEnvFile, ptyEnv);
+    }
+
+    // Source agent .env file (overrides org secrets.env for same key names).
+    // Contains agent-specific secrets: BOT_TOKEN, CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN.
+    const agentEnvFile = join(this.env.agentDir, '.env');
+    loadEnvFileInto(agentEnvFile, ptyEnv);
+
+    // Add convenience CTX_* aliases used throughout agent templates.
+    // CTX_TELEGRAM_CHAT_ID: alias for CHAT_ID from the agent's .env
+    if (ptyEnv['CHAT_ID']) {
+      ptyEnv['CTX_TELEGRAM_CHAT_ID'] = ptyEnv['CHAT_ID'];
+    }
+    // CTX_TIMEZONE: from config.json timezone field, falls back to system TZ
+    const configTimezone = this.config.timezone;
+    if (configTimezone) {
+      ptyEnv['CTX_TIMEZONE'] = configTimezone;
+      ptyEnv['TZ'] = configTimezone; // also set TZ so date/time system calls use correct zone
+    } else if (process.env.TZ) {
+      ptyEnv['CTX_TIMEZONE'] = process.env.TZ;
+    }
+    // CTX_ORCHESTRATOR_AGENT: read from org context.json so agents can route to orchestrator
+    if (this.env.projectRoot && this.env.org) {
+      try {
+        const contextPath = join(this.env.projectRoot, 'orgs', this.env.org, 'context.json');
+        if (existsSync(contextPath)) {
+          const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
+          if (ctx.orchestrator) {
+            ptyEnv['CTX_ORCHESTRATOR_AGENT'] = ctx.orchestrator;
+          }
+        }
+      } catch { /* leave unset if context.json is missing or malformed */ }
+    }
+
+    return ptyEnv;
+  }
+
   private getBaseEnv(): Record<string, string> {
     const env: Record<string, string> = {};
     // Copy essential env vars
