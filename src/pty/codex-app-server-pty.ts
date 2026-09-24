@@ -10,6 +10,7 @@ import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
 import { WsUnixJsonRpcClient, type JsonRpcResponse } from '../utils/ws-unix-client.js';
 import { applyEnvAssignment } from './agent-pty.js';
+import { parseEnvFile } from '../utils/env.js';
 
 interface IPty {
   pid: number;
@@ -1017,18 +1018,13 @@ export class CodexAppServerPTY {
   }
 
   private loadEnvFile(path: string, env: Record<string, string>): void {
-    if (!existsSync(path)) return;
-    try {
-      for (const line of readFileSync(path, 'utf-8').split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const eqIdx = trimmed.indexOf('=');
-        if (eqIdx > 0) {
-          applyEnvAssignment(env, trimmed.slice(0, eqIdx).trim(), trimmed.slice(eqIdx + 1).trim());
-        }
-      }
-    } catch {
-      // Ignore env file read errors.
+    // Use the shared parser (handles BOM/CRLF/quotes/inline-comments) rather
+    // than a hand-rolled split/trim — a quoted PATH value (e.g. from a
+    // shared secrets.env) must have its quotes stripped before
+    // applyEnvAssignment prepends it, or the shim directory it names is
+    // never found on PATH.
+    for (const [key, value] of Object.entries(parseEnvFile(path))) {
+      applyEnvAssignment(env, key, value);
     }
   }
 
