@@ -9,6 +9,7 @@ import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
 import { WsUnixJsonRpcClient, type JsonRpcResponse } from '../utils/ws-unix-client.js';
+import { applyEnvAssignment } from './agent-pty.js';
 
 interface IPty {
   pid: number;
@@ -1023,7 +1024,7 @@ export class CodexAppServerPTY {
         if (!trimmed || trimmed.startsWith('#')) continue;
         const eqIdx = trimmed.indexOf('=');
         if (eqIdx > 0) {
-          env[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+          applyEnvAssignment(env, trimmed.slice(0, eqIdx).trim(), trimmed.slice(eqIdx + 1).trim());
         }
       }
     } catch {

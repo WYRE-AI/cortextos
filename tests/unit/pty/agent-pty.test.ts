@@ -1,4 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { existsSync, readFileSync } from 'fs';
 
 // node-pty is native; stub it so constructing AgentPTY never touches it.
 vi.mock('node-pty', () => ({ spawn: vi.fn() }));
@@ -14,7 +15,7 @@ vi.mock('fs', async () => {
   };
 });
 
-const { AgentPTY } = await import('../../../src/pty/agent-pty.js');
+const { AgentPTY, applyEnvAssignment } = await import('../../../src/pty/agent-pty.js');
 
 const mockEnv = {
   instanceId: 'test',
@@ -79,5 +80,67 @@ describe('AgentPTY auto-updater pinning (shared-binary race)', () => {
 
   it('sets DISABLE_AUTOUPDATER=1 so agents never race on the shared binary', () => {
     expect(baseEnvFor({})['DISABLE_AUTOUPDATER']).toBe('1');
+  });
+});
+
+describe('applyEnvAssignment (PATH prepend, not overwrite)', () => {
+  // .env files here are read with readFileSync + a literal split on the
+  // first "=" — there is no shell involved, so a line like
+  // PATH="/dir:$PATH" can never expand $PATH. This function is what makes
+  // a bare `PATH=/dir` line in an org secrets.env / agent .env mean
+  // "prepend /dir to whatever PATH already is", instead of replacing the
+  // whole thing (which would break every other binary lookup for that
+  // agent — node, git, homebrew, etc. all live on the base PATH).
+  it('prepends PATH onto an existing value instead of replacing it', () => {
+    const ptyEnv: Record<string, string> = { PATH: '/usr/bin:/bin' };
+    applyEnvAssignment(ptyEnv, 'PATH', '/opt/gh-shim');
+    expect(ptyEnv.PATH).toBe('/opt/gh-shim:/usr/bin:/bin');
+  });
+
+  it('sets PATH directly when no base PATH exists yet', () => {
+    const ptyEnv: Record<string, string> = {};
+    applyEnvAssignment(ptyEnv, 'PATH', '/opt/gh-shim');
+    expect(ptyEnv.PATH).toBe('/opt/gh-shim');
+  });
+
+  it('overwrites (not prepends) every other key, unchanged from prior behavior', () => {
+    const ptyEnv: Record<string, string> = { BOT_TOKEN: 'old' };
+    applyEnvAssignment(ptyEnv, 'BOT_TOKEN', 'new');
+    expect(ptyEnv.BOT_TOKEN).toBe('new');
+  });
+});
+
+describe('buildPtyEnv (.env-driven PATH prepend, end to end)', () => {
+  function ptyEnvFor(
+    config: any,
+    files: Record<string, string>,
+  ): Record<string, string> {
+    vi.mocked(existsSync).mockImplementation((p) => Object.hasOwn(files, String(p)));
+    vi.mocked(readFileSync).mockImplementation(((p: string) => files[String(p)] ?? '') as any);
+    const pty = new AgentPTY(mockEnv, config);
+    return (pty as unknown as { buildPtyEnv(): Record<string, string> }).buildPtyEnv();
+  }
+
+  afterEach(() => {
+    vi.mocked(existsSync).mockReset().mockReturnValue(false);
+    vi.mocked(readFileSync).mockReset();
+  });
+
+  it('prepends a gh-shim-style PATH line from the agent .env onto the base PATH', () => {
+    const basePath = process.env.PATH ?? '';
+    const env = ptyEnvFor({}, {
+      '/tmp/fw/orgs/acme/agents/alice/.env': 'PATH=/opt/gh-shim\nBOT_TOKEN=xyz\n',
+    });
+    expect(env.PATH).toBe(`/opt/gh-shim:${basePath}`);
+    expect(env.BOT_TOKEN).toBe('xyz');
+  });
+
+  it('agent .env PATH prepends onto (not replaces) an org secrets.env PATH prepend', () => {
+    const basePath = process.env.PATH ?? '';
+    const env = ptyEnvFor({}, {
+      '/tmp/fw/orgs/acme/secrets.env': 'PATH=/opt/org-wide-shim\n',
+      '/tmp/fw/orgs/acme/agents/alice/.env': 'PATH=/opt/gh-shim\n',
+    });
+    expect(env.PATH).toBe(`/opt/gh-shim:/opt/org-wide-shim:${basePath}`);
   });
 });
