@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Fixed — headless agents crash-looped on Claude Code's "trust this folder" screen after a CLI upgrade
+
+The `claude` binary on this box moved from `2.1.42` to `2.1.261` between daemon restarts. Somewhere in
+that range the "trust this folder?" first-run dialog's default selection flipped from "Yes, I trust"
+to "No, exit" — mirroring the already-known "Bypass Permissions mode" gotcha, but on the *other*
+first-run screen, which `agent-pty.ts`'s prompt-auto-accept logic still handled with a bare Enter.
+The next daemon restart forced every agent into a fresh spawn at once; nearly every agent's working
+directory had no persisted trust record, so every one of them hit this screen, had a bare Enter select
+"No, exit", and exited instantly (`exit_code=1`) — a fleet-wide crash storm that tripped PM2's 10-
+crashes/day breaker on almost every agent (`warden`, `grower`, `pearl`, `ruby`, `scribe`, `marketing`,
+`maintainer`, `dev`, `forge`, `analyst`, `infra`) within about 20 minutes.
+
+Fixed the trust-screen handler to send Down-arrow + Enter instead of a bare Enter, matching the
+existing Bypass-screen handling. Reproducing this against the live binary (via `node-pty`, same
+mechanism the daemon uses) also surfaced a second, independent timing bug: sending the Down-arrow the
+instant the prompt text is first detected is too early — the widget hasn't finished mounting its key
+listener and silently drops the keystroke, so Enter still lands on the un-moved default 350ms later.
+Fixing only the keystroke (Down+Enter) reproduced the exact production failure 3/3 times; adding a
+~1s settle delay before the Down-arrow and ~1.5s before the confirming Enter reproduced success 5/5
+times. Both first-run screens now share this timing via a small helper. Verified live: restarted
+`cortextos-daemon` with the fix built in and confirmed all 14 agents reached "Bootstrap complete" with
+zero `Exited with code`/`HALTED`/`CRASH_LOOP` log lines in the post-restart window (checked the
+per-agent structured `restarts.log`, not just the daemon's own status).
+
 ### Fixed — `migration-collision-check.yml`'s cross-PR scan had no base-branch filter and a hardcoded 300-PR cap
 
 Check 2 (the cross-PR migration-number collision scan) called `gh pr list --repo REPO --state open
