@@ -156,6 +156,30 @@ describe.skipIf(!existsSync(SHIM))("bin/gh-shim/gh", () => {
     expect(stdout).toContain("GH_TOKEN=minted-token-1");
   });
 
+  it("excludes GHCR/package-registry calls from bot-token routing even for an allowlisted org", async () => {
+    // The App's `packages: write` installation permission does not reliably
+    // cover the same surface a personal account's package scopes do --
+    // caught live 2026-09-24 (maintainer): a real
+    // orgs/WYRE-AI/packages/container/.../versions query 404'd through the
+    // bot token where personal auth succeeds. No attribution benefit here
+    // either (a package read creates no commit/PR/comment), so this must
+    // always fall through to ambient auth, regardless of org.
+    await initGitRepo("git@github.com:WYRE-AI/conduit.git");
+    writeFakeExe("cortextos", `echo "should not be called" >&2; exit 1`);
+    writeFakeExe(
+      "gh",
+      `echo "REAL_GH ARGS: $*"; echo "GH_TOKEN=[$GH_TOKEN]"`,
+    );
+
+    const { stdout, stderr, code } = await runShim(
+      ["api", "orgs/WYRE-AI/packages/container/conduit/versions?per_page=100"],
+      fakeRepo,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GH_TOKEN=[]");
+    expect(stderr).toBe("");
+  });
+
   it("mints a token for an allowlisted org via a `gh api repos/OWNER/REPO/...` positional path (no --repo flag)", async () => {
     // The canonical no-checkout invocation shape -- e.g. querying a PR's
     // comments from a temp dir or the daemon's own cwd, never `--repo`.
