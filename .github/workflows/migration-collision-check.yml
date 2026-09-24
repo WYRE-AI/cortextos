@@ -235,8 +235,20 @@ jobs:
           # page's JSON array as a separate top-level value, not one valid
           # document; `--slurp` wraps every page into one array of
           # page-arrays instead, flattened just below.
+          #
+          # `-X GET` is required, not cosmetic: `gh api` silently switches
+          # its default method from GET to POST the moment ANY `-f`/-F`
+          # parameter is present (its own --help: "adding request parameters
+          # will automatically switch the request method to POST"). Without
+          # it, this call becomes `POST /repos/{owner}/{repo}/pulls` — the
+          # CREATE-pull-request endpoint, not the list one — which 403s
+          # ("Resource not accessible by integration") against a token that
+          # correctly has only `pull-requests: read`, not `write`. Confirmed
+          # root cause of a 100%-failure rate on every real invocation since
+          # this check went live (2026-09-24, maintainer + infra).
           prs_raw = subprocess.check_output(
-              ['gh', 'api', f'repos/{REPO}/pulls', '--paginate', '--slurp',
+              ['gh', 'api', f'repos/{REPO}/pulls', '-X', 'GET',
+               '--paginate', '--slurp',
                '-f', 'state=open', '-f', f'base={BASE_REF}',
                '-f', 'per_page=100'],
               text=True,
