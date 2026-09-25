@@ -14,7 +14,7 @@ import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity, broadcastActivityViaBus } from '../bus/system.js';
-import { createExperiment, runExperiment, evaluateExperiment, correctExperimentDecision, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline, linkExperimentApproval } from '../bus/experiment.js';
+import { createExperiment, runExperiment, evaluateExperiment, correctExperimentDecision, closeExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline, linkExperimentApproval } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
@@ -1276,6 +1276,27 @@ busCommand
     const agentDir = env.agentDir || process.cwd();
     try {
       const experiment = correctExperimentDecision(agentDir, id, decision, reason);
+      console.log(JSON.stringify(experiment, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('close-experiment')
+  .description("Close a 'proposed' or 'running' experiment that will never produce a measured result (declined approval, decision made without running, structurally unevaluatable) — a terminal state distinct from evaluate-experiment's keep/discard, which always requires a real measurement")
+  .argument('<id>', 'Experiment ID')
+  .argument('<reason>', 'Why this experiment is being closed without a result — name the concrete cause (approval id, superseding experiment id, surface doc)')
+  .action((id: string, reason: string) => {
+    if (!reason.trim()) {
+      console.error('close-experiment refused: --reason cannot be empty — this is the only durable record of why the experiment never completed.');
+      process.exit(1);
+    }
+    const env = resolveEnv();
+    const agentDir = env.agentDir || process.cwd();
+    try {
+      const experiment = closeExperiment(agentDir, id, reason);
       console.log(JSON.stringify(experiment, null, 2));
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
