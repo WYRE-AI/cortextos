@@ -513,10 +513,19 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
 }
 
 export interface PullDrift {
+  /** origin/main has commits this checkout does not. Fix: git pull --ff-only. */
   behind: boolean;
+  /**
+   * This checkout has commits origin/main does not (e.g. an unmerged feature
+   * branch). NOT a defect and NOT part of `status: 'drift'` — a shared
+   * checkout sitting on a branch ahead of main is routine agent workflow.
+   * Surfaced for visibility only (task_1790474589393_02140942).
+   */
+  ahead: boolean;
   local_head: string;
   origin_head: string;
   commits_behind: number;
+  commits_ahead: number;
   commit_summaries: string[];
   truncated: boolean;
 }
@@ -566,18 +575,25 @@ export const COMMIT_LOG_LIMIT = 20;
  * Two independent drift checks, deliberately not conflated (they have
  * different fixes):
  *
- * 1. **Pull drift** — local HEAD vs `origin/main` after a fetch. Fix: `git
- *    pull --ff-only`.
+ * 1. **Pull drift** — local HEAD vs `origin/main` after a fetch, via commit
+ *    counts (`git rev-list` each direction) rather than SHA equality, so a
+ *    checkout AHEAD of origin/main (an unmerged feature branch — routine
+ *    agent workflow) is reported as `ahead`, not conflated with `behind`.
+ *    Fix for `behind`: `git pull --ff-only`.
  * 2. **Build drift** — `dist/build-manifest.json`'s stamped `gitSha` (written
  *    by every `npm run build`, see tsup.config.ts's `onSuccess` hook — added
  *    for daemon-restart forensics, task_1785551337187, reused here rather
- *    than adding a second stamping mechanism) vs local HEAD. Comparing
- *    against local HEAD, not origin — this check answers "does dist/ match
- *    what's actually checked out," independent of whether the checkout
- *    itself is also behind. Deliberately NOT using dist/cli.js's mtime: a
- *    `git checkout`/`pull` sets file mtimes to checkout time regardless of
- *    content, so mtime doesn't reliably indicate "built from the newest
- *    commit" — the SHA stamp is the robust signal the task called for.
+ *    than adding a second stamping mechanism) vs `origin/main`, not local
+ *    HEAD. Comparing against origin/main answers "does dist/ match what
+ *    SHOULD be deployed," independent of whatever branch the shared tree
+ *    happens to have checked out — comparing against local HEAD instead
+ *    (pre-task_1790474589393_02140942) made every checkout sitting on an
+ *    unmerged branch report false staleness, with a "run npm run build" hint
+ *    that would have rebuilt dist/ from that unmerged branch. Deliberately
+ *    NOT using dist/cli.js's mtime: a `git checkout`/`pull` sets file mtimes
+ *    to checkout time regardless of content, so mtime doesn't reliably
+ *    indicate "built from the newest commit" — the SHA stamp is the robust
+ *    signal the task called for.
  *    A gitSha match alone isn't sufficient, though: a build from a DIRTY
  *    tree stamps the same gitSha as a clean build at that commit (this
  *    exact gap left the live fleet on unmerged code briefly during this
@@ -619,13 +635,23 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
     return { status: 'error', checked_at, error: 'failed to resolve HEAD or origin/main' };
   }
 
-  const behind = localHead !== originHead;
+  // Derived from commit counts, not SHA equality: a shared checkout sitting on
+  // an unmerged feature branch has localHead !== originHead while being
+  // neither behind nor merely equal — it is AHEAD. SHA-equality collapsed
+  // that case into "behind" (task_1790474589393_02140942).
   let commitsBehind = 0;
+  let commitsAhead = 0;
+  try {
+    commitsBehind = parseInt(execSync('git rev-list HEAD..origin/main --count', execOpts).trim(), 10);
+  } catch { /* default 0 */ }
+  try {
+    commitsAhead = parseInt(execSync('git rev-list origin/main..HEAD --count', execOpts).trim(), 10);
+  } catch { /* default 0 */ }
+
+  const behind = commitsBehind > 0;
+  const ahead = commitsAhead > 0;
   let commitSummaries: string[] = [];
   if (behind) {
-    try {
-      commitsBehind = parseInt(execSync('git rev-list HEAD..origin/main --count', execOpts).trim(), 10);
-    } catch { /* default 0 */ }
     try {
       commitSummaries = execSync(`git log HEAD..origin/main --oneline -${COMMIT_LOG_LIMIT}`, execOpts)
         .trim().split('\n').filter(Boolean);
@@ -634,9 +660,11 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
 
   const pull_drift: PullDrift = {
     behind,
+    ahead,
     local_head: localHead,
     origin_head: originHead,
     commits_behind: commitsBehind,
+    commits_ahead: commitsAhead,
     commit_summaries: commitSummaries,
     truncated: commitsBehind > COMMIT_LOG_LIMIT,
   };
@@ -656,7 +684,14 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
       const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { gitSha?: string; builtAt?: string; dirty?: boolean };
       const builtSha = manifest.gitSha ?? null;
       const builtDirty = manifest.dirty === true;
-      const shaMismatch = builtSha !== localHead;
+      // Judged against origin/main, not local HEAD: HEAD is whatever branch
+      // happens to be checked out in the shared tree (routine — an agent
+      // working an unmerged feature branch), and dist/ built from
+      // origin/main's tip is correctly deployed regardless of what's checked
+      // out locally. Comparing to local HEAD instead made every such
+      // checkout report false staleness with a "run npm run build" hint that
+      // would have rebuilt from the unmerged branch (task_1790474589393_02140942).
+      const shaMismatch = builtSha !== originHead;
       // A dirty-tree build stamps the same gitSha as a clean build at that
       // commit — sha-match alone can't tell them apart, so dirty is checked
       // independently rather than folded into shaMismatch.
@@ -665,20 +700,21 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
       if (shaMismatch) {
         // BEHIND vs DIVERGENT — same symptom, very different situations, and
         // until 2026-08-15 both produced the identical "run npm run build".
-        // If built_sha is an ANCESTOR of HEAD, dist is merely old: everything
-        // in it is reviewed code that was on main. If it is NOT an ancestor,
-        // dist was built from a commit that is not in this history at all —
-        // a branch checked out in the shared tree — so the fleet is running
-        // code nobody chose to deploy. Asked of git rather than by comparing
-        // symbols: a name-based probe against a minified bundle collides
-        // (`hasTelegram` matching `hasTelegramMessage` cost an hour that day).
+        // If built_sha is an ANCESTOR of origin/main, dist is merely old:
+        // everything in it is reviewed code that was on main. If it is NOT
+        // an ancestor, dist was built from a commit that is not in main's
+        // history at all — a branch build in the shared tree — so the fleet
+        // is running code nobody chose to deploy. Asked of git rather than by
+        // comparing symbols: a name-based probe against a minified bundle
+        // collides (`hasTelegram` matching `hasTelegramMessage` cost an hour
+        // that day).
         let ancestor: boolean | null = null;
         // Shape-guard before interpolation: builtSha is read from a file on
         // disk, so it is not trusted input for a shell string. A non-SHA value
         // leaves ancestor null and falls through to the neutral wording.
         if (builtSha && /^[0-9a-f]{7,40}$/.test(builtSha)) {
           try {
-            execSync(`git merge-base --is-ancestor ${builtSha} HEAD`, execOpts);
+            execSync(`git merge-base --is-ancestor ${builtSha} origin/main`, execOpts);
             ancestor = true;
           } catch {
             // Non-zero means "not an ancestor" — but it also means "unknown
@@ -688,8 +724,8 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
           }
         }
         reason = ancestor === false
-          ? `dist/ was built from a different commit than local HEAD — ${builtSha} is NOT an ancestor of HEAD, so dist contains code that is not in this history (a branch build in the shared tree, or a commit since pruned). Verify what is in it BEFORE rebuilding; a rebuild silently discards it.`
-          : 'dist/ was built from an earlier commit than local HEAD — dist is behind; run npm run build';
+          ? `dist/ was built from a different commit than origin/main — ${builtSha} is NOT an ancestor of origin/main, so dist contains code that is not in main's history (a branch build in the shared tree, or a commit since pruned). Verify what is in it BEFORE rebuilding; a rebuild silently discards it.`
+          : 'dist/ was built from an earlier commit than origin/main — dist is behind; run npm run build';
       } else if (builtDirty) {
         reason = 'dist/ was built from a dirty working tree (uncommitted changes present at build time) — commit or stash, then run npm run build';
       }
