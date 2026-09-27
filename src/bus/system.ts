@@ -533,6 +533,8 @@ export interface PullDrift {
 export interface BuildDrift {
   stale: boolean;
   local_head: string;
+  /** What `stale`/`reason` are actually judged against — see checkDeployDrift's docstring. */
+  origin_head: string;
   built_sha: string | null;
   built_at: string | null;
   built_dirty?: boolean;
@@ -638,15 +640,17 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
   // Derived from commit counts, not SHA equality: a shared checkout sitting on
   // an unmerged feature branch has localHead !== originHead while being
   // neither behind nor merely equal — it is AHEAD. SHA-equality collapsed
-  // that case into "behind" (task_1790474589393_02140942).
+  // that case into "behind" (task_1790474589393_02140942). One `--left-right`
+  // call returns both counts (left = HEAD-only = ahead, right =
+  // origin/main-only = behind) instead of two separate rev-list spawns.
   let commitsBehind = 0;
   let commitsAhead = 0;
   try {
-    commitsBehind = parseInt(execSync('git rev-list HEAD..origin/main --count', execOpts).trim(), 10);
-  } catch { /* default 0 */ }
-  try {
-    commitsAhead = parseInt(execSync('git rev-list origin/main..HEAD --count', execOpts).trim(), 10);
-  } catch { /* default 0 */ }
+    const [aheadCount, behindCount] = execSync('git rev-list --left-right --count HEAD...origin/main', execOpts)
+      .trim().split('\t').map((n) => parseInt(n, 10));
+    commitsAhead = aheadCount;
+    commitsBehind = behindCount;
+  } catch { /* defaults stay 0 */ }
 
   const behind = commitsBehind > 0;
   const ahead = commitsAhead > 0;
@@ -675,6 +679,7 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
     build_drift = {
       stale: true,
       local_head: localHead,
+      origin_head: originHead,
       built_sha: null,
       built_at: null,
       reason: 'dist/build-manifest.json not found — dist/ has never been built, or was built before manifest stamping was added; run npm run build',
@@ -684,13 +689,8 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
       const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { gitSha?: string; builtAt?: string; dirty?: boolean };
       const builtSha = manifest.gitSha ?? null;
       const builtDirty = manifest.dirty === true;
-      // Judged against origin/main, not local HEAD: HEAD is whatever branch
-      // happens to be checked out in the shared tree (routine — an agent
-      // working an unmerged feature branch), and dist/ built from
-      // origin/main's tip is correctly deployed regardless of what's checked
-      // out locally. Comparing to local HEAD instead made every such
-      // checkout report false staleness with a "run npm run build" hint that
-      // would have rebuilt from the unmerged branch (task_1790474589393_02140942).
+      // Judged against origin/main, not local HEAD — see checkDeployDrift's
+      // docstring (§2, above) for why.
       const shaMismatch = builtSha !== originHead;
       // A dirty-tree build stamps the same gitSha as a clean build at that
       // commit — sha-match alone can't tell them apart, so dirty is checked
@@ -732,6 +732,7 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
       build_drift = {
         stale,
         local_head: localHead,
+        origin_head: originHead,
         built_sha: builtSha,
         built_at: manifest.builtAt ?? null,
         built_dirty: builtDirty,
@@ -741,6 +742,7 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
       build_drift = {
         stale: true,
         local_head: localHead,
+        origin_head: originHead,
         built_sha: null,
         built_at: null,
         reason: 'dist/build-manifest.json exists but could not be parsed',
