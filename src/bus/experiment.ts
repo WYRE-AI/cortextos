@@ -695,6 +695,10 @@ export function closeExperiment(
   experimentId: string,
   reason: string,
 ): Experiment {
+  if (!reason.trim()) {
+    throw new Error('closeExperiment requires a non-empty reason.');
+  }
+
   const experiment = loadExperiment(agentDir, experimentId);
 
   if (experiment.status === 'completed' || experiment.status === 'closed') {

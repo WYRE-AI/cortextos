@@ -794,6 +794,12 @@ describe('Sprint 3: Experiment Framework', () => {
     it('throws for a nonexistent experiment', () => {
       expect(() => closeExperiment(testDir, 'exp_nonexistent_00000', 'reason')).toThrow(/not found/);
     });
+
+    it('throws for an empty or whitespace-only reason, independent of the CLI wrapper', () => {
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h1');
+      expect(() => closeExperiment(testDir, id, '')).toThrow(/non-empty reason/);
+      expect(() => closeExperiment(testDir, id, '   ')).toThrow(/non-empty reason/);
+    });
   });
 
   describe('listExperiments', () => {
