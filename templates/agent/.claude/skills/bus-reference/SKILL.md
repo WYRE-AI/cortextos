@@ -343,6 +343,18 @@ Evaluate a running experiment and decide keep/discard.
 cortextos bus evaluate-experiment <experiment_id> <measured_value> [--score <1-10>] [--justification "<text>"]
 ```
 
+### close-experiment
+Close a `proposed` or `running` experiment that will never produce a measured result — a declined
+approval, a decision made and documented elsewhere, or a running experiment that's structurally
+unevaluatable (e.g. no `baseline_value`, so `evaluate-experiment` refuses it). Distinct from
+`evaluate-experiment`: closing is never a keep/discard verdict, just "this record will never
+complete normally." Refuses on an already-`completed` or already-`closed` experiment. Reason is
+required and stored verbatim in `closed_reason` — name the concrete cause.
+
+```bash
+cortextos bus close-experiment <experiment_id> "<reason>"
+```
+
 ### list-experiments
 List experiments with filters.
 
