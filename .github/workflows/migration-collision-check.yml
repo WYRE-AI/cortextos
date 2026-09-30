@@ -51,7 +51,8 @@ permissions:
 jobs:
   collision-check:
     name: Detect migration-number collisions
-    runs-on: ubuntu-latest
+    # Avoids GitHub-hosted Actions minute/spend budgets.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Checkout PR head with full history
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
