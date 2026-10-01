@@ -1225,6 +1225,11 @@ Attributions are individual. **VERIFIED = measured that night with the output in
   returning ZERO, which does not. Bias toward the visible failure.**
 
 - **OPERATIONAL, VERIFIED, AND EACH ONE COST SOMEBODY AN HOUR:**
+  ➡ **PARTIALLY SUPERSEDED 2026-10-01 (boss; infra independently verified via `--help` + a live append the
+  same hour): `update-task` now has `--append-desc` (works; title edits still absent), and experiments now
+  have `close-experiment` (#181) as a terminal no-result state. The "cannot be corrected in place" shape
+  below is history for descriptions; it still holds for titles and blockers. This stale line was still
+  steering agents' behavior on 2026-10-01 — two agents worked off it that day — hence this pointer.**
   **`updateTask` cannot record a blocker, a description, a title, or an experiment's `learning`** — its
   allowlist is `{assignee, project}` (`src/bus/task.ts:412`). **Experiments have no update path at all**
   (`create`/`run`/`evaluate` only), so a correction can be attached only at evaluation, **once, after the
