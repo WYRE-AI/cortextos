@@ -321,11 +321,12 @@ function cancelFanoutSiblings(
     // this cleanup. Best-effort — if the lock is held, skip this recipient's
     // inbox rather than block or steal it; worst case the sibling processes
     // one redundant copy, the same outcome first-ack-wins already tolerates.
-    if (acquireLock(siblingPaths.inbox)) {
+    const siblingLock = acquireLock(siblingPaths.inbox);
+    if (siblingLock) {
       try {
         supersedeFanoutCopies(siblingPaths.inbox, fanoutId);
       } finally {
-        releaseLock(siblingPaths.inbox);
+        releaseLock(siblingLock);
       }
     }
 
