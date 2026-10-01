@@ -14,12 +14,29 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // ---------------------------------------------------------------------------
 // Mocks — restart.ts talks to the daemon over IPC and writes a stop marker.
 // Both are stubbed so the command can be driven without a live daemon or disk.
+//
+// Captures every sent IPC request (sentRequests) so the disable-resurrection
+// fix test below can assert the stop-agent request carries userInitiated:false
+// — the stop-agent IPC handler is fire-and-forget, so restart's follow-up
+// start races in and queues a pendingRestart; userInitiated:false is what lets
+// that queued restart be honored (a hardcoded/absent true would DROP it,
+// leaving the agent down: the CI-invisible regression this test guards).
+//
+// Also supports a per-call response queue (mockSend.mockResolvedValueOnce...)
+// for the start-phase response-handling tests below, which need to control
+// success/failure/code per call. Default response (no queued override) mirrors
+// upstream's original always-succeeds shape.
 // ---------------------------------------------------------------------------
-const mockSend = vi.fn();
+const sentRequests: Array<Record<string, unknown>> = [];
+const mockSend = vi.fn(async (req: Record<string, unknown>) => {
+  sentRequests.push(req);
+  return { success: true, data: `ok:${req.type}` };
+});
 const mockIsDaemonRunning = vi.fn().mockResolvedValue(true);
 
 vi.mock('../../../src/daemon/ipc-server.js', () => {
   class MockIPCClient {
+    constructor(_instance: string) { /* no-op */ }
     send = mockSend;
     isDaemonRunning = mockIsDaemonRunning;
   }
@@ -127,5 +144,24 @@ describe('restart start-phase response handling', () => {
 
     expect(exitSpy).not.toHaveBeenCalled();
     expect(out()).toContain('Starting alice');
+  });
+});
+
+describe('disable-resurrection fix: restart stop-half is NOT user-initiated', () => {
+  beforeEach(() => { sentRequests.length = 0; });
+
+  it('sends the stop-agent IPC with userInitiated:false, then a follow-up start-agent', async () => {
+    await restartCommand.parseAsync(['alice'], { from: 'user' });
+
+    const stopReq = sentRequests.find(r => r.type === 'stop-agent');
+    // Fails on the regressed code: restart sent no userInitiated → handler
+    // defaulted to true → dropped the queued pendingRestart → agent stayed down.
+    expect(stopReq).toBeDefined();
+    expect(stopReq!.agent).toBe('alice');
+    expect(stopReq!.userInitiated).toBe(false);
+
+    // The restart still issues its own start-agent (which is what the honored
+    // pendingRestart path ultimately mirrors — the agent must come back up).
+    expect(sentRequests.some(r => r.type === 'start-agent' && r.agent === 'alice')).toBe(true);
   });
 });

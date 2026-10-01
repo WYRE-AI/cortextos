@@ -15,9 +15,10 @@
  * Storage: state/<agent>/cron-state.json (same dir as pending-reminders.json).
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { ensureDir } from '../utils/atomic.js';
+import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { withFileLockSync } from '../utils/lock.js';
 
 export interface CronFireRecord {
   name: string;
@@ -65,22 +66,33 @@ export function updateCronFire(
   interval?: string,
   at?: string,
 ): void {
+  // ensureDir runs BEFORE the lock: acquireLock creates its `.lock.d` inside
+  // stateDir, so the directory must already exist.
   ensureDir(stateDir);
-  const state = readCronState(stateDir);
-  const now = new Date().toISOString();
-  const lastFire = at ?? now;
+  // The read-modify-write runs under the per-agent stateDir lock so two
+  // concurrent callers can't lose each other's records, and the write itself
+  // goes through atomicWriteSync (tmp + rename) so a crash mid-write can never
+  // tear the file — a torn cron-state.json degrades to `{crons: []}` on read,
+  // dropping the last-fire references and risking duplicate catch-up fires.
+  withFileLockSync(stateDir, () => {
+    const state = readCronState(stateDir);
+    const now = new Date().toISOString();
+    const lastFire = at ?? now;
 
-  const idx = state.crons.findIndex(r => r.name === cronName);
-  const record: CronFireRecord = { name: cronName, last_fire: lastFire, ...(interval ? { interval } : {}) };
+    const idx = state.crons.findIndex(r => r.name === cronName);
+    const record: CronFireRecord = { name: cronName, last_fire: lastFire, ...(interval ? { interval } : {}) };
 
-  if (idx === -1) {
-    state.crons.push(record);
-  } else {
-    state.crons[idx] = record;
-  }
+    if (idx === -1) {
+      state.crons.push(record);
+    } else {
+      state.crons[idx] = record;
+    }
 
-  state.updated_at = now;
-  writeFileSync(cronStatePath(stateDir), JSON.stringify(state, null, 2) + '\n', 'utf-8');
+    state.updated_at = now;
+    // atomicWriteSync appends the trailing '\n' itself — on-disk bytes are
+    // identical to the previous plain writeFileSync format.
+    atomicWriteSync(cronStatePath(stateDir), JSON.stringify(state, null, 2));
+  });
 }
 
 /**

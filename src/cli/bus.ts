@@ -16,7 +16,7 @@ import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus
 import { selfRestart, hardRestart, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity, broadcastActivityViaBus } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, correctExperimentDecision, closeExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline, linkExperimentApproval } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
-import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
+import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, checkMergeGateMetrics, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
@@ -222,13 +222,19 @@ busCommand
   .action(() => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
-    const { messages, skipped } = checkInboxWithStatus(paths);
-    // stdout shape is unchanged on purpose — agents and scripts parse this
-    // array. The "we never looked" signal rides stderr + exit code so an
-    // empty result can no longer be mistaken for a verified-empty inbox.
-    console.log(JSON.stringify(messages));
-    if (skipped) {
-      console.error('[bus] check-inbox: could not acquire the inbox lock — the inbox was NOT read. The empty result above is not evidence the inbox is empty (stale .lock.d?).');
+    // An unavailable inbox lock must exit nonzero with an error — printing []
+    // would be indistinguishable from a successfully-read empty inbox. Use
+    // checkInboxWithStatus (not the bare checkInbox convenience wrapper) since
+    // this result IS reported to a human/script via stdout — exactly the case
+    // checkInbox's own docblock warns not to use it for.
+    try {
+      const { messages } = checkInboxWithStatus(paths);
+      // stdout shape is unchanged on purpose — agents and scripts parse this
+      // array. The "we never looked" signal rides stderr + exit code so an
+      // empty result can no longer be mistaken for a verified-empty inbox.
+      console.log(JSON.stringify(messages));
+    } catch (err) {
+      console.error(`check-inbox failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exitCode = 1;
     }
   });
@@ -681,15 +687,17 @@ busCommand
   .command('list-tasks')
   .option('--agent <name>', 'Filter by agent')
   .option('--status <s>', 'Filter by status')
+  .option('--project <name>', 'Filter by project (e.g. human-tasks)')
   .option('--format <fmt>', 'Output format: json or text', 'text')
   .option('--respect-deps', 'Sort DAG-aware: unblocked tasks first, blocked tasks last')
   .option('--include-archived', 'Also include compact-tasks archive entries (reconstructed summaries — see readCompactedTasks)')
-  .action((opts: { agent?: string; status?: string; format?: string; respectDeps?: boolean; includeArchived?: boolean }) => {
+  .action((opts: { agent?: string; status?: string; project?: string; format?: string; respectDeps?: boolean; includeArchived?: boolean }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
     const tasks = listTasks(paths, {
       agent: opts.agent,
       status: opts.status as TaskStatus,
+      project: opts.project,
       respectDeps: opts.respectDeps ?? false,
       includeArchived: opts.includeArchived ?? false,
     });
@@ -704,30 +712,42 @@ busCommand
       console.log('  No tasks found.');
       return;
     }
-
-    const PRIORITY_ICON: Record<string, string> = { urgent: '🔴', high: '🟠', normal: '🔵', low: '⚪' };
-    const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
-
-    console.log(`\n  Tasks (${tasks.length})\n`);
-    // ID column is 28 chars (current format max: task_<13>_<8> = 27 + 1 headroom);
-    // never substring the id — display must preserve identifier precision so
-    // copy-paste from the table cannot produce a non-existent ID. Same principle
-    // applied to assignee — pad-to-min-width, never truncate.
-    const header = '  Status  Pri  ID                          Assignee         Title';
-    const separator = '  ' + '-'.repeat(header.length - 2);
-    console.log(header);
-    console.log(separator);
-
-    for (const t of tasks) {
-      const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
-      const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
-      const id = t.id.padEnd(28);
-      const assignee = (t.assigned_to || '-').padEnd(17);
-      const title = t.title.substring(0, 50);
-      console.log(`  ${statusIcon}${priIcon}${id}${assignee}${title}`);
-    }
-    console.log('');
+    console.log(formatTaskTable(tasks));
   });
+
+/**
+ * Render the list-tasks text table. IDs are copy-paste targets for
+ * update-task/complete-task, so they are NEVER truncated — column widths
+ * come from the data (same pattern as the crons table). Every column is
+ * separated by 2+ spaces; the only column that may truncate is the trailing
+ * title, and truncation is marked with "…". (The previous fixed-width render
+ * cut every 27-char id to 26 with no delimiter before the assignee, which
+ * produced plausible-but-wrong ids when copied.)
+ */
+export function formatTaskTable(tasks: Task[]): string {
+  const PRIORITY_ICON: Record<string, string> = { urgent: '🔴', high: '🟠', normal: '🔵', low: '⚪' };
+  const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
+  const TITLE_MAX = 50;
+
+  const idW = Math.max(2, ...tasks.map(t => t.id.length));
+  const assigneeW = Math.max(8, ...tasks.map(t => (t.assigned_to || '-').length));
+
+  const lines: string[] = [];
+  lines.push(`\n  Tasks (${tasks.length})\n`);
+  const header = `  Status  Pri  ${'ID'.padEnd(idW)}  ${'Assignee'.padEnd(assigneeW)}  Title`;
+  lines.push(header);
+  lines.push('  ' + '-'.repeat(header.length - 2));
+  for (const t of tasks) {
+    const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
+    const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
+    const id = t.id.padEnd(idW);
+    const assignee = (t.assigned_to || '-').padEnd(assigneeW);
+    const title = t.title.length > TITLE_MAX ? t.title.substring(0, TITLE_MAX - 1) + '…' : t.title;
+    lines.push(`  ${statusIcon}${priIcon}${id}  ${assignee}  ${title}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
 
 busCommand
   .command('log-event')
@@ -1539,6 +1559,16 @@ busCommand
     const env = resolveEnv();
     const frameworkRoot = env.frameworkRoot || env.projectRoot || process.cwd();
     const result = checkUpstream(frameworkRoot, { apply: opts.apply });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+busCommand
+  .command('collect-merge-gate-metrics')
+  .description('Report gated_queue_depth/oldest_gated_age_days from the gh merge-ready label (canonical source; label lifecycle is operator-owned, this only reads)')
+  .argument('<repo>', 'GitHub repo in owner/name form')
+  .option('--label <name>', 'Label marking review-PASS+bake-elapsed PRs', 'merge-ready')
+  .action((repo: string, opts: { label?: string }) => {
+    const result = checkMergeGateMetrics(repo, { label: opts.label });
     console.log(JSON.stringify(result, null, 2));
   });
 
@@ -2683,13 +2713,18 @@ function fmtTs(iso: string | undefined): string {
 
 /**
  * Send a reload-crons IPC signal to the daemon (non-blocking, best-effort).
- * Silently swallows errors — the daemon will pick up changes on its next tick.
+ *
+ * This is a fast-path only: it asks the running scheduler to reload crons.json
+ * immediately.  If the signal cannot be delivered, the edit is NOT lost — the
+ * scheduler's tick loop stats crons.json every 30s and reloads on its own when
+ * the file mtime changes (see CronScheduler.tick mtime guard), so a durable
+ * crons.json edit takes effect within one tick regardless of this signal.
  */
 async function signalCronReload(agentName: string, instanceId: string): Promise<void> {
   try {
     const ipc = new IPCClient(instanceId);
     await ipc.send({ type: 'reload-crons', agent: agentName, source: 'cortextos bus cron-cmd' });
-  } catch { /* non-fatal — scheduler picks up file change on next 30s tick */ }
+  } catch { /* non-fatal — the tick loop detects the crons.json mtime change and reloads within ~30s */ }
 }
 
 busCommand
@@ -3076,9 +3111,17 @@ busCommand
         case 'migrated':
           console.log(
             `Migrated ${agentArg}: ${result.cronsMigrated} cron(s) migrated` +
-            (result.cronsSkipped?.length ? `, ${result.cronsSkipped.length} skipped (${result.cronsSkipped.join(', ')})` : '')
+            (result.cronsSkipped?.length ? `, ${result.cronsSkipped.length} skipped (${result.cronsSkipped.join(', ')})` : '') +
+            (result.cronsRefused?.length ? `, ${result.cronsRefused.length} REFUSED (${result.cronsRefused.join(', ')})` : '')
           );
           break;
+      }
+
+      // An unknown key/type must gate, not just print — checkable by exit
+      // code, not by reading log text.
+      if (result.cronsRefused?.length) {
+        console.error(`migrate-crons: ${result.cronsRefused.length} entr${result.cronsRefused.length === 1 ? 'y' : 'ies'} refused for "${agentArg}" — see REFUSED lines above.`);
+        process.exitCode = 1;
       }
     } else {
       // All-agents migration
@@ -3088,6 +3131,8 @@ busCommand
       const skippedAlready = summary.results.filter(r => r.status === 'skipped-already-migrated').length;
       const noConfig = summary.results.filter(r => r.status === 'no-config').length;
       const noCrons = summary.results.filter(r => r.status === 'no-crons').length;
+      const totalRefused = summary.results.reduce((sum, r) => sum + (r.cronsRefused?.length ?? 0), 0);
+      const agentsWithRefusals = summary.results.filter(r => (r.cronsRefused?.length ?? 0) > 0);
 
       console.log(`\nMigration summary:`);
       console.log(`  Agents processed    : ${summary.processed}`);
@@ -3095,6 +3140,15 @@ busCommand
       console.log(`  Already migrated    : ${skippedAlready}`);
       console.log(`  No config.json      : ${noConfig}`);
       console.log(`  No crons in config  : ${noCrons}`);
+      console.log(`  Entries refused     : ${totalRefused}`);
+
+      if (totalRefused > 0) {
+        console.error(
+          `migrate-crons: ${totalRefused} entr${totalRefused === 1 ? 'y' : 'ies'} refused across ${agentsWithRefusals.length} agent(s) ` +
+          `(${agentsWithRefusals.map(r => r.agentName).join(', ')}) — see REFUSED lines above.`
+        );
+        process.exitCode = 1;
+      }
     }
   });
 
@@ -3695,6 +3749,7 @@ busCommand
       console.log('  cortextos restart <agent-name>');
     }
   });
+
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));

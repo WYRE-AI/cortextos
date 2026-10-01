@@ -288,7 +288,11 @@ describe('AgentManager - duplicate agent names across orgs (BUG-011 false alarm 
     // getPid returns a LIVE pid so the start-path reconcile treats this as a
     // genuinely-running agent (an alive entry to queue), not a stale/dead one
     // to evict.
-    process: { stop: async () => {}, getPid: () => process.pid },
+    process: {
+      stop: async () => {},
+      getPid: () => process.pid,
+      getStatus: () => ({ name: 'alice', status: 'running', pid: process.pid }),
+    },
     checker: { stop() {} },
   });
 
@@ -306,13 +310,29 @@ describe('AgentManager - duplicate agent names across orgs (BUG-011 false alarm 
     expect(aliceCalls[0][3]).toBe('acme');
   });
 
-  it('startAgent still queues a pendingRestart when the agent is genuinely already registered (race safety net)', async () => {
+  it('startAgent still queues a pendingRestart when a teardown is genuinely in flight (race safety net)', async () => {
+    // Post-axis-3-adoption: an already-registered, alive agent only queues a
+    // pendingRestart when a concurrent stopAgent() teardown is actually in
+    // flight (stoppingAgents.has) or on post-crash discovery overlap
+    // (daemonJustCrashed) — see the per-case comments in startAgent(). A pure
+    // duplicate start against a healthy agent nobody is stopping is now an
+    // idempotent no-op instead, so this test pins the genuine race case.
+    const am = new AgentManager('default', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', fakeEntry());
+    (am as any).stoppingAgents.add('alice');
+
+    await am.startAgent('alice', join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'));
+
+    expect((am as any).pendingRestarts.has('alice')).toBe(true);
+  });
+
+  it('startAgent is an idempotent no-op for a pure duplicate start against a healthy agent nobody is stopping', async () => {
     const am = new AgentManager('default', ctxRoot, frameworkRoot, 'acme');
     (am as any).agents.set('alice', fakeEntry());
 
     await am.startAgent('alice', join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'));
 
-    expect((am as any).pendingRestarts.has('alice')).toBe(true);
+    expect((am as any).pendingRestarts.has('alice')).toBe(false);
   });
 
   it('evict drops a stale entry via dispose() — NEVER stop() (no delayed pty.kill on a recycled pid)', () => {
@@ -488,6 +508,73 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
     expect(statusAtStartTime.used_percentage).toBe(0);
     expect(statusAtStartTime.exceeds_200k_tokens).toBe(false);
     expect(startSpy).toHaveBeenCalledWith('alice', '');
+  });
+});
+
+describe('AgentManager.stopAgent - disable-resurrection fix (stop wins vs queued restart)', () => {
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-stop-test-'));
+    ctxRoot = join(testDir, 'instance');
+    frameworkRoot = join(testDir, 'framework');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('user-initiated stop drops a queued pendingRestart (stop wins)', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', {
+      process: { stop: vi.fn().mockResolvedValue(undefined) },
+      checker: { stop: vi.fn() },
+    });
+    (am as any).pendingRestarts.add('alice');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.stopAgent('alice', true);
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect((am as any).pendingRestarts.has('alice')).toBe(false);
+  });
+
+  it('internal (restart-all) stop still honors a queued pendingRestart (BUG-011 preserved)', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', {
+      process: { stop: vi.fn().mockResolvedValue(undefined) },
+      checker: { stop: vi.fn() },
+    });
+    (am as any).pendingRestarts.add('alice');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.stopAgent('alice');
+
+    expect(startSpy).toHaveBeenCalledWith('alice', '');
+  });
+
+  it('restart stop-half (userInitiated=false) honors the queued pendingRestart (regression #859)', async () => {
+    // Reproduces the restart flow at the manager level: restart's fire-and-forget
+    // stop races with its own start-agent, which queues a pendingRestart. With
+    // userInitiated=false the honor path must fire startAgent — restoring the
+    // pre-PR behavior the CI-invisible regression broke. (The manager's own
+    // default is false; "stop wins" lives at the IPC handler's `?? true`.)
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', {
+      process: { stop: vi.fn().mockResolvedValue(undefined) },
+      checker: { stop: vi.fn() },
+    });
+    (am as any).pendingRestarts.add('alice');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.stopAgent('alice', false);
+
+    expect(startSpy).toHaveBeenCalledWith('alice', '');
+    expect((am as any).pendingRestarts.has('alice')).toBe(false);
   });
 });
 

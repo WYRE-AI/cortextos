@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { sendMessage, checkInbox, checkInboxWithStatus, ackInbox } from '../../../src/bus/message';
+import { sendMessage, checkInbox, ackInbox, InboxLockUnavailableError } from '../../../src/bus/message';
 import { acquireLock, releaseLock } from '../../../src/utils/lock';
 import { resolvePaths } from '../../../src/utils/paths';
 import type { BusPaths } from '../../../src/types';
@@ -125,23 +125,24 @@ describe('Message Bus', () => {
       expect(inflightFiles.length).toBe(1);
     });
 
-    it('warns (rate-limited) when the inbox lock cannot be acquired', () => {
-      sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'test');
-      // Hold the lock from this (live) process so checkInbox cannot acquire it
-      expect(acquireLock(receiverPaths.inbox)).toBe(true);
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    it('throws InboxLockUnavailableError when the inbox lock is held — never a fake empty read', () => {
+      // A held (or permanently orphaned) lock must surface as a failure the
+      // caller can retry — returning [] here is indistinguishable from a
+      // successfully-read empty inbox and silently black-holes every message.
+      sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'must not vanish');
+      const held = acquireLock(receiverPaths.inbox);
+      expect(held).not.toBe(false);
       try {
-        expect(checkInbox(receiverPaths)).toEqual([]);
-        expect(warnSpy).toHaveBeenCalledTimes(1);
-        expect(String(warnSpy.mock.calls[0][0])).toContain(receiverPaths.inbox);
-
-        // Immediate re-check must not warn again (rate-limited per inbox)
-        expect(checkInbox(receiverPaths)).toEqual([]);
-        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(() => checkInbox(receiverPaths)).toThrow(InboxLockUnavailableError);
+        expect(() => checkInbox(receiverPaths)).toThrow(/Inbox lock unavailable/);
       } finally {
-        warnSpy.mockRestore();
-        releaseLock(receiverPaths.inbox);
+        if (held) releaseLock(held);
       }
+      // Once the lock is free the message is still there and delivers — nothing
+      // was consumed or lost during the locked window.
+      const messages = checkInbox(receiverPaths);
+      expect(messages.length).toBe(1);
+      expect(messages[0].text).toBe('must not vanish');
     });
   });
 
@@ -245,83 +246,5 @@ describe('Message Bus', () => {
       expect(backupInboxFiles.length).toBe(1);
       expect(existsSync(join(backupPaths.inbox, '.superseded'))).toBe(false);
     });
-  });
-});
-
-describe('inbox check completion status — "nothing there" vs "I did not look"', () => {
-  let testDir: string;
-  let paths: BusPaths;
-
-  beforeEach(() => {
-    testDir = mkdtempSync(join(tmpdir(), 'cortextos-inbox-status-'));
-    paths = {
-      ctxRoot: testDir,
-      inbox: join(testDir, 'inbox', 'receiver'),
-      inflight: join(testDir, 'inflight', 'receiver'),
-      processed: join(testDir, 'processed', 'receiver'),
-      logDir: join(testDir, 'logs', 'receiver'),
-      stateDir: join(testDir, 'state', 'receiver'),
-      taskDir: join(testDir, 'tasks'),
-      approvalDir: join(testDir, 'approvals'),
-      analyticsDir: join(testDir, 'analytics'),
-      heartbeatDir: join(testDir, 'heartbeats'),
-    };
-  });
-
-  afterEach(() => {
-    rmSync(testDir, { recursive: true, force: true });
-  });
-
-  // Hold the lock with a LIVE pid (our own), so acquireLock takes the
-  // "process is alive — lock is held" branch rather than stealing it as stale.
-  const holdInboxLock = (): void => {
-    mkdirSync(paths.inbox, { recursive: true });
-    const lockDir = join(paths.inbox, '.lock.d');
-    mkdirSync(lockDir, { recursive: true });
-    writeFileSync(join(lockDir, 'pid'), String(process.pid));
-  };
-
-  it('CONTROL: a genuinely empty inbox reports a COMPLETED check', () => {
-    const r = checkInboxWithStatus(paths);
-    expect(r.messages).toEqual([]);
-    expect(r.skipped).toBe(false); // real emptiness — safe to act on
-  });
-
-  it('CONTROL: the lock recipe actually blocks acquisition', () => {
-    // Without this, a lock that silently failed to hold would make the
-    // skipped-case test below pass for the wrong reason.
-    holdInboxLock();
-    expect(acquireLock(paths.inbox)).toBe(false);
-  });
-
-  it('a held lock reports the inbox was NOT checked', () => {
-    holdInboxLock();
-    const r = checkInboxWithStatus(paths);
-    expect(r.messages).toEqual([]);
-    expect(r.skipped).toBe(true); // [] here means "did not look", not "empty"
-  });
-
-  it('THE COLLAPSE: a wedged inbox and an empty one are identical through the wrapper', () => {
-    const empty = checkInbox(paths);
-    holdInboxLock();
-    const wedged = checkInbox(paths);
-    // This is what `bus check-inbox` prints, and what an agent reads as
-    // "inbox empty, nothing owed to anyone". Wrapper is intentionally lossy.
-    expect(JSON.stringify(empty)).toBe(JSON.stringify(wedged));
-  });
-
-  it('a real message still arrives, and reports a completed check', () => {
-    sendMessage(paths, 'sender', 'receiver', 'normal', 'hello');
-    const r = checkInboxWithStatus(paths);
-    expect(r.messages.length).toBe(1);
-    expect(r.skipped).toBe(false);
-  });
-
-  it('a held lock does NOT consume messages — they survive for the next poll', () => {
-    sendMessage(paths, 'sender', 'receiver', 'normal', 'hello');
-    holdInboxLock();
-    expect(checkInboxWithStatus(paths).messages).toEqual([]);
-    rmSync(join(paths.inbox, '.lock.d'), { recursive: true, force: true });
-    expect(checkInboxWithStatus(paths).messages.length).toBe(1);
   });
 });

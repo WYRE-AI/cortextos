@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync } from 'fs';
 import { execFile } from 'child_process';
-import { join } from 'path';
+import { join, dirname, basename } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import { readCrons } from '../bus/crons.js';
@@ -18,7 +18,7 @@ import { evaluateHang, evaluateBootstrapHang, mostRecentAnswerableFireMs, hasBea
 const HANG_GRACE_MS = 15 * 60_000;
 import { isLimitBlocked } from './rotation-manager.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
-import { checkInbox, ackInbox } from '../bus/message.js';
+import { checkInbox, ackInbox, sendMessage } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -45,6 +45,14 @@ export function handoffGraceMs(runtime: string | undefined): number {
 }
 
 /**
+ * Percentage points of context growth beyond the session baseline that count as
+ * real work-fill. Below this margin, a session born at/above the handoff
+ * threshold has done no meaningful work, so a handoff is futile — the fresh
+ * session would be reborn at the same baseline and re-fire.
+ */
+const WORKFILL_MARGIN = 10;
+
+/**
  * Fast message checker for a single agent.
  * Replaces fast-checker.sh: polls Telegram and inbox, injects into PTY.
  */
@@ -68,6 +76,15 @@ export class FastChecker {
 
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
+
+  // External Buzz (Nostr/NIP-29) handler — SP3b-style parallel queue
+  // alongside telegramMessages, reusing the same isDuplicate dedup. Currently
+  // unfed: the daemon-side Buzz subsystem (src/buzz/*) is parked pending an
+  // Aaron product decision (2026-10-01 upstream sync), so nothing calls
+  // queueBuzzMessage() yet. Kept rather than stripped — it has no dependency
+  // on the parked subsystem itself, just this shaped queue — so it's ready
+  // to wire back up the moment Buzz is adopted.
+  private buzzMessages: Array<{ formatted: string }> = [];
 
   // External Slack handler (set by daemon's SP3b dispatcher). Deliberately a
   // separate queue from telegramMessages, not a shared one: draining it must
@@ -106,6 +123,15 @@ export class FastChecker {
   private ctxCircuitBrokenAt: number | null = null; // when circuit tripped (null = healthy)
   // Persisted to disk so --continue restarts don't reset the circuit breaker
   private ctxCircuitFile: string = '';
+  // Per-session (NOT persisted): first trustworthy ctx reading of this session,
+  // captured once the post-start grace window has expired. null = not yet captured.
+  private ctxSessionBaselinePct: number | null = null;
+  // Per-session (NOT persisted): once-per-session throttle for the futile-handoff alert.
+  private ctxBaselineAlertFiredAt: number = 0;
+  // Accepted edge: on the null-session_id restart path the new-session block is skipped,
+  // so these two fields (like the other per-session ctx fields) can carry a prior session's
+  // value across a cooperative restart. forceContextRestart resets them, and the guard is
+  // inert whenever ctxSessionStartedAt is 0, so this is no worse than the existing fields.
 
   // Hang detector (DETECTION path — catches non-context / environmental session freezes
   // that no context-% threshold sees: a --continue-resumed session frozen mid-turn that
@@ -130,7 +156,13 @@ export class FastChecker {
     agent: AgentProcess,
     paths: BusPaths,
     frameworkRoot: string,
-    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number } = {},
+    options: {
+      pollInterval?: number;
+      log?: LogFn;
+      telegramApi?: TelegramAPI;
+      chatId?: string;
+      allowedUserId?: number;
+    } = {},
   ) {
     this.agent = agent;
     this.paths = paths;
@@ -253,6 +285,15 @@ export class FastChecker {
   }
 
   /**
+   * Queue a formatted Buzz message for injection.
+   * Called by the daemon's BuzzRelayClient message handler. Currently unfed
+   * — see buzzMessages' declaration.
+   */
+  queueBuzzMessage(formatted: string): void {
+    this.buzzMessages.push({ formatted });
+  }
+
+  /**
    * Queue a formatted Slack message for injection.
    * Called by the daemon's SP3b Slack dispatcher.
    */
@@ -267,24 +308,48 @@ export class FastChecker {
     let messageBlock = '';
     const ackIds: string[] = [];
 
-    // Process queued Telegram messages
-    let hasTelegramMessage = false;
+    // Process queued transport messages. Drain into local buffers rather than
+    // discarding outright — if injection fails (agent mid-restart, or deduped)
+    // we must re-queue, since these in-memory queues are the ONLY backing store
+    // for Telegram/Buzz/Slack (no inbox-style ACK/redelivery). Mirrors the
+    // inbox ACK-after-inject recovery model below.
+    const drainedTelegram: typeof this.telegramMessages = [];
     while (this.telegramMessages.length > 0) {
       const msg = this.telegramMessages.shift()!;
       messageBlock += msg.formatted;
-      hasTelegramMessage = true;
+      drainedTelegram.push(msg);
+    }
+    const hasTelegramMessage = drainedTelegram.length > 0;
+
+    // Process queued Buzz messages
+    const drainedBuzz: typeof this.buzzMessages = [];
+    while (this.buzzMessages.length > 0) {
+      const msg = this.buzzMessages.shift()!;
+      messageBlock += msg.formatted;
+      drainedBuzz.push(msg);
     }
 
     // Process queued Slack messages. Deliberately does NOT set
     // hasTelegramMessage / lastMessageInjectedAt — see slackMessages'
     // declaration for why the typing-indicator timer must stay
     // Telegram-only.
+    const drainedSlack: typeof this.slackMessages = [];
     while (this.slackMessages.length > 0) {
-      messageBlock += this.slackMessages.shift()!;
+      const msg = this.slackMessages.shift()!;
+      messageBlock += msg;
+      drainedSlack.push(msg);
     }
 
-    // Check agent inbox
-    const inboxMessages = checkInbox(this.paths);
+    // Check agent inbox. A refused inbox lock throws InboxLockUnavailableError;
+    // keep independent transport delivery moving, but make the failure explicit
+    // in the daemon log — the next poll retries instead of claiming a
+    // successful empty inbox.
+    let inboxMessages: InboxMessage[] = [];
+    try {
+      inboxMessages = checkInbox(this.paths);
+    } catch (err) {
+      this.log(`Inbox check failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     for (const msg of inboxMessages) {
       messageBlock += this.formatInboxMessage(msg);
       ackIds.push(msg.id);
@@ -292,8 +357,12 @@ export class FastChecker {
 
     // Inject if there's anything
     if (messageBlock) {
-      const injected = this.agent.injectMessage(messageBlock);
-      if (injected) {
+      // The detailed result matters here: a bare boolean conflates NOT_RUNNING
+      // with DEDUPED, and re-queueing a DEDUPED batch would park it in the
+      // queue forever (every retry dedups again) or replay it later alongside
+      // new traffic. Only NOT_RUNNING is retriable.
+      const injected = this.agent.injectMessageDetailed(messageBlock);
+      if (injected.ok) {
         // ACK inbox messages
         for (const id of ackIds) {
           ackInbox(this.paths, id);
@@ -307,6 +376,25 @@ export class FastChecker {
         }
         // Cooldown after injection
         await sleep(5000);
+      } else if (
+        injected.code === 'NOT_RUNNING' &&
+        (drainedTelegram.length > 0 || drainedBuzz.length > 0 || drainedSlack.length > 0)
+      ) {
+        // Agent not running (mid-restart). Re-queue the drained transport
+        // messages at the FRONT so they are retried next cycle in original
+        // order. Inbox messages need no action — they were never ACK'd, so
+        // checkInbox redelivers them. Without this, inbound transport traffic
+        // during a restart is silently and permanently lost.
+        this.telegramMessages.unshift(...drainedTelegram);
+        this.buzzMessages.unshift(...drainedBuzz);
+        this.slackMessages.unshift(...drainedSlack);
+        const requeued = drainedTelegram.length + drainedBuzz.length + drainedSlack.length;
+        this.log(`Inject failed (${injected.code}); re-queued ${requeued} transport message(s)`);
+      } else if (!injected.ok) {
+        // DEDUPED: an identical block was already injected — treat as
+        // delivered and drop the drained copies. Re-queueing would never
+        // succeed (each retry dedups again) and could replay the batch later.
+        this.log(`Inject skipped (${injected.code}); dropped duplicate transport batch`);
       }
     }
 
@@ -386,6 +474,29 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     return `=== TELEGRAM from [USER: ${sanitizeForPtyInjection(from)}] (chat_id:${chatId}) ===
 ${replyCx}${historyCx}${body}
 ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+
+`;
+  }
+
+  /**
+   * Format a Buzz (Nostr/NIP-29) channel message for injection.
+   * Mirrors formatTelegramTextMessage's shape: [USER: ...] wrapper against
+   * display-name injection, fence-safe body, slash commands passed through
+   * unfenced so the Skill tool can still invoke them. Currently unfed — see
+   * buzzMessages' declaration.
+   */
+  static formatBuzzTextMessage(
+    from: string,
+    channelId: string,
+    text: string,
+  ): string {
+    const isSlashCommand = /^\/[a-zA-Z]/.test(stripControlChars(text).trim());
+    const body = isSlashCommand
+      ? sanitizeForPtyInjection(text).trim()
+      : wrapFenceSafe(text);
+    return `=== BUZZ from [USER: ${sanitizeForPtyInjection(from)}] (channel:${channelId}) ===
+${body}
+Reply using: cortextos buzz send --channel ${channelId} --text '<your reply>'
 
 `;
   }
@@ -1071,6 +1182,26 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
   }
 
   /**
+   * Resolve the org's configured orchestrator agent name, or null if none is
+   * configured / resolvable. Mirrors how the daemon reads it elsewhere
+   * (agent-manager.maybeStartSlackSocketMode, AgentProcess.buildDeliverablesBlock):
+   * the `orchestrator` field lives in orgs/<org>/context.json under the framework
+   * root. The org is derived from the agent directory, whose canonical layout is
+   * <root>/orgs/<org>/agents/<name> (see add-agent.ts / resolvePaths). Returns null
+   * on any failure so the caller degrades to log-only.
+   */
+  private resolveOrchestratorName(): string | null {
+    try {
+      const org = basename(dirname(dirname(this.agent.getAgentDir())));
+      const contextPath = join(this.frameworkRoot, 'orgs', org, 'context.json');
+      const orchestrator = JSON.parse(readFileSync(contextPath, 'utf-8')).orchestrator;
+      return typeof orchestrator === 'string' && orchestrator ? orchestrator : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Context monitor — called on every poll cycle.
    * Reads context_status.json written by the statusLine bridge hook and takes
    * action when thresholds are crossed.
@@ -1125,6 +1256,8 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
           this.ctxHandoffFiredAt = 0;
           this.ctxHandoffDeadlineAt = 0;
           this.ctxWarningFiredAt = 0;
+          this.ctxSessionBaselinePct = null;
+          this.ctxBaselineAlertFiredAt = 0;
           this.log(`New session detected (${incomingSessionId.slice(0, 8)}…) — per-session ctx state reset`);
         }
         this.ctxLastSessionId = incomingSessionId;
@@ -1134,6 +1267,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         // app-server threads that briefly report prior prompt-cache tokens) that would
         // otherwise fire an immediate handoff → restart → fresh-session loop.
         this.ctxSessionStartedAt = now;
+        // Capture the baseline AT this true session-birth reading, not lazily on
+        // the first post-grace poll below — a session that does real work during
+        // the grace window itself (e.g. a slow poll cadence, or simply a session
+        // that grows fast) would otherwise have that genuine work-fill mistaken
+        // for baseline, permanently suppressing a handoff it actually needs.
+        this.ctxSessionBaselinePct = pct ?? (exceeds200k ? 101 : null);
       }
     } catch { return; }
 
@@ -1223,6 +1362,13 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       return;
     }
 
+    // The session baseline (if any) was already captured above, at the true
+    // session-birth reading observed when this session's session_id first
+    // appeared. A FastChecker instance that was never present for that
+    // transition (respawned mid-session) never observed a birth reading, so
+    // ctxSessionBaselinePct stays null and the futile-handoff guard below
+    // stays inert — legacy handoff behavior is preserved for that case.
+
     // Tier 1: warning — PTY injection only, no Telegram ping (context management is internal)
     if (effectivePct >= warn && !withinHandoffGrace && now - this.ctxWarningFiredAt > 15 * 60_000) {
       this.ctxWarningFiredAt = now;
@@ -1234,6 +1380,41 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
     // Tier 2: handoff (fires once per session lifecycle)
     if (effectivePct >= handoff && this.ctxHandoffFiredAt === 0 && !withinHandoffGrace) {
+      // Futile-handoff guard. A session BORN at/above the handoff threshold cannot be
+      // helped by a handoff — the fresh session inherits the same heavy resume baseline
+      // and re-fires immediately, thrashing in ~3-min clusters until the 3-fire breaker
+      // pauses auto-handoff. Suppress ONLY when the captured baseline itself meets/exceeds
+      // threshold AND almost no work-fill has accumulated on top of it. A born-low session
+      // that grows into the threshold (baseline < handoff) is the healthy path and reaches
+      // the normal handoff below untouched. Returning here means no lease is acquired, no
+      // fire is counted toward the 3-fire breaker, no Tier-3 deadline is armed, and no
+      // .force-fresh is pre-written — the handoff simply idles until real work-fill lands.
+      if (
+        this.ctxSessionBaselinePct !== null
+        && this.ctxSessionBaselinePct >= handoff
+        && effectivePct - this.ctxSessionBaselinePct < WORKFILL_MARGIN
+      ) {
+        if (this.ctxBaselineAlertFiredAt === 0) {
+          this.ctxBaselineAlertFiredAt = now;
+          const msg = `Context handoff SUPPRESSED for ${this.agent.name}: resume baseline `
+            + `${Math.round(this.ctxSessionBaselinePct)}% already meets/exceeds the ${handoff}% handoff `
+            + `threshold. A handoff cannot reduce a baseline it did not create — the fresh session would `
+            + `be born at the same level and re-fire. Review ctx_handoff_threshold or trim this agent's `
+            + `bootstrap. Auto-handoff idle until real work-fill accumulates.`;
+          this.log(msg);
+          // Route to the org's configured orchestrator as an internal bus message (agent
+          // inbox), NOT to the human's Telegram — this is an infra event, not a user ping.
+          // Best-effort: skip if no orchestrator is configured or it would be self-messaging,
+          // and swallow any bus failure — the this.log line above is the durable audit trail.
+          const orchestrator = this.resolveOrchestratorName();
+          if (orchestrator && orchestrator !== this.agent.name) {
+            try {
+              sendMessage(this.paths, this.agent.name, orchestrator, 'normal', msg);
+            } catch { /* non-fatal — bus send is best-effort */ }
+          }
+        }
+        return;
+      }
       const lease = requestContextHandoffLease({
         ctxRoot: this.paths.ctxRoot,
         agentName: this.agent.name,
@@ -1356,6 +1537,8 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     this.ctxHandoffFiredAt = 0;
     this.ctxHandoffDeadlineAt = 0;
     this.ctxWarningFiredAt = 0;
+    this.ctxSessionBaselinePct = null;
+    this.ctxBaselineAlertFiredAt = 0;
 
     // Release this dying session's context-handoff lease on teardown. This restart is
     // IN-PROCESS — sessionRefresh() below does stop()+start() on the same AgentProcess

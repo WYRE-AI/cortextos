@@ -2,6 +2,72 @@
 
 ## [Unreleased]
 
+### Changed — merged upstream `grandamenium/cortextos` main (2026-10-01, 49 real conflicts / 496 files)
+
+Third upstream sync since the fork. Four architecture axes needed explicit rulings rather than a
+mechanical merge: pluggable connectors (`MessageConnector`/`TelegramConnector`/`NullConnector`) —
+stripped from every call site, new `src/connectors/*` kept on disk unregistered for a future
+adoption decision; Slack — kept our own `src/slack/*` stack as the live runtime, upstream's parallel
+hardened stack removed, porting its fail-closed identity gate and SSN redaction into our
+architecture tracked separately; per-agent concurrency control (`evictingAgents`/`stoppingAgents`
+sets, `isAgentActuallyAlive()`, `stillMapped()`) — adopted as the new foundation in
+`agent-manager.ts`, a genuine hardening of our simpler mechanism, coexisting with our own
+whole-fleet `stoppingAll` flag which protects a different scenario; the Buzz/Nostr messaging
+subsystem — parked, new `src/buzz/*` kept on disk unregistered, all call sites that had silently
+auto-merged with zero conflict markers were stripped.
+
+Also adopted: upstream's handle-based generation-ownership lock (`src/utils/lock.ts`,
+`LockHandle`/`acquireLock(): LockHandle | false`/`releaseLock(handle)`), `checkInboxWithStatus()`
+now throwing `InboxLockUnavailableError` on a held lock instead of silently returning
+`{messages: [], skipped: true}` (a permanently orphaned lock must surface as a failure the caller
+can retry, never read as a successfully-checked empty inbox), and a Telegram poller improvement —
+exponential backoff with jitter, honoring a 429 `retry_after` hint capped at 5 minutes so a hostile
+or buggy hint can't freeze the poller for an hour.
+
+A conflict-marker sweep alone missed two wholesale-file-replacement near-misses with zero textual
+overlap against our side: `src/telegram/{index,media,poller,transcribe}.ts` had silently become
+2-line `@deprecated` re-export shims pointing at the parked connector stack (restored to our own
+implementation), and `src/cli/bus.ts` had picked up 3 new CLI commands built against upstream's
+incompatible Slack API signature plus a dangling import to a deleted module (removed, redundant
+with our existing `bus/send-slack.sh` anyway). A repo-wide grep for the new architecture's import
+paths across the whole tree, not just conflicted files, is what caught both.
+
+### Fixed — context-handoff futile-baseline guard captured the session baseline on the wrong reading
+
+The futile-handoff guard (suppresses a context-handoff when a session was born already at/above
+threshold, since a fresh session would inherit the same baseline and immediately re-fire) captured
+`ctxSessionBaselinePct` lazily, on the first poll after the post-start grace window expired — not
+at the session's actual birth. A session that did real, substantive work during the grace window
+itself (slow poll cadence, or simply fast context growth) had that genuine work-fill captured as
+"baseline" instead, permanently suppressing a handoff the session actually needed: once baseline
+reads at/above threshold with ~no further growth since, the guard idles forever.
+
+Moved the capture to the session-id-transition point itself, using the same reading that anchors
+`ctxSessionStartedAt` — the true birth reading, not whatever the context happened to be by the time
+the first post-grace poll fired. A `FastChecker` instance that never observed the session's birth
+(respawned mid-session) still never captures a baseline, preserving the existing degrade-to-inert
+behavior for that case.
+
+### Fixed — `GET /api/workflows/crons` re-read each agent's execution log once per cron
+
+`readLastExecution(agent, cronName)` re-read and re-parsed the agent's entire
+`cron-execution.log` once **per cron**. At 10 crons per agent that is ten full
+reads of the same file per request. `/health` already read each agent's log
+exactly once, which is why it benchmarked several times faster than `/crons`
+over the same dataset.
+
+Replaced with a single forward pass per agent building a
+`Map<cronName, lastEntry>`; later lines overwrite earlier ones, so the map
+naturally holds "last entry in file order wins" exactly. Cost is now O(agents)
+reads instead of O(crons).
+
+Measured on `tests/integration/phase4-performance.test.ts`:
+
+| dataset | p50 before | p50 after | p95 before | p95 after |
+|---|---|---|---|---|
+| 50 crons  | 79.0ms | **19.4ms** | 88.7ms | **21.5ms** |
+| 100 crons | 76.3ms | **18.0ms** | 77.3ms | **18.8ms** |
+
 ### Fixed — `migration-collision-check.yml`'s cross-PR scan had no base-branch filter and a hardcoded 300-PR cap
 
 Check 2 (the cross-PR migration-number collision scan) called `gh pr list --repo REPO --state open

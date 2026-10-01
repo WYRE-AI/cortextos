@@ -44,7 +44,16 @@ export class SlackAPI {
     if (!token) throw new Error('SlackAPI: token is required');
   }
 
-  /** Generic Slack API call helper — handles auth, JSON, and ok=false errors. */
+  /**
+   * Generic Slack API call helper — handles auth, JSON, and ok=false errors.
+   *
+   * 10s timeout: without one a black-holed connection hangs this await
+   * forever. getUserInfo() is awaited from agent-manager.ts's Slack Socket
+   * Mode message handler (resolveUserName), so a hung call here stalls that
+   * inbound Slack message's dispatch indefinitely rather than failing fast
+   * and letting the next event through. Matches the timeout convention
+   * already used throughout src/telegram/api.ts's post()/postUnpooled().
+   */
   private async call<T>(method: string, body: Record<string, unknown>): Promise<T> {
     const res = await fetch(`https://slack.com/api/${method}`, {
       method: 'POST',
@@ -53,6 +62,7 @@ export class SlackAPI {
         'Content-Type': 'application/json; charset=utf-8',
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
     });
     const json = (await res.json()) as { ok: boolean; error?: string } & T;
     if (!json.ok) {

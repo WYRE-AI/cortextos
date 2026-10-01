@@ -95,6 +95,20 @@ export function sendMessage(
 }
 
 /**
+ * Distinguishes an unreadable inbox from a successfully-read empty inbox.
+ * Production callers must surface this state and retry; they must never emit
+ * the successful empty representation (`[]`).
+ */
+export class InboxLockUnavailableError extends Error {
+  readonly code = 'INBOX_LOCK_UNAVAILABLE';
+
+  constructor(readonly inbox: string) {
+    super(`Inbox lock unavailable: ${inbox}`);
+    this.name = 'InboxLockUnavailableError';
+  }
+}
+
+/**
  * Check inbox for pending messages.
  * Reads inbox directory, moves messages to inflight, returns sorted array.
  * Recovers stale inflight messages (>5 minutes old).
@@ -137,15 +151,12 @@ export function checkInboxWithStatus(paths: BusPaths): InboxCheck {
   ensureDir(inbox);
   ensureDir(inflight);
 
-  // Acquire lock
-  if (!acquireLock(inbox)) {
-    const now = Date.now();
-    const last = lockWarnLastAt.get(inbox) ?? 0;
-    if (now - last >= LOCK_WARN_INTERVAL_MS) {
-      lockWarnLastAt.set(inbox, now);
-      console.warn(`[bus/message] WARNING: could not acquire inbox lock at ${inbox} — delivery skipped this poll (stale .lock.d?)`);
-    }
-    return { messages: [], skipped: true };
+  // Acquire lock. A refused lock throws rather than returning [] — a permanently
+  // orphaned lock must look like a failure to the caller, never like a
+  // successfully-read empty inbox (which silently black-holes every message).
+  const lockHandle = acquireLock(inbox);
+  if (!lockHandle) {
+    throw new InboxLockUnavailableError(inbox);
   }
   lockWarnLastAt.delete(inbox);
 
@@ -211,7 +222,10 @@ export function checkInboxWithStatus(paths: BusPaths): InboxCheck {
     // one meaning: the inbox was never opened.
     return { messages, skipped: false };
   } finally {
-    releaseLock(inbox);
+    // Release is bound to the acquired generation handle: if another process
+    // legitimately stole this lock as stale mid-operation, this release is a
+    // no-op instead of destroying the new holder's lock.
+    releaseLock(lockHandle);
   }
 }
 

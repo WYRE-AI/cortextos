@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import type { EventCategory, EventSeverity, BusPaths, Heartbeat } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { withFileLockSync } from '../utils/lock.js';
 import { randomString } from '../utils/random.js';
 import { validateEventCategory, validateEventSeverity, isValidJson } from '../utils/validate.js';
 
@@ -87,9 +88,19 @@ function refreshHeartbeatTimestamp(paths: BusPaths, timestamp: string): void {
   try {
     const hbPath = join(paths.stateDir, 'heartbeat.json');
     if (!existsSync(hbPath)) return;
-    const hb = JSON.parse(readFileSync(hbPath, 'utf-8')) as Heartbeat;
-    hb.last_heartbeat = timestamp;
-    atomicWriteSync(hbPath, JSON.stringify(hb));
+    // This read-modify-write is NOT atomic against a concurrent full overwrite
+    // in updateHeartbeat(): without a lock, this reader can load a stale
+    // heartbeat, an explicit update writes new status/mode/task fields, and then
+    // this write clobbers them back to stale (TOCTOU lost update). Take the same
+    // per-agent stateDir lock updateHeartbeat() takes so the read+write is
+    // serialized against it. withFileLockSync may throw on timeout; the
+    // surrounding try/catch keeps the refresh best-effort and never blocks the
+    // already-persisted event.
+    withFileLockSync(paths.stateDir, () => {
+      const hb = JSON.parse(readFileSync(hbPath, 'utf-8')) as Heartbeat;
+      hb.last_heartbeat = timestamp;
+      atomicWriteSync(hbPath, JSON.stringify(hb));
+    });
   } catch {
     // Best-effort — event already persisted, heartbeat refresh is secondary.
   }
