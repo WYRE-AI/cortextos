@@ -27,6 +27,24 @@ export interface CronActionCredentials {
 export interface CronActionResult {
   run_id: number;
   run_url: string;
+  /**
+   * `null` means the run was still `in_progress` at the one poll this
+   * function takes — NOT a failure or an unknown outcome, just "ask
+   * `run_url` later if you want to know how it finished." This is a common,
+   * expected result, not an edge case: the poll happens exactly once, 15s
+   * after dispatch (see `RUN_LOOKUP_DELAY_MS`), and a live end-to-end test
+   * during development (task_1790952782650) measured ~35s dispatch-to-
+   * completion for a real workflow — i.e. for a workflow in that ballpark
+   * or slower, `null` is the LIKELY outcome, not the exception. This
+   * function's guarantee is "the dispatch was accepted and a run was
+   * observed to start," not "confirmed success" — catching that GitHub's
+   * own scheduler never fired the workflow at all is the whole point; the
+   * workflow's own pass/fail is secondary and these production workflows
+   * already have their own failure visibility. A single longer poll or a
+   * retry-poll loop was deliberately not added, to keep this a bounded,
+   * cheap, no-judgment daemon action rather than something that waits on
+   * (and inherits the failure modes of) a long-running external job.
+   */
   conclusion: string | null;
 }
 

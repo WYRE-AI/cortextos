@@ -1512,7 +1512,12 @@ export class AgentManager {
           );
         }
         const result = await runCronAction(cron.action, { appId, privateKey });
-        console.log(`[daemon] cron "${cron.name}" dispatched: ${result.run_url} (${result.conclusion})`);
+        // `conclusion: null` means still in_progress at the one poll
+        // runCronAction takes (common for a workflow slower than the poll
+        // delay — see CronActionResult.conclusion) — NOT a failure. Log it
+        // as such so this line doesn't read as a dangling/ambiguous result.
+        const conclusionLabel = result.conclusion ?? 'still running, check run_url';
+        console.log(`[daemon] cron "${cron.name}" dispatched: ${result.run_url} (${conclusionLabel})`);
         return;
       }
 
