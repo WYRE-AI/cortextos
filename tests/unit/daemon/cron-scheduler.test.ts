@@ -32,7 +32,7 @@ vi.mock('../../../src/bus/crons.js', () => ({
 // Imports AFTER mock setup
 // ---------------------------------------------------------------------------
 
-import { CronScheduler, nextFireFromCron, computeReferenceMs } from '../../../src/daemon/cron-scheduler';
+import { CronScheduler, NonRetryableError, nextFireFromCron, computeReferenceMs } from '../../../src/daemon/cron-scheduler';
 import type { CronDefinition } from '../../../src/types/index';
 
 // ---------------------------------------------------------------------------
@@ -471,6 +471,32 @@ describe('CronScheduler', () => {
     );
 
     retryScheduler.stop();
+  });
+
+  it('does not retry onFire when it throws NonRetryableError', async () => {
+    const failingFire = vi.fn().mockRejectedValue(new NonRetryableError('dispatched run concluded "failure"'));
+    mockReadCrons.mockReturnValue([
+      makeCron({
+        schedule:      '24h',
+        created_at:    new Date(Date.now() - 48 * 3_600_000).toISOString(),
+        last_fired_at: new Date(Date.now() - 25 * 3_600_000).toISOString(),
+      }),
+    ]);
+
+    const logs: string[] = [];
+    const noRetryScheduler = new CronScheduler({
+      agentName: 'test-agent',
+      onFire: failingFire,
+      logger: (msg) => logs.push(msg),
+    });
+    noRetryScheduler.start();
+
+    await vi.advanceTimersByTimeAsync(TICK + 1_000 + 4_000 + 16_000 + 1_000);
+
+    expect(failingFire).toHaveBeenCalledTimes(1);
+    expect(logs.some(l => l.includes('non-retryable'))).toBe(true);
+
+    noRetryScheduler.stop();
   });
 
   it('succeeds on second attempt (first fails, second succeeds)', async () => {

@@ -2733,6 +2733,10 @@ busCommand
       console.error('Error: --action-repo and --action-workflow must be given together.');
       process.exit(1);
     }
+    if (!opts.actionRepo && (opts.actionRef !== undefined || opts.actionInput !== undefined)) {
+      console.error('Error: --action-ref and --action-input require --action-repo and --action-workflow.');
+      process.exit(1);
+    }
     let action: CronDefinition['action'];
     if (opts.actionRepo && opts.actionWorkflow) {
       if (!/^[^/\s]+\/[^/\s]+$/.test(opts.actionRepo)) {
@@ -2745,6 +2749,9 @@ busCommand
           const parsed: unknown = JSON.parse(opts.actionInput);
           if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
             throw new Error('must be a JSON object');
+          }
+          for (const [k, v] of Object.entries(parsed)) {
+            if (typeof v !== 'string') throw new Error(`input "${k}" must be a string`);
           }
           inputs = parsed as Record<string, string>;
         } catch (err) {
