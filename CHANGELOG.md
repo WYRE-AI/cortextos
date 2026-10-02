@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Added — non-agent cron action: `github-workflow-dispatch`
+
+Some crons need no model judgment at all: dispatch a GitHub Actions workflow on a schedule
+GitHub's own `schedule:` trigger can't be trusted for. GitHub's scheduler-dispatch is delayed
+2-8h, uniformly, account-wide (task_1790882172065) — invisible on anything with more slack than
+the delay, but it destroys a cadence shorter than the delay itself (a 30-min cron observed
+firing at ~10-15% of nominal).
+
+`CronDefinition` gains an optional `action` field (`src/types/index.ts`). When set, the daemon's
+`onFire` handler (`src/daemon/agent-manager.ts`) runs the action directly — mint a GitHub App
+installation token (reusing the existing `mintInstallationToken()`, already used by the
+`gh-app-token` CLI command), POST the `workflow_dispatch` REST call, poll once for the resulting
+run's conclusion, log the result — and returns without ever injecting a PTY prompt. No agent
+turn at all, per the 2026-08-15 observer-principle lesson: a dispatcher that needs no judgment
+shouldn't ride a model-backed session, since it inherits credit-exhaustion and session-failure
+modes for zero benefit. Fully backward compatible — `action` is undefined for every existing
+cron fleet-wide, and the branch is a no-op when absent.
+
+`bus add-cron` gains `--action-repo`/`--action-workflow`/`--action-ref`/`--action-input` to
+author these from the CLI. Credentials (`GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY`) are read from
+the daemon's own process environment, the same place `SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN` already
+live — not per-agent `.env`, since this is one shared GitHub App installation, not a per-agent
+secret.
+
+New `src/daemon/cron-actions.ts` (the action runner) with its own unit tests
+(`tests/unit/daemon/cron-actions.test.ts`), plus `onFire`-branch tests in
+`tests/unit/daemon/agent-manager.test.ts` proving an action cron never calls `injectAgent` and a
+normal cron is completely unaffected.
+
 ### Fixed — `migration-collision-check.yml`'s cross-PR scan had no base-branch filter and a hardcoded 300-PR cap
 
 Check 2 (the cross-PR migration-number collision scan) called `gh pr list --repo REPO --state open

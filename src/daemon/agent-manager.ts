@@ -8,6 +8,7 @@ import { CronScheduler } from './cron-scheduler.js';
 import { ReminderScheduler } from './reminder-scheduler.js';
 import { migrateCronsForAgent } from './cron-migration.js';
 import type { CronDefinition } from '../types/index.js';
+import { runCronAction } from './cron-actions.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
 import { SlackAPI } from '../slack/api.js';
@@ -1493,6 +1494,28 @@ export class AgentManager {
     const GOAL_INJECTION_GAP_MS = 2000;
 
     const onFire = async (cron: CronDefinition): Promise<void> => {
+      // Action crons bypass the agent entirely — no PTY injection, no model
+      // turn. Same fleet-wide credential as Slack's socket-mode client above
+      // (process.env, not per-agent .env — a shared GitHub App installation,
+      // not a per-agent secret). Throws straight through to fireWithRetry's
+      // existing retry/logging wrapper on any failure, including a missing
+      // credential — unlike Slack's silent-skip-when-unconfigured, a cron
+      // someone deliberately created that can't authenticate is a real
+      // failure, not an optional-feature no-op, so it should fail loudly.
+      if (cron.action) {
+        const appId = process.env.GITHUB_APP_ID;
+        const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
+        if (!appId || !privateKey) {
+          throw new Error(
+            `cron "${cron.name}" has an action but GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY ` +
+            `are not set in the daemon's environment`,
+          );
+        }
+        const result = await runCronAction(cron.action, { appId, privateKey });
+        console.log(`[daemon] cron "${cron.name}" dispatched: ${result.run_url} (${result.conclusion})`);
+        return;
+      }
+
       const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
       // Salt with the fire timestamp so MessageDedup (which hashes the last 100
       // injects) does not reject identical cron prompts on subsequent fires.
