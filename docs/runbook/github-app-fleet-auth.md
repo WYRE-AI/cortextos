@@ -6,7 +6,9 @@ Least-privilege, per-installation scoped, no personal account in the loop.
 ## The App
 
 - Name: **WYRE Agent Fleet** (slug `wyre-agent-fleet`, App id `4317194`), owned by `wyre-technology`.
-- Permissions: `contents:write`, `pull_requests:write`, `actions:write`, `packages:write`, `checks:write`, `metadata:read`.
+- Permissions: `contents:write`, `pull_requests:write`, `actions:write`, `packages:write`, `checks:write`, `workflows:write`, `metadata:read`.
+  Re-verified live 2026-09-20 via `GET /app` (see below) — this list was missing `workflows:write`, now corrected.
+  **No organization-level permissions at all** — this is load-bearing for the repo-creation gap two sections down.
 - Credentials live in Infisical, **conduit** context: `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_PRIVATE_KEY`.
   Fetch via `cortex-secret run --context conduit -- <cmd>` — never write the private key to disk.
 
@@ -77,6 +79,47 @@ GH_TOKEN=$(cortex-secret run --context conduit -- cortextos bus gh-app-token --o
 - Identity is `wyre-agent-fleet[bot]`, not a human/agent's own name. Known limits: CodeRabbit
   ignores commands from the bot identity (re-triggers still need Aaron); no `Deployments:Read`
   permission on the App's current grant.
+
+## Known gap: repo creation falls back to the deprecated PAT
+
+**Found 2026-09-20 (forge)**: every wave-3 build agent creating a sidecar repo (Slide, Cork,
+UniFi, CyberQP) silently fell back to the deprecated `GITHUB_PAT` (conduit context — the
+`asachs01` personal token this whole App migration exists to retire) instead of using an App
+installation token. Undocumented until now, and contradicted this doc's own stated purpose
+("no personal account in the loop").
+
+**Root cause, verified live 2026-09-20** (`GET /app` with the App's own JWT — see "Validating
+the install" above): the App's permission grant has **zero organization-level permissions**.
+Creating a repo under an org (`POST /orgs/{org}/repos`) requires the App to hold the
+**organization-level `administration: write`** permission — there is no narrower GitHub App
+permission that covers repo creation specifically; it is bundled with the same org-admin
+permission that also covers org webhooks and custom properties. Repository-level `administration`
+(a separate permission, scoped to a single existing repo) doesn't help here — the repo doesn't
+exist yet.
+
+**Decision: expand the App's grant to include organization-level `administration: write`,
+rather than continue leaning on the PAT.** Reasoning:
+- The PAT is exactly the credential this system exists to eliminate. Leaving repo creation on it
+  indefinitely is a standing regression against this doc's own design goal, and — worse — it was
+  happening silently, which is a bigger risk than either option chosen deliberately.
+- There is only **one installation** (`WYRE-AI`, `repository_selection: all`, verified live via
+  `GET /app/installations`), so this is a single, bounded action: the App owner (Aaron) edits the
+  App's permission manifest to add org `administration: write`, then accepts the resulting
+  permission-upgrade prompt for the one installation. Not a recurring credential to rotate or
+  track, unlike a PAT.
+- Named tradeoff, not hidden: org-level `administration` is broader than "just repo creation" —
+  it also covers org webhook and custom-property management via the API. The fleet doesn't use
+  either today. Flagging this explicitly so whoever clicks "accept" knows the actual scope, not
+  just the motivating use case.
+- Rejected alternative: provisioning a dedicated, narrowly-scoped fine-grained PAT under a
+  non-personal bot account. Would be tighter in principle, but WYRE has no existing bot GitHub
+  identity to hang it on, so it trades one small, well-understood App-grant click for setting up
+  and then indefinitely rotating/tracking a whole new standing credential — worse on the exact
+  axis (personal-credential elimination, credential sprawl) this migration is optimizing for.
+
+**Action item**: this needs Aaron directly (App-owner permission edit + install-level accept) —
+joins the existing click queue. Until it lands, wave-3 repo creation keeps using `GITHUB_PAT` —
+that's now a documented, deliberate, temporary exception rather than a silent one.
 
 ## What's still open (tracked separately)
 
