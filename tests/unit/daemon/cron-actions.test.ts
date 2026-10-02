@@ -48,6 +48,7 @@ beforeEach(() => {
 
 describe('runGithubWorkflowDispatch', () => {
   it('mints a token, dispatches, waits, then reports the resulting run on success', async () => {
+    vi.setSystemTime(new Date('2026-10-02T12:00:00.123Z'));
     mockTokenMint();
     mockFetch.mockResolvedValueOnce(dispatchAccepted());
     mockFetch.mockResolvedValueOnce(runsListResponse({
@@ -71,9 +72,11 @@ describe('runGithubWorkflowDispatch', () => {
     expect(dispatchInit.headers.Authorization).toBe('Bearer ghs_minted123');
 
     // No run id comes back from the dispatch itself — the follow-up lists
-    // the workflow's runs filtered to workflow_dispatch events.
+    // the workflow's runs filtered to workflow_dispatch events created no
+    // earlier than 5s before the dispatch, so an older run can't match.
     expect(mockFetch.mock.calls[3][0]).toBe(
-      'https://api.github.com/repos/WYRE-AI/conduit/actions/workflows/signup-smoke.yml/runs?event=workflow_dispatch&per_page=1',
+      'https://api.github.com/repos/WYRE-AI/conduit/actions/workflows/signup-smoke.yml/runs' +
+        `?event=workflow_dispatch&created=${encodeURIComponent('>=2026-10-02T11:59:55Z')}&per_page=1`,
     );
   });
 
@@ -121,6 +124,20 @@ describe('runGithubWorkflowDispatch', () => {
       CREDENTIALS,
     );
     await expect(promise).rejects.toBeInstanceOf(NonRetryableError);
+  });
+
+  it('throws NonRetryableError when a 5xx dispatch response body cannot be read', async () => {
+    mockTokenMint();
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 503, json: async () => ({}), text: async () => { throw new Error('stream reset'); },
+    });
+
+    const promise = runGithubWorkflowDispatch(
+      { kind: 'github-workflow-dispatch', repo: 'WYRE-AI/conduit', workflow: 'signup-smoke.yml' },
+      CREDENTIALS,
+    );
+    await expect(promise).rejects.toBeInstanceOf(NonRetryableError);
+    await expect(promise).rejects.toThrow(/returned 503: <response body unreadable: stream reset>/);
   });
 
   it('throws NonRetryableError when the dispatch POST fails in transport', async () => {

@@ -84,6 +84,11 @@ export async function runGithubWorkflowDispatch(
 
   const { token } = await mintInstallationToken(credentials.appId, credentials.privateKey, owner);
 
+  // Lower bound for the post-dispatch run lookup, so a run created before
+  // this dispatch can't be mistaken for it. The 5s margin absorbs clock skew
+  // between this host and GitHub. Not filtered by branch: `ref` may be a tag.
+  const createdAfter = new Date(Date.now() - 5_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
   let dispatchRes: Response;
   try {
     dispatchRes = await githubApiRequest(
@@ -99,11 +104,18 @@ export async function runGithubWorkflowDispatch(
     );
   }
   if (dispatchRes.status !== 204) {
-    const message = `workflow_dispatch POST for ${label} returned ${dispatchRes.status}: ${await dispatchRes.text()}`;
     // A 4xx is GitHub explicitly refusing the request, so retrying cannot
     // double-dispatch. A 5xx (or an unexpected 2xx/3xx) may have been
     // accepted server-side.
-    if (dispatchRes.status >= 400 && dispatchRes.status < 500) throw new Error(message);
+    const refused = dispatchRes.status >= 400 && dispatchRes.status < 500;
+    let body: string;
+    try {
+      body = await dispatchRes.text();
+    } catch (err) {
+      body = `<response body unreadable: ${err instanceof Error ? err.message : String(err)}>`;
+    }
+    const message = `workflow_dispatch POST for ${label} returned ${dispatchRes.status}: ${body}`;
+    if (refused) throw new Error(message);
     throw new NonRetryableError(message);
   }
 
@@ -113,7 +125,8 @@ export async function runGithubWorkflowDispatch(
   try {
     const runsRes = await githubApiRequest(
       token,
-      `/repos/${action.repo}/actions/workflows/${action.workflow}/runs?event=workflow_dispatch&per_page=1`,
+      `/repos/${action.repo}/actions/workflows/${action.workflow}/runs` +
+        `?event=workflow_dispatch&created=${encodeURIComponent(`>=${createdAfter}`)}&per_page=1`,
     );
     if (!runsRes.ok) {
       throw new Error(`returned ${runsRes.status}: ${await runsRes.text()}`);
