@@ -55,7 +55,7 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls -X GET --paginate --slurp -f state=open -f base=main -f per_page=100")
     echo '[[{"number": 999, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/999/files --paginate --slurp")
@@ -146,7 +146,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls -X GET --paginate --slurp -f state=open -f base=main -f per_page=100")
     echo '[[{"number": 997, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/997/files --paginate --slurp")
@@ -180,7 +180,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls -X GET --paginate --slurp -f state=open -f base=main -f per_page=100")
     echo '[[{"number": 996, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/996/files --paginate --slurp")
@@ -213,7 +213,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls -X GET --paginate --slurp -f state=open -f base=main -f per_page=100")
     echo '[[{"number": 995, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/995/files --paginate --slurp")
@@ -262,7 +262,7 @@ git push -q origin main
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls -X GET --paginate --slurp -f state=open -f base=main -f per_page=100")
     echo '[[]]'
     ;;
   *)
@@ -314,7 +314,7 @@ git checkout -q pr-head
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls -X GET --paginate --slurp -f state=open -f base=main -f per_page=100")
     echo '[[{"number": 994, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/994/files --paginate --slurp")
@@ -345,7 +345,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls -X GET --paginate --slurp -f state=open -f base=main -f per_page=100")
     echo '[[{"number": 993, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/993/files --paginate --slurp")
@@ -378,7 +378,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls -X GET --paginate --slurp -f state=open -f base=main -f per_page=100")
     python3 -c 'import json; print(json.dumps([[{"number": 990, "draft": False}, {"number": 991, "draft": False}], [{"number": 992, "draft": False}]]))'
     ;;
   "api repos/fake/repo/pulls/990/files --paginate --slurp"|"api repos/fake/repo/pulls/991/files --paginate --slurp")

@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Fixed — `migration-collision-check.yml`'s cross-PR PR-list call silently became a POST, 403ing on every real invocation
+
+The `gh api repos/<repo>/pulls --paginate --slurp -f state=open -f base=<ref> -f per_page=100` call
+introduced by the base-branch-filter fix below had no `--method`/`-X` flag. Per `gh api --help`,
+"adding request parameters will automatically switch the request method to `POST`" — so this call
+was silently hitting `POST /repos/<owner>/<repo>/pulls`, the create-pull-request endpoint, not the
+list one, which requires `pull-requests: write` rather than the `read` scope this workflow actually
+declares and needs. Confirmed as the root cause of a 100% failure rate on every real invocation since
+the check went live (three real migration-touching PRs, three `403 Resource not accessible by
+integration` failures — not actual collisions). Verified live against a real, harmless call:
+`gh api repos/WYRE-AI/cortextos/pulls -f state=open --verbose` sends `POST ... -> 422`; adding `-X
+GET` sends `GET .../pulls?state=open -> 200 OK`.
+
+Fixed by adding `-X GET` so the `-f` parameters are sent as a query string, per gh's own documented
+escape hatch, instead of a POST body. `tests/migration-collision-check.test.sh`'s fake-`gh`
+command-matching strings (8 call sites) updated to the corrected argument order — the exact-match
+`case` already fails loudly on any drift in this shape, so it continues to guard the fix.
+
 ### Fixed — `migration-collision-check.yml`'s cross-PR scan had no base-branch filter and a hardcoded 300-PR cap
 
 Check 2 (the cross-PR migration-number collision scan) called `gh pr list --repo REPO --state open
