@@ -101,7 +101,7 @@ describe('LimitScanner — banner-then-gap-then-dialog across multiple push() ca
   it('still fires when >WINDOW_BYTES of noise separates the banner from the dialog marker', () => {
     const s = new LimitScanner(() => NOW);
     const BANNER_ONLY = `You've hit your weekly limit · resets Jul 20 at 6am (UTC)`;
-    const DIALOG_ONLY = `What do you want to do?`;
+    const DIALOG_ONLY = `❯ /rate-limit-options What do you want to do? ❯ 1. Stop and wait for limit to reset`;
 
     expect(s.push(BANNER_ONLY)).toBeNull();      // banner seen, dialog not rendered yet
     expect(s.push('z'.repeat(5000))).toBeNull(); // redraw noise > WINDOW_BYTES evicts the banner text
@@ -109,6 +109,26 @@ describe('LimitScanner — banner-then-gap-then-dialog across multiple push() ca
     expect(ev).not.toBeNull();
     expect(ev!.kind).toBe('weekly');
     expect(ev!.resetAt).toBe(Date.UTC(2026, 6, 20, 6));
+  });
+
+  it('does not fire on a quoted limit phrase followed, after eviction, by a generic "What do you want to do?"', () => {
+    const s = new LimitScanner(() => NOW);
+    const quoted = `boss said "You've hit your weekly limit · resets Jul 20 at 6am (UTC)" in the incident report`;
+
+    expect(s.push(quoted)).toBeNull();
+    expect(s.push('z'.repeat(5000))).toBeNull();
+    expect(s.push('What do you want to do? Pick a branch to review.')).toBeNull();
+  });
+
+  it('reports the newest banner when a different banner arrives before the dialog', () => {
+    const s = new LimitScanner(() => NOW);
+
+    expect(s.push(`You've hit your weekly limit · resets Jul 20 at 6am (UTC)`)).toBeNull();
+    expect(s.push(`You've hit your session limit · resets 3am (UTC)`)).toBeNull();
+    const ev = s.push(`❯ /rate-limit-options What do you want to do?`);
+    expect(ev).not.toBeNull();
+    expect(ev!.kind).toBe('session');
+    expect(ev!.resetAt).toBe(Date.UTC(2026, 6, 16, 3));
   });
 });
 
