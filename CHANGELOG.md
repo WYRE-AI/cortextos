@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Fixed — `LimitScanner` could silently miss a rate-limit dialog when PTY noise evicted the banner from its window
+
+`src/daemon/limit-detector.ts`'s `LimitScanner` matched the limit banner and the
+`What do you want to do?` dialog marker only when both were present together in the same
+`WINDOW_BYTES` (4KB) rolling window. If the banner and the dialog render in separate PTY
+chunks — real redraw/spinner noise between them exceeding 4KB — the window evicts the banner
+text before the dialog marker ever co-occurs with it, and the event is silently missed. This is
+the leading hypothesis for the 09-27 warden/adoption/grower limit incidents: `RotationManager`
+never got `onLimitEvent()`, so the only recovery path for an agent that hits the limit without
+its process exiting never engaged.
+
+`LimitScanner` is now stateful: once the limit phrase is seen, it stays "armed" (kind, parsed
+`resetAt`, matched text) independent of the window, so a later window can still complete the
+match on a rate-limit-specific dialog marker (`/rate-limit-options` or `Stop and wait for limit
+to reset`) alone; the generic `What do you want to do?` only counts while the banner is still in
+the window, so a quoted limit phrase followed by unrelated output can't trigger a rotation. A
+newer banner with a different kind or reset time replaces the armed one, so the event carries
+the latest banner's metadata. Bounded by a new `ARM_TTL_MS` (2 minutes) so a much later
+occurrence of dialog-like text can't fire a stale event off a long-gone banner.
+`scanForLimit()`'s pure co-occurrence contract is unchanged — `LimitScanner` is the only
+caller affected. New test in `tests/unit/limit-detector.test.ts` reproduces the eviction race
+across multiple `push()` calls; it fails against the prior single-window implementation and
+passes against the stateful one.
+
 ### Added — non-agent cron action: `github-workflow-dispatch`
 
 Some crons need no model judgment at all: dispatch a GitHub Actions workflow on a schedule
