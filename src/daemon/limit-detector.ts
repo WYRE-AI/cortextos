@@ -23,8 +23,11 @@ export function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, '');
 }
 
-const LIMIT_RE = /You'vehityour(weekly|session|usage)?limit/i;
+const LIMIT_RE = /You'vehityour(weekly|session|usage)?limit/gi;
 const DIALOG_RE = /Whatdoyouwanttodo\?|\/rate-limit-options/i;
+// Markers only the rate-limit dialog renders. "What do you want to do?" alone is
+// generic, so it cannot complete a banner that has already left the window.
+const RATE_LIMIT_DIALOG_RE = /\/rate-limit-options|Stopandwaitforlimittoreset/i;
 const MONTHS = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
 // "resetsJul20at6am(UTC)" | "resets3am(UTC)" | "resets3:30pm(UTC)" — normalized (no spaces)
 const RESET_DATE_RE = /resets([A-Za-z]{3})(\d{1,2})at(\d{1,2})(?::(\d{2}))?([ap])m\(UTC\)/i;
@@ -59,13 +62,16 @@ export function parseResetHint(normalized: string, now: number): number | null {
   return null;
 }
 
+// Uses the LAST banner in the window, with the reset hint that follows it, so a
+// newer banner is never reported with an older banner's kind/resetAt.
 function detectLimitPhrase(normalized: string, now: number): LimitEvent | null {
-  const limit = LIMIT_RE.exec(normalized);
+  const matches = [...normalized.matchAll(LIMIT_RE)];
+  const limit = matches[matches.length - 1];
   if (!limit) return null;
   const kind = (limit[1]?.toLowerCase() ?? 'unknown') as LimitEvent['kind'];
   return {
     kind,
-    resetAt: parseResetHint(normalized, now),
+    resetAt: parseResetHint(normalized.slice(limit.index), now),
     matchedText: limit[0],
   };
 }
@@ -93,8 +99,8 @@ const ARM_TTL_MS = 2 * 60_000;
  * window evicts the banner text before the dialog marker is ever seen
  * alongside it in the same window — `scanForLimit` alone would silently miss
  * that case. Once the limit phrase is seen, remember it ("armed") outside
- * the window so a later window can still complete the match on the dialog
- * marker alone, bounded by ARM_TTL_MS.
+ * the window so a later window can still complete the match on a
+ * rate-limit-specific dialog marker alone, bounded by ARM_TTL_MS.
  */
 export class LimitScanner {
   private window = '';
@@ -112,12 +118,20 @@ export class LimitScanner {
     }
 
     const normalized = this.window.replace(/\s+/g, '');
-    if (!this.armed) {
-      const match = detectLimitPhrase(normalized, t);
-      if (match) this.armed = { ...match, armedAt: t };
+    const inWindow = detectLimitPhrase(normalized, t);
+    if (inWindow && (!this.armed ||
+      inWindow.kind !== this.armed.kind ||
+      inWindow.resetAt !== this.armed.resetAt)) {
+      this.armed = { ...inWindow, armedAt: t };
     }
+    if (!this.armed) return null;
 
-    if (this.armed && DIALOG_RE.test(normalized)) {
+    // Banner still in the window: same co-occurrence rule as scanForLimit.
+    // Banner evicted: only a rate-limit-specific dialog marker completes the
+    // match, so a quoted limit phrase followed later by an unrelated
+    // "What do you want to do?" cannot trigger a rotation.
+    const dialogRe = inWindow ? DIALOG_RE : RATE_LIMIT_DIALOG_RE;
+    if (dialogRe.test(normalized)) {
       const { armedAt, ...ev } = this.armed;
       this.armed = null;
       this.suppressedUntil = t + REFIRE_SUPPRESS_MS;
