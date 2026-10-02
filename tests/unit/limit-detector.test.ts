@@ -91,6 +91,27 @@ describe('scanForLimit — golden sample, live-captured 2026-08-01 (PR #54 revie
   });
 });
 
+describe('LimitScanner — banner-then-gap-then-dialog across multiple push() calls', () => {
+  // Reproduces the 2026-09-27 hypothesis (task_1790496946359_00279472): the
+  // banner and the dialog marker can arrive in SEPARATE push() calls with
+  // enough intervening PTY redraw noise between them that the rolling
+  // WINDOW_BYTES-sized window evicts the banner text before the dialog
+  // marker ever co-occurs with it. None of the fixtures above test this —
+  // every one has both phrases arriving together in the same push() call.
+  it('still fires when >WINDOW_BYTES of noise separates the banner from the dialog marker', () => {
+    const s = new LimitScanner(() => NOW);
+    const BANNER_ONLY = `You've hit your weekly limit · resets Jul 20 at 6am (UTC)`;
+    const DIALOG_ONLY = `What do you want to do?`;
+
+    expect(s.push(BANNER_ONLY)).toBeNull();      // banner seen, dialog not rendered yet
+    expect(s.push('z'.repeat(5000))).toBeNull(); // redraw noise > WINDOW_BYTES evicts the banner text
+    const ev = s.push(DIALOG_ONLY);              // dialog finally renders, banner long gone from the window
+    expect(ev).not.toBeNull();
+    expect(ev!.kind).toBe('weekly');
+    expect(ev!.resetAt).toBe(Date.UTC(2026, 6, 20, 6));
+  });
+});
+
 describe('LimitScanner', () => {
   it('fires once, then suppresses re-fires for 5 minutes', () => {
     let t = NOW;

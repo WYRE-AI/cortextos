@@ -59,10 +59,9 @@ export function parseResetHint(normalized: string, now: number): number | null {
   return null;
 }
 
-export function scanForLimit(window: string, now: number): LimitEvent | null {
-  const normalized = window.replace(/\s+/g, '');
+function detectLimitPhrase(normalized: string, now: number): LimitEvent | null {
   const limit = LIMIT_RE.exec(normalized);
-  if (!limit || !DIALOG_RE.test(normalized)) return null;
+  if (!limit) return null;
   const kind = (limit[1]?.toLowerCase() ?? 'unknown') as LimitEvent['kind'];
   return {
     kind,
@@ -71,24 +70,60 @@ export function scanForLimit(window: string, now: number): LimitEvent | null {
   };
 }
 
+export function scanForLimit(window: string, now: number): LimitEvent | null {
+  const normalized = window.replace(/\s+/g, '');
+  const match = detectLimitPhrase(normalized, now);
+  if (!match || !DIALOG_RE.test(normalized)) return null;
+  return match;
+}
+
+// How long to keep waiting for the dialog marker after the limit phrase is
+// seen, once it has scrolled out of the WINDOW_BYTES rolling window. Bounds
+// the fix below: long enough to span realistic PTY redraw/buffering gaps,
+// short enough that an unrelated later "What do you want to do?" can't fire
+// a stale event off an old banner.
+const ARM_TTL_MS = 2 * 60_000;
+
 /**
  * Per-agent stateful wrapper: rolling window over stripped PTY chunks with
  * re-fire suppression (the TUI re-renders the same banner constantly).
+ *
+ * The limit banner and the dialog marker can arrive in separate push() calls
+ * with enough intervening PTY redraw noise between them that the rolling
+ * window evicts the banner text before the dialog marker is ever seen
+ * alongside it in the same window — `scanForLimit` alone would silently miss
+ * that case. Once the limit phrase is seen, remember it ("armed") outside
+ * the window so a later window can still complete the match on the dialog
+ * marker alone, bounded by ARM_TTL_MS.
  */
 export class LimitScanner {
   private window = '';
   private suppressedUntil = 0;
+  private armed: (LimitEvent & { armedAt: number }) | null = null;
   constructor(private readonly now: () => number = () => Date.now()) {}
 
   push(chunk: string): LimitEvent | null {
     this.window = (this.window + stripAnsi(chunk)).slice(-WINDOW_BYTES);
     const t = this.now();
     if (t < this.suppressedUntil) return null;
-    const ev = scanForLimit(this.window, t);
-    if (ev) {
+
+    if (this.armed && t - this.armed.armedAt > ARM_TTL_MS) {
+      this.armed = null; // dialog never came within a plausible render gap
+    }
+
+    const normalized = this.window.replace(/\s+/g, '');
+    if (!this.armed) {
+      const match = detectLimitPhrase(normalized, t);
+      if (match) this.armed = { ...match, armedAt: t };
+    }
+
+    if (this.armed && DIALOG_RE.test(normalized)) {
+      const { armedAt, ...ev } = this.armed;
+      this.armed = null;
       this.suppressedUntil = t + REFIRE_SUPPRESS_MS;
       this.window = '';
+      return ev;
     }
-    return ev;
+    return null;
   }
 }
