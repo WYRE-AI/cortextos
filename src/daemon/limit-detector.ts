@@ -106,10 +106,17 @@ export class LimitScanner {
   private window = '';
   private suppressedUntil = 0;
   private armed: (LimitEvent & { armedAt: number }) | null = null;
+  // Total normalized length of everything pushed so far. The normalized window
+  // is always a suffix of the normalized stream, so this gives each banner match
+  // a stable stream offset for telling a fresh banner from one already seen.
+  private streamLen = 0;
+  private lastBannerEnd = -1;
   constructor(private readonly now: () => number = () => Date.now()) {}
 
   push(chunk: string): LimitEvent | null {
-    this.window = (this.window + stripAnsi(chunk)).slice(-WINDOW_BYTES);
+    const stripped = stripAnsi(chunk);
+    this.window = (this.window + stripped).slice(-WINDOW_BYTES);
+    this.streamLen += stripped.replace(/\s+/g, '').length;
     const t = this.now();
     if (t < this.suppressedUntil) return null;
 
@@ -119,10 +126,19 @@ export class LimitScanner {
 
     const normalized = this.window.replace(/\s+/g, '');
     const inWindow = detectLimitPhrase(normalized, t);
-    if (inWindow && (!this.armed ||
-      inWindow.kind !== this.armed.kind ||
-      inWindow.resetAt !== this.armed.resetAt)) {
-      this.armed = { ...inWindow, armedAt: t };
+    if (inWindow) {
+      // A banner ending past the last one seen is a new occurrence (including a
+      // re-render of the same limit) and renews the arm; a banner still sitting
+      // in the window from an earlier push does not.
+      const bannerEnd = this.streamLen - normalized.length +
+        normalized.lastIndexOf(inWindow.matchedText) + inWindow.matchedText.length;
+      const isNewBanner = bannerEnd > this.lastBannerEnd;
+      this.lastBannerEnd = Math.max(this.lastBannerEnd, bannerEnd);
+      if (isNewBanner || !this.armed ||
+        inWindow.kind !== this.armed.kind ||
+        inWindow.resetAt !== this.armed.resetAt) {
+        this.armed = { ...inWindow, armedAt: t };
+      }
     }
     if (!this.armed) return null;
 

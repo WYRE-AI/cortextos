@@ -130,6 +130,34 @@ describe('LimitScanner — banner-then-gap-then-dialog across multiple push() ca
     expect(ev!.kind).toBe('session');
     expect(ev!.resetAt).toBe(Date.UTC(2026, 6, 16, 3));
   });
+
+  it('renews the arm when the same banner is rendered again', () => {
+    let t = NOW;
+    const s = new LimitScanner(() => t);
+    const BANNER = `You've hit your weekly limit · resets Jul 20 at 6am (UTC)`;
+
+    expect(s.push(BANNER)).toBeNull();
+    expect(s.push('z'.repeat(5000))).toBeNull();
+    t = NOW + 90_000;
+    expect(s.push(BANNER)).toBeNull();           // same kind/resetAt, new occurrence
+    expect(s.push('z'.repeat(5000))).toBeNull();
+    t = NOW + 150_000;                           // past the first arm's TTL, within the second's
+    const ev = s.push(`❯ /rate-limit-options What do you want to do?`);
+    expect(ev).not.toBeNull();
+    expect(ev!.kind).toBe('weekly');
+  });
+
+  it('does not renew the arm for a banner that merely lingers in the window', () => {
+    let t = NOW;
+    const s = new LimitScanner(() => t);
+
+    expect(s.push(`You've hit your weekly limit · resets Jul 20 at 6am (UTC)`)).toBeNull();
+    t = NOW + 100_000;
+    expect(s.push('y'.repeat(10))).toBeNull();   // old banner still in the window
+    t = NOW + 130_000;
+    expect(s.push('z'.repeat(5000))).toBeNull();
+    expect(s.push(`❯ /rate-limit-options What do you want to do?`)).toBeNull();
+  });
 });
 
 describe('LimitScanner', () => {
