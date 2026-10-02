@@ -34,6 +34,12 @@ agents/*/memory/
 # Test artifacts
 test-results/
 *.log
+# Backstop for a test writing its fixture ctxRoot relative to cwd instead of
+# a proper mkdtemp'd tmpdir — observed 2026-10-01, root cause not yet traced
+# (task_1790874272515_32835006). Most tests under tests/unit/bus/ and
+# tests/integration/ correctly prefix this with a tmpRoot; this exists so a
+# future instance of the same gap can't land committed content either way.
+.cortextOS/
 # Spurious directory created when ${APPDATA} env var unexpanded during npm link on Windows
 ${APPDATA}/
 
