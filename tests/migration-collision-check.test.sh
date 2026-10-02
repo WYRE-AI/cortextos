@@ -45,7 +45,9 @@ fi
 sed -n "$((START+1)),$((END-1))p" "$WORKFLOW" | sed 's/^          //' > "$TMP/collision_check.py"
 
 # ---- Fake `gh` on PATH ----
-# gh api repos/.../pulls (paginated, base+state filtered) -> one other open, non-draft PR (#999).
+# gh api repos/.../pulls?state=open&base=<ref>&per_page=100 (GET query string,
+# paginated) -> one other open, non-draft PR (#999). The filters are in the
+# URL, not `-f`: `gh api -f` defaults to POST (create-PR), which 403s.
 # gh api .../pulls/999/files --paginate --slurp -> a REAL 2-page slurped
 # shape ([[page1 items],[page2 items]]), page 1 all non-colliding filler,
 # page 2 holding the ONE file that collides with our PR's new migration
@@ -55,7 +57,7 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
     echo '[[{"number": 999, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/999/files --paginate --slurp")
@@ -146,7 +148,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
     echo '[[{"number": 997, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/997/files --paginate --slurp")
@@ -180,7 +182,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
     echo '[[{"number": 996, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/996/files --paginate --slurp")
@@ -213,7 +215,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
     echo '[[{"number": 995, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/995/files --paginate --slurp")
@@ -262,7 +264,7 @@ git push -q origin main
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
     echo '[[]]'
     ;;
   *)
@@ -314,7 +316,7 @@ git checkout -q pr-head
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
     echo '[[{"number": 994, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/994/files --paginate --slurp")
@@ -345,7 +347,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
     echo '[[{"number": 993, "draft": false}]]'
     ;;
   "api repos/fake/repo/pulls/993/files --paginate --slurp")
@@ -378,7 +380,7 @@ fi
 cat > "$TMP/bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
 case "$*" in
-  "api repos/fake/repo/pulls --paginate --slurp -f state=open -f base=main -f per_page=100")
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
     python3 -c 'import json; print(json.dumps([[{"number": 990, "draft": False}, {"number": 991, "draft": False}], [{"number": 992, "draft": False}]]))'
     ;;
   "api repos/fake/repo/pulls/990/files --paginate --slurp"|"api repos/fake/repo/pulls/991/files --paginate --slurp")
@@ -402,6 +404,153 @@ if [ "$rc" -eq 0 ]; then
 fi
 if ! printf '%s\n' "$out" | grep -q "collides in open PR #992"; then
   echo "FAIL: the page-2-only collision was not attributed to PR #992"
+  echo "$out"
+  fails=1
+fi
+
+# ---- Case (k): open-PR listing itself fails (the 2026-09-24 conduit #1895
+#      failure: `gh api -f` POSTed create-PR and GITHUB_TOKEN got HTTP 403).
+#      Must be a ::error that includes stderr, not a CalledProcessError
+#      traceback, and must not be reported as a migration collision. ----
+git checkout -q pr-head
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
+    echo 'gh: Resource not accessible by integration (HTTP 403)' >&2
+    exit 1
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+export BASE_REF=main
+export PR_NUMBER=1
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "FAIL: script exited 0 when the open-PR listing failed — must fail closed"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "::error::Failed to list open pull requests"; then
+  echo "FAIL: open-PR listing failure did not emit a ::error:: annotation"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "Resource not accessible by integration (HTTP 403)"; then
+  echo "FAIL: open-PR listing ::error:: did not include gh stderr"
+  echo "$out"
+  fails=1
+fi
+if printf '%s\n' "$out" | grep -q "CalledProcessError\|Traceback"; then
+  echo "FAIL: open-PR listing failure still surfaced as a Python traceback"
+  echo "$out"
+  fails=1
+fi
+if printf '%s\n' "$out" | grep -q "collides "; then
+  echo "FAIL: an API listing failure was reported as a migration collision"
+  echo "$out"
+  fails=1
+fi
+
+# ---- Case (l): the same listing failure must NOT swallow a base-branch
+#      collision already found via git (that path does not use the API). ----
+git checkout -q main
+git checkout -q -b collide-base-api-down
+echo "-- duplicate of 001" > migrations/001_duplicate.sql
+git add -A; git commit -q -m "add colliding 001 while API is down"
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "FAIL: script exited 0 with both a base-branch collision and a failed open-PR listing"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "Failed to list open pull requests"; then
+  echo "FAIL: base-collision + API-failure case dropped the listing ::error::"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "Migration number 001"; then
+  echo "FAIL: base-branch collision was swallowed when the open-PR listing failed"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "on main as migrations/001_init.sql"; then
+  echo "FAIL: base-branch collision was not attributed to migrations/001_init.sql"
+  echo "$out"
+  fails=1
+fi
+
+# ---- Case (m): a base ref containing '/' is percent-encoded into the GET
+#      query value. The fake accepts only base=feature%2Fslash-base, so a
+#      raw slash (or a return to -f POST fields) fails the invocation. ----
+git checkout -q main
+git checkout -q -b feature/slash-base
+git push -q origin feature/slash-base
+git checkout -q -b pr-against-slash
+echo "-- against slash base" > migrations/040_against_slash_base.sql
+git add -A; git commit -q -m "add 040 against a slash base ref"
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "api repos/fake/repo/pulls?state=open&base=feature%2Fslash-base&per_page=100 --paginate --slurp")
+    echo '[[]]'
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+export BASE_REF='feature/slash-base'
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "FAIL: GET listing with a slash in the base ref did not succeed (query encoding regressed, or the call is not the encoded GET)"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "Checked 1 new migration"; then
+  echo "FAIL: slash-base case did not reach the post-listing success line"
+  echo "$out"
+  fails=1
+fi
+export BASE_REF=main
+
+# ---- Case (n): a 0-exit listing body that is not JSON must fail closed with
+#      ::error::, not a JSONDecodeError traceback. ----
+git checkout -q pr-head
+cat > "$TMP/bin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  "api repos/fake/repo/pulls?state=open&base=main&per_page=100 --paginate --slurp")
+    echo 'not-json'
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+GHEOF
+chmod +x "$TMP/bin/gh"
+export BASE_REF=main
+export PR_NUMBER=1
+out=$(python3 "$TMP/collision_check.py" 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "FAIL: script exited 0 on a malformed open-PR listing body"
+  echo "$out"
+  fails=1
+fi
+if ! printf '%s\n' "$out" | grep -q "malformed JSON from open-PR listing"; then
+  echo "FAIL: malformed open-PR listing did not emit the JSON ::error::"
+  echo "$out"
+  fails=1
+fi
+if printf '%s\n' "$out" | grep -q "Traceback"; then
+  echo "FAIL: malformed open-PR listing still surfaced as a Python traceback"
   echo "$out"
   fails=1
 fi

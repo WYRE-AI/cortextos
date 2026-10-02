@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed — `migration-collision-check.yml` listed open PRs with a POST
+
+The cross-PR scan called `gh api repos/<repo>/pulls --paginate --slurp -f state=open -f base=<ref> -f per_page=100`. `gh api` defaults to GET, and switches to POST whenever any `-f`/`--raw-field` is present. That call was `POST /repos/{owner}/{repo}/pulls` (create a pull request), which `GITHUB_TOKEN` cannot do, so consumer CI (WYRE-AI/conduit PR #1895) failed with `gh: Resource not accessible by integration (HTTP 403)` and a `subprocess.CalledProcessError`. The 403 is not a permissions gap on GET listing and not a migration collision.
+
+The listing is now a real GET, with the filters in the query string (`repos/<repo>/pulls?state=open&base=<percent-encoded-ref>&per_page=100`). A non-zero `gh` exit or malformed listing JSON prints `::error::` including stderr and fails the check, instead of a bare traceback. Base-branch collisions (found via git, before the API call) are still reported when that listing fails. The base-branch collision check itself is unchanged.
+
+`tests/migration-collision-check.test.sh` matches the GET URL (a return to `-f` fails every case as an unexpected `gh` invocation), and covers the listing-failure annotation, a base-branch collision that must still surface when the listing fails, and a base ref containing `/` encoded as `%2F`.
+
 ### Fixed — `migration-collision-check.yml`'s cross-PR scan had no base-branch filter and a hardcoded 300-PR cap
 
 Check 2 (the cross-PR migration-number collision scan) called `gh pr list --repo REPO --state open
@@ -17,6 +25,8 @@ Replaced `gh pr list` with a direct call to the REST list-PRs endpoint (`gh api 
 (closing gap 1), and `--paginate` walks every page with no artificial cap (closing gap 2). `--slurp`
 is required for the same reason it already was on the per-PR file listing — `--paginate` alone
 concatenates each page's JSON array as a separate top-level value rather than one valid document.
+The `-f` form in this paragraph is the one that shipped and then 403'd in consumer CI; `gh api -f`
+issues a POST. The GET correction is the entry above.
 
 `tests/migration-collision-check.test.sh` gained a new case proving a collision visible only on page
 2 of the PR listing is still caught (the pagination-cap regression case), and every existing case's
