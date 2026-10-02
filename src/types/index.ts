@@ -531,7 +531,48 @@ export interface CronDefinition {
    * @example "All 12 vendor repos show green CI on main"
    */
   goal?: string;
+
+  /**
+   * When set, the daemon runs this action directly instead of injecting
+   * `prompt` into the agent's PTY — no agent turn at all. For a cron whose
+   * job is "dispatch this GitHub Actions workflow on a schedule GitHub's
+   * own `schedule:` trigger can't be trusted for" (task_1790882172065 — GH
+   * Actions' own scheduler dispatch is delayed 2-8h, uniformly,
+   * account-wide), there is no judgment to apply, so it shouldn't ride a
+   * model-backed session (2026-08-15 observer-principle lesson: a
+   * dispatcher needing no judgment inherits credit-exhaustion and
+   * session-failure modes for zero benefit).
+   *
+   * `prompt` is still required even when `action` is set — it is never
+   * injected, but serves as this cron's human-readable description in
+   * `list-crons` output and the dashboard, same role `description` plays
+   * elsewhere.
+   *
+   * See `src/daemon/cron-actions.ts` for the action runner.
+   */
+  action?: CronAction;
 }
+
+/**
+ * Dispatches a GitHub Actions `workflow_dispatch`-enabled workflow. The
+ * workflow must already declare `on: workflow_dispatch:` in its own YAML —
+ * this does not add that trigger, it calls it on a schedule the daemon
+ * owns instead of GitHub's own (unreliable, for short cadences) scheduler.
+ */
+export interface GithubWorkflowDispatchAction {
+  kind: 'github-workflow-dispatch';
+  /** "owner/repo", e.g. "WYRE-AI/conduit". */
+  repo: string;
+  /** Workflow file name (e.g. "signup-smoke.yml") or numeric workflow ID. */
+  workflow: string;
+  /** Git ref to dispatch against. @default "main" */
+  ref?: string;
+  /** workflow_dispatch input parameters, if the workflow declares any. */
+  inputs?: Record<string, string>;
+}
+
+/** Discriminated union — the only variant today; more may join it later. */
+export type CronAction = GithubWorkflowDispatchAction;
 
 // ---------------------------------------------------------------------------
 // Cron Execution Log — Subtask 1.5

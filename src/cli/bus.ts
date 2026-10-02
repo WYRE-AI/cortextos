@@ -2698,11 +2698,15 @@ busCommand
   .argument('<agent>', 'Agent name')
   .argument('<name>', 'Cron name (unique per agent, slug format recommended)')
   .argument('<interval>', 'Schedule: interval ("6h", "30m", "1d") or 5-field cron expr ("0 8 * * *")')
-  .argument('<prompt...>', 'Prompt text injected when the cron fires (all remaining words joined)')
+  .argument('<prompt...>', 'Prompt text injected when the cron fires. For an --action cron this is never injected -- it is still required, and serves as the cron\'s human-readable description in list-crons/dashboard output.')
   .option('--desc <description>', 'Human-readable description (optional)')
   .option('--timezone <tz>', 'IANA timezone for a cron-expression schedule (default: UTC). No effect on interval schedules.')
   .option('--goal <condition>', 'Verifiable completion condition registered via /goal, injected as its own standalone submission immediately before this cron fires (optional)')
-  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string; timezone?: string; goal?: string }) => {
+  .option('--action-repo <owner/repo>', 'Non-agent action cron: dispatch a GitHub Actions workflow directly from the daemon (no agent turn) instead of injecting the prompt. Requires --action-workflow.')
+  .option('--action-workflow <file-or-id>', 'Workflow file name (e.g. "signup-smoke.yml") or numeric ID to dispatch. Requires --action-repo.')
+  .option('--action-ref <ref>', 'Git ref to dispatch the workflow against (default: "main")')
+  .option('--action-input <json>', 'JSON object of workflow_dispatch input parameters (optional, only if the workflow declares inputs)')
+  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string; timezone?: string; goal?: string; actionRepo?: string; actionWorkflow?: string; actionRef?: string; actionInput?: string }) => {
     // Validate agent name format
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
@@ -2724,6 +2728,46 @@ busCommand
       try { timezone = validateTimezone(opts.timezone); } catch (err) { console.error(String(err)); process.exit(1); }
     }
 
+    // --action-repo and --action-workflow are a pair -- either both or neither.
+    if (Boolean(opts.actionRepo) !== Boolean(opts.actionWorkflow)) {
+      console.error('Error: --action-repo and --action-workflow must be given together.');
+      process.exit(1);
+    }
+    if (!opts.actionRepo && (opts.actionRef !== undefined || opts.actionInput !== undefined)) {
+      console.error('Error: --action-ref and --action-input require --action-repo and --action-workflow.');
+      process.exit(1);
+    }
+    let action: CronDefinition['action'];
+    if (opts.actionRepo && opts.actionWorkflow) {
+      if (!/^[^/\s]+\/[^/\s]+$/.test(opts.actionRepo)) {
+        console.error(`Error: --action-repo must be "owner/repo" (got "${opts.actionRepo}").`);
+        process.exit(1);
+      }
+      let inputs: Record<string, string> | undefined;
+      if (opts.actionInput !== undefined) {
+        try {
+          const parsed: unknown = JSON.parse(opts.actionInput);
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            throw new Error('must be a JSON object');
+          }
+          for (const [k, v] of Object.entries(parsed)) {
+            if (typeof v !== 'string') throw new Error(`input "${k}" must be a string`);
+          }
+          inputs = parsed as Record<string, string>;
+        } catch (err) {
+          console.error(`Error: --action-input must be a JSON object: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+      }
+      action = {
+        kind: 'github-workflow-dispatch',
+        repo: opts.actionRepo,
+        workflow: opts.actionWorkflow,
+        ...(opts.actionRef ? { ref: opts.actionRef } : {}),
+        ...(inputs ? { inputs } : {}),
+      };
+    }
+
     const prompt = promptWords.join(' ');
     const cron: CronDefinition = {
       name,
@@ -2734,6 +2778,7 @@ busCommand
       ...(opts.desc ? { description: opts.desc } : {}),
       ...(timezone ? { timezone } : {}),
       ...(opts.goal ? { goal: opts.goal } : {}),
+      ...(action ? { action } : {}),
     };
 
     try {

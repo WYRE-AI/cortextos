@@ -70,6 +70,11 @@ vi.mock('../../../src/slack/api.js', () => ({
   },
 }));
 
+const runCronActionMock = vi.fn();
+vi.mock('../../../src/daemon/cron-actions.js', () => ({
+  runCronAction: (...args: unknown[]) => runCronActionMock(...args),
+}));
+
 const { AgentManager } = await import('../../../src/daemon/agent-manager.js');
 
 describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
@@ -833,5 +838,102 @@ describe('AgentManager.maybeStartSlackSocketMode — SP3b self-containment (anal
 
     expect(logs).toEqual([]);
     expect((am as any).slackSocketStarted).toBe(false);
+  });
+});
+
+describe('AgentManager.startAgentCronScheduler — onFire action-cron branch (task_1790953189717)', () => {
+  // A cron with `action` set must skip PTY injection entirely and dispatch
+  // via runCronAction() instead — no agent turn, per the 2026-08-15
+  // observer-principle lesson. injectAgent is the PTY-injection path every
+  // normal cron uses; asserting it is never called is the behavioral proof
+  // that this branch takes a genuinely different path, not just that
+  // runCronAction happened to also be called.
+
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+  let prevCtxRoot: string | undefined;
+  let prevAppId: string | undefined;
+  let prevPrivateKey: string | undefined;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-cronaction-'));
+    ctxRoot = join(testDir, 'instance');
+    frameworkRoot = join(testDir, 'framework');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'), { recursive: true });
+    prevCtxRoot = process.env.CTX_ROOT;
+    process.env.CTX_ROOT = ctxRoot;
+    prevAppId = process.env.GITHUB_APP_ID;
+    prevPrivateKey = process.env.GITHUB_APP_PRIVATE_KEY;
+    runCronActionMock.mockReset();
+  });
+
+  afterEach(() => {
+    if (prevCtxRoot === undefined) delete process.env.CTX_ROOT; else process.env.CTX_ROOT = prevCtxRoot;
+    if (prevAppId === undefined) delete process.env.GITHUB_APP_ID; else process.env.GITHUB_APP_ID = prevAppId;
+    if (prevPrivateKey === undefined) delete process.env.GITHUB_APP_PRIVATE_KEY; else process.env.GITHUB_APP_PRIVATE_KEY = prevPrivateKey;
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  function wireAgentAndScheduler(am: any) {
+    const fakeProcess = { config: { runtime: undefined } } as any;
+    am.agents.set('alice', { process: fakeProcess, checker: {} });
+    am.startAgentCronScheduler('alice');
+    const scheduler = am.cronSchedulers.get('alice');
+    scheduler.stop(); // test invokes onFire directly; no real tick needed
+    return scheduler;
+  }
+
+  const actionCron = {
+    name: 'signup-smoke-dispatch',
+    prompt: 'Dispatch signup-smoke.yml',
+    schedule: '30m',
+    enabled: true,
+    created_at: new Date().toISOString(),
+    action: { kind: 'github-workflow-dispatch' as const, repo: 'WYRE-AI/conduit', workflow: 'signup-smoke.yml' },
+  };
+
+  it('dispatches via runCronAction and never injects a PTY prompt', async () => {
+    process.env.GITHUB_APP_ID = 'test-app-id';
+    process.env.GITHUB_APP_PRIVATE_KEY = 'test-private-key';
+    runCronActionMock.mockResolvedValue({ run_id: 1, run_url: 'https://x/1', conclusion: 'success' });
+
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const injectSpy = vi.spyOn(am, 'injectAgent');
+    const scheduler = wireAgentAndScheduler(am);
+
+    await (scheduler as any).onFire(actionCron);
+
+    expect(runCronActionMock).toHaveBeenCalledWith(
+      actionCron.action,
+      { appId: 'test-app-id', privateKey: 'test-private-key' },
+    );
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('throws without calling runCronAction when the daemon has no GitHub App credentials', async () => {
+    delete process.env.GITHUB_APP_ID;
+    delete process.env.GITHUB_APP_PRIVATE_KEY;
+
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const injectSpy = vi.spyOn(am, 'injectAgent');
+    const scheduler = wireAgentAndScheduler(am);
+
+    await expect((scheduler as any).onFire(actionCron)).rejects.toThrow(/GITHUB_APP_ID/);
+    expect(runCronActionMock).not.toHaveBeenCalled();
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('still injects the PTY prompt normally for a cron with no action', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const injectSpy = vi.spyOn(am, 'injectAgent').mockReturnValue(true);
+    const scheduler = wireAgentAndScheduler(am);
+
+    const normalCron = { ...actionCron, action: undefined, name: 'heartbeat' };
+    await (scheduler as any).onFire(normalCron);
+
+    expect(runCronActionMock).not.toHaveBeenCalled();
+    expect(injectSpy).toHaveBeenCalledTimes(1);
   });
 });
