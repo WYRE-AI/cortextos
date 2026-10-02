@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# bin/gh-shim/gh
+#
+# Transparent PATH shim for `gh`. Installed by prepending this directory to
+# PATH in each agent's .env (see agent-pty.ts's buildPtyEnv/applyEnvAssignment
+# -- PATH there is a prepend, never a replacement). Never installed in
+# Aaron's own interactive shell.
+#
+# For a call targeting an ALLOWLISTED org (one the wyre-agent-fleet GitHub
+# App is actually installed on), mints -- or reuses a short-lived cached --
+# installation token and runs the real `gh` with GH_TOKEN set, so the
+# resulting commit/PR/comment is attributed to the bot instead of whatever
+# personal account is logged into `gh` on this shared Mac.
+#
+# For anything else (unrelated org, ambiguous, no git checkout, --help,
+# `gh auth status`, etc.) this FAILS OPEN: passes straight through to the
+# real `gh` with today's ambient auth, silently -- ordinary `gh` usage for
+# something outside the fleet's own repos must keep working exactly as
+# before. If the target IS on the allowlist but minting fails (network
+# blip, secrets unavailable), this also falls open to ambient auth, but
+# LOUDLY -- a silent fallback there would just reproduce the bug this
+# exists to fix.
+#
+# See bus/gh-bot.sh (the explicit opt-in sibling; same org-resolution
+# shape, no allowlist since it's explicit) and task_1790244063432.
+set -euo pipefail
+
+# The standard PATH-shim trick: strip this script's own directory out of a
+# COPY of PATH before resolving `gh`, so we find the real binary instead of
+# recursing into ourselves. Compares each PATH entry's REAL (symlink- and
+# trailing-slash-resolved) directory against this script's real directory,
+# not a literal string match, so a differently-spelled or symlinked PATH
+# entry for this same directory is still caught -- this runs on every `gh`
+# call fleet-wide, so the common exact-match case is checked first (zero
+# forks) and only a non-matching entry pays for the realpath resolution.
+realpath_of() { (cd "$1" 2>/dev/null && pwd -P); } # empty output on a missing dir
+SHIM_DIR="$(realpath_of "$(dirname "${BASH_SOURCE[0]}")")"
+CLEAN_PATH=""
+IFS=: read -ra _path_entries <<< "$PATH"
+for _dir in "${_path_entries[@]}"; do
+  if [[ "$_dir" == "$SHIM_DIR" ]]; then continue; fi
+  if [[ -n "$_dir" && "$(realpath_of "$_dir")" == "$SHIM_DIR" ]]; then continue; fi
+  CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$_dir"
+done
+REAL_GH="$(PATH="$CLEAN_PATH" command -v gh || true)"
+if [[ -z "$REAL_GH" || "$(realpath_of "${REAL_GH%/*}")" == "$SHIM_DIR" ]]; then
+  echo "gh-shim: no real 'gh' binary found on PATH behind this shim" >&2
+  exit 127
+fi
+
+ALLOWLIST=("WYRE-AI")
+CACHE_DIR="${CTX_ROOT:-$HOME/.cortextos}/state/gh-shim"
+CACHE_TTL_SECS=2700 # 45min -- comfortably inside gh-app-token's ~1h token life
+
+is_allowlisted() {
+  local needle="${1,,}"
+  for org in "${ALLOWLIST[@]}"; do
+    [[ "${org,,}" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+# [HOST/]OWNER/REPO -> OWNER (strips an optional leading host segment, e.g.
+# "github.com/WYRE-AI/conduit" or the attached "-R" form below).
+owner_of() {
+  local val="$1"
+  if [[ "$val" == */*/* ]]; then val="${val#*/}"; fi
+  printf '%s' "${val%%/*}"
+}
+
+# 1) --repo/-R OWNER/REPO anywhere in the args (gh's own flag for "not
+#    inside a checkout" calls -- e.g. `gh pr view 123 --repo OWNER/REPO`).
+#    Handles --repo=OWNER/REPO, an attached -ROWNER/REPO, and an optional
+#    HOST/ prefix on any of these forms.
+ORG=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--repo" || "$prev" == "-R" ]]; then
+    ORG="$(owner_of "$arg")"
+    break
+  fi
+  case "$arg" in
+    --repo=*) ORG="$(owner_of "${arg#--repo=}")"; break ;;
+    -R?*) ORG="$(owner_of "${arg#-R}")"; break ;;
+  esac
+  # 2) `gh api repos/OWNER/REPO/...` — the canonical form for calls made
+  # outside any checkout (no --repo flag at all). Without this, e.g.
+  # `gh api repos/WYRE-AI/conduit/pulls/123/comments` from a non-checkout
+  # cwd falls through to the origin-remote check below, finds nothing, and
+  # silently uses ambient auth — reproducing the exact bug this shim
+  # exists to fix, with no signal (unlike bus/gh-bot.sh, which dies loudly
+  # on an undetermined org). Also accepts a leading slash (`gh api` allows
+  # both `repos/...` and `/repos/...`).
+  if [[ "$arg" =~ ^/?repos/([^/]+)/ ]]; then
+    ORG="${BASH_REMATCH[1]}"
+    break
+  fi
+  prev="$arg"
+done
+
+# 3) fall back to the cwd's origin remote
+if [[ -z "$ORG" ]]; then
+  REMOTE_URL="$(git remote get-url origin 2>/dev/null || true)"
+  ORG="$(printf '%s' "$REMOTE_URL" | sed -nE 's#.*[:/]([^/]+)/[^/]+(\.git)?$#\1#p')"
+fi
+
+# GHCR/package-registry calls (`gh api .../packages/...`) are excluded from
+# bot-token routing even for an allowlisted org. The App's package
+# permission ("packages: write" on the installation) does not reliably
+# cover the same surface a personal account's package scopes do -- caught
+# 2026-09-24 (maintainer, task via bus msg 1790266708602) when a real
+# `orgs/WYRE-AI/packages/container/.../versions` query 404'd through the
+# bot token in a case where personal auth is expected to succeed. There is
+# also no attribution benefit here to weigh against that risk: package
+# reads create no commit/PR/comment, so intercepting them serves no part
+# of this shim's actual purpose.
+for arg in "$@"; do
+  if [[ "$arg" == *"/packages/"* || "$arg" == packages/* ]]; then
+    exec "$REAL_GH" "$@"
+  fi
+done
+
+# Not our own org (or undeterminable) -- ordinary gh usage, pass through
+# silently. This is the common case (foreign repos, --help, auth status,
+# ambiguous cwd) and must never warn.
+if [[ -z "$ORG" ]] || ! is_allowlisted "$ORG"; then
+  exec "$REAL_GH" "$@"
+fi
+
+CACHE_FILE="$CACHE_DIR/${ORG,,}.token"
+NOW="$(date +%s)"
+TOKEN=""
+if [[ -f "$CACHE_FILE" ]]; then
+  MINT_EPOCH=""
+  { read -r MINT_EPOCH; read -r TOKEN; } < "$CACHE_FILE" 2>/dev/null || true
+  if [[ ! "$MINT_EPOCH" =~ ^[0-9]+$ ]] || (( NOW - MINT_EPOCH >= CACHE_TTL_SECS )); then
+    TOKEN=""
+  fi
+fi
+
+if [[ -z "$TOKEN" ]]; then
+  if TOKEN="$(cortex-secret run --context conduit -- cortextos bus gh-app-token --org "$ORG" 2>/dev/null)" && [[ -n "$TOKEN" ]]; then
+    # Atomic cache write: write to a private temp file in the same
+    # directory, then rename over the cache file. rename() is atomic on
+    # the same filesystem, so a concurrent reader (another agent's `gh`
+    # call) always sees either the old complete file or the new complete
+    # file, never a partial write -- no locking needed. mkdir here (not
+    # unconditionally at startup) since a warm cache hit never needs it.
+    mkdir -p "$CACHE_DIR" 2>/dev/null || true
+    if TMP="$(mktemp "$CACHE_DIR/.${ORG,,}.token.XXXXXX" 2>/dev/null)"; then
+      { printf '%s\n%s\n' "$NOW" "$TOKEN" > "$TMP" && mv -f "$TMP" "$CACHE_FILE"; } 2>/dev/null \
+        || rm -f "$TMP"
+    fi
+  else
+    echo "gh-shim: WARNING -- failed to mint a wyre-agent-fleet token for org \"$ORG\"; falling back to ambient gh auth for this call (check GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY via cortex-secret --context conduit)" >&2
+    # Also log-event, not just stderr -- a stderr line inside some other
+    # command's PTY transcript is easy to miss for days (this org's own
+    # documented failure shape for silent misattribution). Best-effort:
+    # if cortextos itself is what's failing, this may also fail; that's
+    # fine, the stderr warning above still fired.
+    cortextos bus log-event error gh_shim_mint_failed error --meta "{\"org\":\"$ORG\"}" >/dev/null 2>&1 || true
+    exec "$REAL_GH" "$@"
+  fi
+fi
+
+GH_TOKEN="$TOKEN" exec "$REAL_GH" "$@"
