@@ -30,10 +30,14 @@ export interface CronActionResult {
   conclusion: string | null;
 }
 
-/** Delay between dispatching and polling the run once for its conclusion.
- * The dispatch call (with `return_run_details`) returns the run id directly,
- * so this only gives a short run a chance to finish before we report on it.
- * 15s was verified live (task_1790952782650). */
+/** Delay between dispatching and looking up the resulting run. The REST
+ * dispatch call returns 204 with no run identifier at all — verified live,
+ * twice, against a real repo on 2026-10-02 (raw `gh api ... --include`:
+ * `HTTP/2.0 204 No Content`, no `Location` header either, with and without
+ * a `return_run_details` body field, which is not a real parameter this
+ * endpoint recognizes). GitHub creates the run asynchronously, so a lookup
+ * immediately after dispatch can race it; 15s was verified live
+ * (task_1790952782650) as comfortably enough in practice. */
 const RUN_LOOKUP_DELAY_MS = 15_000;
 
 async function githubApiRequest(
@@ -55,16 +59,20 @@ async function githubApiRequest(
 /**
  * Runs one `github-workflow-dispatch` cron action end to end: mint a
  * GitHub App installation token scoped to the action's repo owner,
- * dispatch the workflow (asking GitHub for the created run's id), wait
- * briefly, then fetch that exact run and report its conclusion.
+ * dispatch the workflow, wait briefly for GitHub to create the run, then
+ * look it up (by listing the workflow's most recent `workflow_dispatch`
+ * run — the dispatch response itself carries no run identifier) and
+ * report its conclusion.
  *
- * Throws on any failure (auth, dispatch rejected, run lookup failed, or the
- * run completed without succeeding); the caller (agent-manager.ts's onFire,
- * via cron-scheduler.ts's `fireWithRetry`) retries and logs it. Anything
- * that may have happened after GitHub accepted the dispatch (an ambiguous
- * POST outcome, or any post-dispatch lookup/result failure) throws
- * NonRetryableError instead, so a retry can never dispatch the workflow
- * twice for one cron fire.
+ * Throws on any failure; the caller (agent-manager.ts's onFire, via
+ * cron-scheduler.ts's `fireWithRetry`) retries and logs it. A clean 4xx on
+ * the dispatch POST (GitHub explicitly refusing the request — bad ref,
+ * workflow not found, etc.) throws a plain, retryable `Error`, since
+ * nothing happened server-side. Everything else — a transport failure or
+ * 5xx on the POST (ambiguous: GitHub may have accepted it anyway), the
+ * post-dispatch run lookup failing, no run found, or the run completing
+ * without succeeding — throws `NonRetryableError`, so a retry can never
+ * dispatch the same workflow twice for one cron fire.
  */
 export async function runGithubWorkflowDispatch(
   action: GithubWorkflowDispatchAction,
@@ -81,10 +89,7 @@ export async function runGithubWorkflowDispatch(
     dispatchRes = await githubApiRequest(
       token,
       `/repos/${action.repo}/actions/workflows/${action.workflow}/dispatches`,
-      {
-        method: 'POST',
-        body: { ref, return_run_details: true, ...(action.inputs ? { inputs: action.inputs } : {}) },
-      },
+      { method: 'POST', body: { ref, ...(action.inputs ? { inputs: action.inputs } : {}) } },
     );
   } catch (err) {
     // Transport failure: GitHub may have accepted the dispatch anyway.
@@ -93,7 +98,7 @@ export async function runGithubWorkflowDispatch(
       `${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  if (dispatchRes.status !== 200) {
+  if (dispatchRes.status !== 204) {
     const message = `workflow_dispatch POST for ${label} returned ${dispatchRes.status}: ${await dispatchRes.text()}`;
     // A 4xx is GitHub explicitly refusing the request, so retrying cannot
     // double-dispatch. A 5xx (or an unexpected 2xx/3xx) may have been
@@ -102,30 +107,31 @@ export async function runGithubWorkflowDispatch(
     throw new NonRetryableError(message);
   }
 
-  let runId: number;
-  try {
-    const dispatchBody = await dispatchRes.json() as { workflow_run_id?: unknown };
-    if (typeof dispatchBody.workflow_run_id !== 'number') throw new Error('response has no workflow_run_id');
-    runId = dispatchBody.workflow_run_id;
-  } catch (err) {
-    throw new NonRetryableError(
-      `workflow_dispatch POST for ${label} succeeded but its response could not be read: ` +
-      `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-
   await new Promise((resolve) => setTimeout(resolve, RUN_LOOKUP_DELAY_MS));
 
   let run: { id: number; html_url: string; status: string; conclusion: string | null };
   try {
-    const runRes = await githubApiRequest(token, `/repos/${action.repo}/actions/runs/${runId}`);
-    if (!runRes.ok) {
-      throw new Error(`returned ${runRes.status}: ${await runRes.text()}`);
+    const runsRes = await githubApiRequest(
+      token,
+      `/repos/${action.repo}/actions/workflows/${action.workflow}/runs?event=workflow_dispatch&per_page=1`,
+    );
+    if (!runsRes.ok) {
+      throw new Error(`returned ${runsRes.status}: ${await runsRes.text()}`);
     }
-    run = await runRes.json() as typeof run;
+    const runsBody = await runsRes.json() as {
+      workflow_runs: Array<{ id: number; html_url: string; status: string; conclusion: string | null }>;
+    };
+    const found = runsBody.workflow_runs[0];
+    if (!found) {
+      throw new Error(`no run appeared within ${RUN_LOOKUP_DELAY_MS}ms of dispatch`);
+    }
+    run = found;
   } catch (err) {
+    // The dispatch itself already returned 204 (accepted), so any failure
+    // from here on is ambiguous about whether the workflow actually ran —
+    // never safe to retry.
     throw new NonRetryableError(
-      `run lookup for dispatched run ${runId} of ${label} failed: ` +
+      `run lookup for ${label} failed after a successful dispatch: ` +
       `${err instanceof Error ? err.message : String(err)}`,
     );
   }
