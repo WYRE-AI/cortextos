@@ -6,9 +6,6 @@
  * conversations.list. SP3b adds Socket Mode; SP3c adds Block Kit + interactive
  * acks via this same client.
  */
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-
 /**
  * RUNTIME AGENT IDENTITY — the ONLY source an outbound chat.postMessage's
  * `username` can ever come from.
@@ -25,15 +22,17 @@ import { join } from 'node:path';
  * different, possibly more-trusted agent.
  *
  * Captured ONCE at module load from the daemon-provisioned agent context
- * (CTX_AGENT_NAME in the environment, else the agent dir's .cortextos-env
- * file), into a module-private primitive const:
+ * (CTX_AGENT_NAME in the environment only), into a module-private primitive
+ * const:
  *   - cannot be MINTED: postMessage's request type has no username field
  *     for a caller to set;
  *   - cannot be MUTATED: a const string binding, and post-load mutation of
  *     process.env or cwd cannot re-run this capture.
- * The deliberately-omitted cwd-basename fallback is omitted because it IS
- * mintable by cwd choice (same reasoning upstream documents for the same
- * omission).
+ * cwd-derived fallbacks (the cwd basename, or a cwd `.cortextos-env` file)
+ * are deliberately omitted because they ARE mintable by cwd choice, and the
+ * CLI's --as gate (src/cli/slack.ts) checks only CTX_AGENT_NAME, so it could
+ * not see a cwd-derived identity (same reasoning upstream documents for the
+ * same omission).
  *
  * Boundary honestly stated: this fences API CALLERS in a daemon-provisioned
  * process. It does not (and cannot) stop a process that genuinely controls
@@ -44,11 +43,6 @@ const RUNTIME_AGENT_NAME: string | undefined = (() => {
   try {
     const fromEnv = process.env.CTX_AGENT_NAME?.trim();
     if (fromEnv) return fromEnv;
-    const envPath = join(process.cwd(), '.cortextos-env');
-    if (existsSync(envPath)) {
-      const match = readFileSync(envPath, 'utf-8').match(/^CTX_AGENT_NAME=(.+)$/m);
-      if (match?.[1]?.trim()) return match[1].trim();
-    }
     return undefined;
   } catch {
     return undefined;
