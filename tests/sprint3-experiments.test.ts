@@ -404,6 +404,24 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(learnings).toContain('Emojis work');
     });
 
+    it('does not disturb a different experiment\'s active.json', () => {
+      const evaluatedId = createExperiment(testDir, 'testbot', 'ctr', 'h1', { baseline: 0 });
+      runExperiment(testDir, evaluatedId);
+      const otherRunningId = createExperiment(testDir, 'testbot', 'ctr', 'h2');
+      runExperiment(testDir, otherRunningId);
+
+      // Both experiments are 'running', but this repo's one-active-experiment
+      // invariant is only enforced by convention, not by this function — a
+      // stale orphaned active.json can point at either. Evaluating the first
+      // one must not clear the second's active pointer just because it exists.
+      evaluateExperiment(testDir, evaluatedId, 5);
+
+      const activePath = join(testDir, 'experiments', 'active.json');
+      expect(existsSync(activePath)).toBe(true);
+      const active = JSON.parse(readFileSync(activePath, 'utf-8').trim());
+      expect(active.id).toBe(otherRunningId);
+    });
+
     it('discards when measured < baseline (direction=higher)', () => {
       const id = createExperiment(testDir, 'testbot', 'engagement', 'Remove images', {
         baseline: 0,

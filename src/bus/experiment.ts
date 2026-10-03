@@ -586,13 +586,20 @@ export function evaluateExperiment(
     .join('\n');
   appendFileSync(learningsPath, learningEntry + '\n', 'utf-8');
 
-  // Remove active.json
+  // Remove active.json — only when it names THIS experiment (mirrors
+  // closeExperiment's identical guard below): relies on the one-running-
+  // experiment-per-agent invariant, but if that's ever violated by a stale
+  // orphaned running record predating the current active one, clearing
+  // unconditionally would wipe a different experiment's active pointer.
   const activePath = join(expDir, 'active.json');
   if (existsSync(activePath)) {
     try {
-      unlinkSync(activePath);
+      const active = JSON.parse(readFileSync(activePath, 'utf-8').trim()) as Experiment;
+      if (active.id === experimentId) {
+        unlinkSync(activePath);
+      }
     } catch {
-      // ignore
+      // active.json corruption isn't this function's problem — leave it.
     }
   }
 
