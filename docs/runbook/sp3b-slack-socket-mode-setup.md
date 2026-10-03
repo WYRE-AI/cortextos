@@ -91,13 +91,19 @@ create a second app.
 
    ```json
    {
-     "display_name": "boss",
-     "icon_emoji": ":robot_face:",
      "channels": { "recap": "C01XXXX01" },
      "allowed_channels": ["C01XXXX01"],
      "allowed_users": ["T0ABCDEF:U0123456"]
    }
    ```
+
+   `display_name`/`icon_emoji`/`icon_url` are accepted in the schema but
+   have no effect as of the 2026-10 identity-gate hardening
+   (task_1790871245210_64848240): an outbound message's posted username is
+   always the agent's own `CTX_AGENT_NAME`, read from that agent's own
+   process environment, never from this file — a file is not a safe
+   identity source, since any agent can read any other agent's `slack.json`.
+   Setting `display_name` here will silently do nothing; don't rely on it.
 
    Note: `allowed_users` is a single flat list across ALL of this agent's
    `allowed_channels` — not a per-channel map. Fine for a single-channel

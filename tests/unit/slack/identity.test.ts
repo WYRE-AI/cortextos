@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { loadSlackIdentity, isSlackUserAllowed, slackIdentityKey, type SlackConfig } from '../../../src/slack/identity';
+import { loadSlackConfig, isSlackUserAllowed, slackIdentityKey, type SlackConfig } from '../../../src/slack/identity';
 
 function makeAgent(root: string, name: string, slackJson?: object): string {
   const dir = join(root, 'orgs', 'wyre', 'agents', name);
@@ -11,44 +11,34 @@ function makeAgent(root: string, name: string, slackJson?: object): string {
   return dir;
 }
 
-describe('loadSlackIdentity', () => {
+// loadSlackIdentity was removed as part of the identity-gate hardening
+// (task_1790871245210_64848240) — it turned a file's display_name into a
+// chat.postMessage username with no check that the caller was the agent it
+// claimed to be. See src/slack/api.ts's RUNTIME_AGENT_NAME for the
+// replacement: the posted identity now always comes from the calling
+// process's own environment, never from a file. loadSlackConfig (below)
+// remains the correct way to check whether an agent is Slack-enabled.
+describe('loadSlackConfig', () => {
   let root: string;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'sp3a-id-'));
   });
 
-  it('returns display_name + icon_emoji from slack.json', () => {
+  it('returns the parsed config from slack.json', () => {
     makeAgent(root, 'boss', {
       display_name: 'boss',
-      icon_emoji: ':robot_face:',
       channels: { recap: 'C01' },
       allowed_channels: ['C01'],
+      allowed_users: ['T1:U1'],
     });
-    const id = loadSlackIdentity(root, 'wyre', 'boss');
-    expect(id).toEqual({ username: 'boss', icon_emoji: ':robot_face:' });
-  });
-
-  it('returns icon_url when slack.json has it instead of icon_emoji', () => {
-    makeAgent(root, 'analyst', {
-      display_name: 'analyst',
-      icon_url: 'https://example.com/a.png',
-      channels: {},
-      allowed_channels: [],
-    });
-    const id = loadSlackIdentity(root, 'wyre', 'analyst');
-    expect(id).toEqual({ username: 'analyst', icon_url: 'https://example.com/a.png' });
+    const cfg = loadSlackConfig(root, 'wyre', 'boss');
+    expect(cfg?.allowed_channels).toEqual(['C01']);
   });
 
   it('returns null when slack.json is absent (agent is Slack-disabled)', () => {
     makeAgent(root, 'dev'); // no slack.json
-    expect(loadSlackIdentity(root, 'wyre', 'dev')).toBeNull();
-  });
-
-  it('throws on malformed slack.json', () => {
-    const dir = makeAgent(root, 'broken');
-    writeFileSync(join(dir, 'slack.json'), '{ not json');
-    expect(() => loadSlackIdentity(root, 'wyre', 'broken')).toThrow(/parse/i);
+    expect(loadSlackConfig(root, 'wyre', 'dev')).toBeNull();
   });
 
   it('resolves namespaced agent (engineer/agent)', () => {
@@ -56,15 +46,10 @@ describe('loadSlackIdentity', () => {
     mkdirSync(nsDir, { recursive: true });
     writeFileSync(
       join(nsDir, 'slack.json'),
-      JSON.stringify({
-        display_name: 'aaron-dev',
-        icon_emoji: ':computer:',
-        channels: {},
-        allowed_channels: [],
-      }),
+      JSON.stringify({ channels: {}, allowed_channels: ['C9'], allowed_users: [] }),
     );
-    const id = loadSlackIdentity(root, 'wyre', 'aaron/dev');
-    expect(id).toEqual({ username: 'aaron-dev', icon_emoji: ':computer:' });
+    const cfg = loadSlackConfig(root, 'wyre', 'aaron/dev');
+    expect(cfg?.allowed_channels).toEqual(['C9']);
   });
 });
 
