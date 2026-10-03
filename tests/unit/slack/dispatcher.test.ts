@@ -136,6 +136,44 @@ describe('dispatchSlackMessage', () => {
     expect(result.delivered).toEqual([]);
     expect(checker.queued).toHaveLength(0);
   });
+
+  it('redacts an SSN in the inbound text before it is queued to the agent PTY', async () => {
+    makeAgent(root, 'boss', { display_name: 'boss', channels: {}, allowed_channels: ['C1'], allowed_users: ['T1:U1'] });
+    const checker = new FakeChecker();
+    const targets: DispatchTarget[] = [{ name: 'boss', checker: checker as unknown as FastChecker }];
+    const event = { ...baseEvent, text: 'my ssn is 123-45-6789, can you help' };
+
+    await dispatchSlackMessage(event, targets, root, 'wyre', noopResolver);
+
+    expect(checker.queued).toHaveLength(1);
+    expect(checker.queued[0]).not.toContain('123-45-6789');
+    expect(checker.queued[0]).toContain('[REDACTED-SSN]');
+  });
+
+  it('redacts a structural credential shape (Slack bot token) in the inbound text', async () => {
+    makeAgent(root, 'boss', { display_name: 'boss', channels: {}, allowed_channels: ['C1'], allowed_users: ['T1:U1'] });
+    const checker = new FakeChecker();
+    const targets: DispatchTarget[] = [{ name: 'boss', checker: checker as unknown as FastChecker }];
+    const event = { ...baseEvent, text: 'here is the token xoxb-123456-abcdef use it' };
+
+    await dispatchSlackMessage(event, targets, root, 'wyre', noopResolver);
+
+    expect(checker.queued).toHaveLength(1);
+    expect(checker.queued[0]).not.toContain('xoxb-123456-abcdef');
+    expect(checker.queued[0]).toContain('xoxb-****');
+  });
+
+  it('does not corrupt ordinary prose containing the word "bot" (no loose Bearer/Bot heuristic on inbound text)', async () => {
+    makeAgent(root, 'boss', { display_name: 'boss', channels: {}, allowed_channels: ['C1'], allowed_users: ['T1:U1'] });
+    const checker = new FakeChecker();
+    const targets: DispatchTarget[] = [{ name: 'boss', checker: checker as unknown as FastChecker }];
+    const event = { ...baseEvent, text: 'tell the bot not to delete the file' };
+
+    await dispatchSlackMessage(event, targets, root, 'wyre', noopResolver);
+
+    expect(checker.queued).toHaveLength(1);
+    expect(checker.queued[0]).toContain('tell the bot not to delete the file');
+  });
 });
 
 describe('makeUserNameResolver', () => {
