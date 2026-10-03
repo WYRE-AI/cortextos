@@ -126,6 +126,17 @@ describe('dispatchSlackMessage', () => {
     expect(second.delivered).toEqual([]); // deduped, not "delivered" a second time
   });
 
+  it('does not dedup distinct messages that differ only in a redacted value', async () => {
+    makeAgent(root, 'boss', { display_name: 'boss', channels: {}, allowed_channels: ['C1'], allowed_users: ['T1:U1'] });
+    const checker = new FakeChecker();
+    const targets: DispatchTarget[] = [{ name: 'boss', checker: checker as unknown as FastChecker }];
+
+    await dispatchSlackMessage({ ...baseEvent, text: 'ssn 123-45-6789', ts: '2.1' }, targets, root, 'wyre', noopResolver);
+    await dispatchSlackMessage({ ...baseEvent, text: 'ssn 234-56-7890', ts: '2.2' }, targets, root, 'wyre', noopResolver);
+
+    expect(checker.queued).toHaveLength(2);
+  });
+
   it('skips an agent with no slack.json entirely', async () => {
     // no makeAgent() call for 'dev' — no slack.json on disk
     const checker = new FakeChecker();

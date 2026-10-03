@@ -18,6 +18,11 @@ describe('redactInboundText', () => {
     expect(redactInboundText('use ghp_abc123DEF456')).toBe('use ghp_****');
   });
 
+  it('redacts GitHub App user-to-server (ghu_) and refresh (ghr_) tokens', () => {
+    expect(redactInboundText('use ghu_abc123DEF456')).toBe('use ghu_****');
+    expect(redactInboundText('use ghr_abc123DEF456')).toBe('use ghr_****');
+  });
+
   it('redacts an AWS access key id', () => {
     expect(redactInboundText('key AKIAABCDEFGHIJKLMNOP')).toBe('key AKIA****');
   });

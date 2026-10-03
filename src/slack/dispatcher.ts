@@ -98,7 +98,11 @@ export async function dispatchSlackMessage(
       target.name,
     );
 
-    if (target.checker.isDuplicate(formatted)) continue;
+    // Dedup on the Slack message identity (channel + ts), not the formatted
+    // text: post-redaction, two messages differing only in a redacted value
+    // format identically and would wrongly collapse. channel+ts also covers
+    // Socket Mode redeliveries and the message/app_mention pair for one post.
+    if (target.checker.isDuplicate(`slack:${event.channel}:${event.ts}`)) continue;
     target.checker.queueSlackMessage(formatted);
     result.delivered.push(target.name);
   }
