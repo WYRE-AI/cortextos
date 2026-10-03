@@ -77,6 +77,43 @@ times. Both first-run screens now share this timing via a small helper. Verified
 zero `Exited with code`/`HALTED`/`CRASH_LOOP` log lines in the post-restart window (checked the
 per-agent structured `restarts.log`, not just the daemon's own status).
 
+### Fixed — Slack outbound identity had no gate against agent-name spoofing, and inbound text reached an agent's PTY unredacted
+
+Ported two concepts from grandamenium/cortextos's parallel Slack security
+hardening (commits d647b862d/761e949fd), deferred during the 2026-10-01
+upstream sync for its own review rather than a mechanical merge
+(task_1790871245210_64848240):
+
+**Identity gate.** `cortextos slack send/test-send <channel> <text> --as
+<agent>` loaded `--as <agent>`'s own `slack.json` and posted under whatever
+`display_name`/icon was in that file, with no check that the calling process
+actually was that agent. `slack.json` is routine org config, not a secret —
+any process that can read another agent's directory (every agent, by design)
+could make a Slack message read as having come from a different, possibly
+more-trusted agent. `SlackAPI.postMessage` now derives the outbound
+`username` exclusively from a module-private `RUNTIME_AGENT_NAME`, captured
+once at load from the process's own `CTX_AGENT_NAME` — never from a caller
+argument or a file — and `PostMessageRequest` no longer has a `username`/
+`icon_emoji`/`icon_url` field for a caller to set. `--as` is now a
+self-identity assertion: the CLI refuses (fail-closed, not a logged warning)
+when it doesn't match the calling process's own `CTX_AGENT_NAME`. A human
+operator running the CLI outside any agent's process context (no
+`CTX_AGENT_NAME` set) is unaffected — there is no runtime identity to spoof
+in that case. `loadSlackIdentity`/`SlackIdentity` (the function that WAS the
+vulnerability) are removed; `slack.json`'s display_name/icon fields remain
+in the schema for a possible future gated reintroduction but are read by
+nobody today.
+
+**Inbound redaction.** `dispatchSlackMessage` queued inbound Slack text
+verbatim into an agent's PTY and the persisted stdout.log — an SSN or a
+Slack/Telegram/Anthropic/GitHub/AWS token typed into an allowed inbound
+message would have reached both in the clear. A new `redactInboundText`
+(ported `slack-redact.ts`, backed by a verbatim port of upstream's
+self-contained `ssn-redaction.ts`) now scrubs structurally-unambiguous
+credential shapes plus SSNs before the text is ever formatted or queued —
+deliberately not the loose Bearer/Bot heuristics, which match ordinary prose
+and can invert its meaning.
+
 ### Fixed — `migration-collision-check.yml`'s cross-PR scan had no base-branch filter and a hardcoded 300-PR cap
 
 Check 2 (the cross-PR migration-number collision scan) called `gh pr list --repo REPO --state open
