@@ -3,18 +3,23 @@ import { join } from 'path';
 import { resolveAgentDir } from '../utils/agent-dir.js';
 
 /**
- * Per-agent Slack identity override — applied to every chat.postMessage.
- * Either icon_emoji OR icon_url, not both (Slack honors the first present).
+ * Schema of `agents/<name>/slack.json`.
+ *
+ * display_name/icon_emoji/icon_url are READ BY NOBODY as of the
+ * identity-gate hardening (task_1790871245210_64848240, ported concept from
+ * grandamenium/cortextos@761e949fd): an outbound chat.postMessage's username
+ * is now always the calling process's own RUNTIME_AGENT_NAME (src/slack/api.ts),
+ * never a value sourced from a file — a file is not a safe identity source
+ * since any agent can read any other agent's slack.json. The fields stay in
+ * the schema (existing slack.json files on disk keep parsing; a future
+ * brand/persona review could reintroduce a GATED path for them) but there is
+ * deliberately no loadSlackIdentity()/SlackIdentity type anymore — that
+ * function WAS the vulnerability (it turned file content into a
+ * chat.postMessage username with no check that the caller was the agent it
+ * claimed to be).
  */
-export interface SlackIdentity {
-  username: string;
-  icon_emoji?: string;
-  icon_url?: string;
-}
-
-/** Schema of `agents/<name>/slack.json`. */
 export interface SlackConfig {
-  display_name: string;
+  display_name?: string;
   icon_emoji?: string;
   icon_url?: string;
   /** Map of purpose ("recap", "ops", "approvals", ...) → channel id (Cxxx). */
@@ -47,33 +52,6 @@ export interface SlackConfig {
    * length first.
    */
   allowed_users: string[];
-}
-
-/**
- * Load the Slack identity override for an agent. Returns null when the agent
- * has no slack.json — that's the "Slack-disabled" signal and a normal state.
- *
- * `qualifiedName` can be bare ("boss") for shared agents or "engineer/agent"
- * for namespaced personal agents.
- */
-export function loadSlackIdentity(
-  frameworkRoot: string,
-  org: string,
-  qualifiedName: string,
-): SlackIdentity | null {
-  const agentDir = resolveAgentDir(frameworkRoot, org, qualifiedName);
-  const path = join(agentDir, 'slack.json');
-  if (!existsSync(path)) return null;
-  let cfg: SlackConfig;
-  try {
-    cfg = JSON.parse(readFileSync(path, 'utf-8'));
-  } catch (e) {
-    throw new Error(`slack.json parse failed for ${qualifiedName}: ${(e as Error).message}`);
-  }
-  const id: SlackIdentity = { username: cfg.display_name };
-  if (cfg.icon_emoji) id.icon_emoji = cfg.icon_emoji;
-  else if (cfg.icon_url) id.icon_url = cfg.icon_url;
-  return id;
 }
 
 /**
