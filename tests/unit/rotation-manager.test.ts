@@ -59,7 +59,7 @@ describe('RotationManager', () => {
     const accounts = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/accounts.json'), 'utf-8'));
     expect(accounts.active).toBe('b');
     expect(restartAgent).toHaveBeenCalledTimes(1);
-    expect(restartAgent).toHaveBeenCalledWith('boss');
+    expect(restartAgent).toHaveBeenCalledWith('boss', expect.any(String));
     // token written to ALL agent .envs (existing writeTokenToAgents behavior)
     expect(readFileSync(join(frameworkRoot, 'orgs/wyre/agents/dev/.env'), 'utf-8')).toContain('tok-b');
     expect(sendAlert).toHaveBeenCalledTimes(1);
@@ -75,7 +75,7 @@ describe('RotationManager', () => {
     expect(isLimitBlocked(ctxRoot, 'dev')).toBe(true);
     t += 10 * 60_000;                             // past cooldown
     await rm.tick();
-    expect(restartAgent).toHaveBeenCalledWith('dev');
+    expect(restartAgent).toHaveBeenCalledWith('dev', expect.any(String));
     expect(isLimitBlocked(ctxRoot, 'dev')).toBe(false);
   });
 
@@ -114,7 +114,7 @@ describe('RotationManager', () => {
     preflight.mockResolvedValue('ok');
     t += 36 * 60_000; // past retryAt (t+35m)
     await rm.tick();
-    expect(restartAgent).toHaveBeenCalledWith('boss');
+    expect(restartAgent).toHaveBeenCalledWith('boss', expect.any(String));
     expect(isLimitBlocked(ctxRoot, 'boss')).toBe(false);
   });
 
@@ -127,7 +127,7 @@ describe('RotationManager', () => {
     t += 36 * 60_000;                            // past retryAt AND active's synthetic expiry
     await rm.tick();
     expect(preflight).toHaveBeenCalledWith('tok-a');
-    expect(restartAgent).toHaveBeenCalledWith('boss');
+    expect(restartAgent).toHaveBeenCalledWith('boss', expect.any(String));
     expect(isLimitBlocked(ctxRoot, 'boss')).toBe(false);
     const accounts = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/accounts.json'), 'utf-8'));
     expect(accounts.active).toBe('a');           // no flip — recovered in place

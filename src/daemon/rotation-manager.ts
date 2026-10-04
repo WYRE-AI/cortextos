@@ -19,7 +19,7 @@ export interface RotationDeps {
   org: string;
   now?: () => number;
   preflight: (accessToken: string) => Promise<PreflightResult>;
-  restartAgent: (name: string) => Promise<void>;
+  restartAgent: (name: string, reason?: string) => Promise<void>;
   sendAlert: (text: string) => void;
   log: (msg: string) => void;
 }
@@ -291,7 +291,7 @@ export class RotationManager {
         const toRestart = Object.keys(state.limitBlocked);
         for (const agent of toRestart) {
           try {
-            await this.deps.restartAgent(agent);
+            await this.deps.restartAgent(agent, `oauth rotation -> account "${name}" (${reason})`);
             delete state.limitBlocked[agent];
           } catch (err) {
             this.deps.log(`[rotation] restart failed for ${agent}: ${err} — stays blocked for next tick`);
@@ -338,7 +338,7 @@ export class RotationManager {
         const toRestart = Object.keys(state.limitBlocked);
         for (const agent of toRestart) {
           try {
-            await this.deps.restartAgent(agent);
+            await this.deps.restartAgent(agent, `oauth rotation -> account "${store.active}" (recovered)`);
             delete state.limitBlocked[agent];
           } catch (err) {
             this.deps.log(`[rotation] restart failed for ${agent}: ${err} — stays blocked for next tick`);
