@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Fixed — `restartAgent()` had no pre-stop marker, so every rotation/manual restart paged as a false crash
+
+`agent-manager.ts`'s `stopAll()` writes a `.daemon-stop` marker in each agent's state dir before
+stopping, specifically so `hook-crash-alert.ts`'s SessionEnd hook classifies the exit correctly
+instead of alarming (BUG-034). `restartAgent()` — the single-agent path used by
+`rotation-manager.ts`, the dashboard/CLI `restart-agent` IPC command, and anything else that
+restarts one agent without going through `stopAll()` — had no equivalent, and had never had one.
+Confirmed 2026-09-30: an OAuth rotation restarting 10 agents in ~60s produced 10 false
+`type=crash reason=none` alerts in about a minute, even though every exit was clean (code 0,
+signal 0).
+
+The marker type this needed already existed: `.restart-planned` / `'planned-restart'` is already
+in `hook-crash-alert.ts`'s `classifyFromMarkers()` markers array, already produces an accurate
+per-agent message (`🔄 <agent> restarted (planned): <reason>`, distinct from the daemon-wide
+`daemon-stop` wording), and is already written by `src/bus/system.ts`'s `selfRestart`/`hardRestart`
+for the cooperative self-restart paths. `restartAgent()` was the one writer missing, not a new
+marker to add. Fixed by writing `.restart-planned` synchronously before `stopAgent()`, mirroring
+`stopAll()`'s ordering and its don't-block-on-write-failure handling. `restartAgent(name, reason?)`
+now takes an optional reason, threaded through from its three call sites: `rotation-manager.ts`
+passes `oauth rotation -> account "<name>" (<reason>)`, the IPC `restart-agent` handler passes
+`manual restart (dashboard/CLI)`.
+
 ### Added — non-agent cron action: `github-workflow-dispatch`
 
 Some crons need no model judgment at all: dispatch a GitHub Actions workflow on a schedule

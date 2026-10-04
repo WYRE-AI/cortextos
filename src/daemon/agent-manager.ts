@@ -160,7 +160,7 @@ export class AgentManager {
         frameworkRoot: this.frameworkRoot,
         org: env.org,
         preflight: preflightAccount,
-        restartAgent: (name) => this.restartAgent(name),
+        restartAgent: (name, reason) => this.restartAgent(name, reason),
         sendAlert: (text) => {
           const handle = this.alertHandle;
           if (handle) handle.api.sendMessage(handle.chatId, text).catch(() => {});
@@ -1181,8 +1181,16 @@ export class AgentManager {
    *
    * agentDir is auto-discovered by startAgent() from frameworkRoot/orgs/{org}/agents/{name}.
    * Participates in the pendingRestarts race protection used by restart-all.
+   *
+   * Writes a `.restart-planned` marker before stopping, same reasoning and
+   * same marker as stopAll()'s `.daemon-stop` (and src/bus/system.ts's
+   * selfRestart/hardRestart): without it, hook-crash-alert.ts's SessionEnd
+   * hook finds no marker and defaults to a false 🚨 crash alarm for every
+   * rotation-triggered or manual/dashboard restart on this path. The marker
+   * type already exists and is handled by classifyFromMarkers() — this was
+   * the one writer missing, not a new marker to add.
    */
-  async restartAgent(name: string): Promise<void> {
+  async restartAgent(name: string, reason?: string): Promise<void> {
     if (!this.agents.has(name)) {
       console.log(`[agent-manager] Agent ${name} not found — cannot restart`);
       return;
@@ -1203,6 +1211,14 @@ export class AgentManager {
     }
     try {
       console.log(`[agent-manager] Restarting ${name}`);
+      try {
+        mkdirSync(stateDir, { recursive: true });
+        writeFileSync(join(stateDir, '.restart-planned'), (reason || 'restartAgent (no reason given)') + '\n', 'utf-8');
+      } catch (err) {
+        // Don't block the restart on marker-write failure — worst case the
+        // user gets the false crash alarm this fix exists to prevent.
+        console.error(`[agent-manager] Failed to write .restart-planned marker for ${name}: ${err}`);
+      }
       await this.stopAgent(name);
       // Reset context_status.json so the fresh FastChecker this creates (startAgent
       // below) doesn't read the dying session's last-written, possibly still-high

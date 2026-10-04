@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { buildReplyContext } from '../../../src/daemon/agent-manager.js';
@@ -493,6 +493,45 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
     expect(statusAtStartTime.used_percentage).toBe(0);
     expect(statusAtStartTime.exceeds_200k_tokens).toBe(false);
     expect(startSpy).toHaveBeenCalledWith('alice', '');
+  });
+
+  it('writes a .restart-planned marker before stopAgent, mirroring stopAll\'s .daemon-stop pattern (task_1790766645549_24058243)', async () => {
+    // Without this marker, hook-crash-alert.ts's SessionEnd hook finds nothing
+    // and defaults to a false "crash" classification on every rotation-triggered
+    // or manual/dashboard restart through this path — it was the one writer
+    // missing for a marker type (.restart-planned / 'planned-restart') that
+    // already existed and was already handled correctly by classifyFromMarkers().
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', { process: {}, checker: {}, poller: { stop() {} } });
+
+    const stateDir = join(ctxRoot, 'state', 'alice');
+    const markerPath = join(stateDir, '.restart-planned');
+    let markerAtStopTime: string | null = null;
+    const stopSpy = vi.spyOn(am, 'stopAgent').mockImplementation(async () => {
+      markerAtStopTime = existsSync(markerPath) ? readFileSync(markerPath, 'utf-8').trim() : null;
+    });
+    vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.restartAgent('alice', 'oauth rotation -> account "bench2"');
+
+    expect(stopSpy).toHaveBeenCalled();
+    // Marker must exist by the time stopAgent runs, not just afterward —
+    // the whole point is that it's on disk before the kill happens.
+    expect(markerAtStopTime).toBe('oauth rotation -> account "bench2"');
+  });
+
+  it('defaults the marker reason to a generic string when restartAgent is called with no reason (e.g. the IPC path before this fix wired one through)', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', { process: {}, checker: {}, poller: { stop() {} } });
+    vi.spyOn(am, 'stopAgent').mockResolvedValue();
+    vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    const markerPath = join(ctxRoot, 'state', 'alice', '.restart-planned');
+
+    await am.restartAgent('alice');
+
+    expect(existsSync(markerPath)).toBe(true);
+    expect(readFileSync(markerPath, 'utf-8').trim().length).toBeGreaterThan(0);
   });
 });
 
