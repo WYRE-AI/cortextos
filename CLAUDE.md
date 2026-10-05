@@ -84,6 +84,16 @@ npm test
   fast-checker "heartbeat watchdog" fake-timer tests, phase4-performance p95
   assertions, and phase5-performance SC-2. They pass on a quiet machine —
   not regressions.
+- **Fifth entry in this list, promoted 2026-10-05 (infra) after a second
+  recurrence in one day:** `dashboard/src/lib/__tests__/watcher-ingests-real-events.test.ts`
+  (real-chokidar filesystem-watcher timing test) failed on a different
+  assertion each time (15:26Z and 17:26Z, same session) under two separate
+  `npm test` full-suite runs, passed clean both times when re-run isolated
+  seconds later, and both triggering pulls' diffs were confirmed to touch
+  zero dashboard files (`git diff --stat <before>..<after> -- dashboard/`
+  empty both times). Same shape as the other four: load-sensitive real I/O
+  timing, not a regression. Verify with an isolated re-run + a diff-scope
+  check before re-litigating flake-vs-regression on this file again.
 - Same flaky class, different environment (2026-09-04, dev/murph, PR #151
   CI): `tests/integration/phase5-performance.test.ts` P-4 ("10 successive
   write+read cycles of 100 crons all complete in <100ms each") failed on a
