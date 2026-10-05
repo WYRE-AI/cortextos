@@ -1190,10 +1190,10 @@ export class AgentManager {
    * type already exists and is handled by classifyFromMarkers() — this was
    * the one writer missing, not a new marker to add.
    */
-  async restartAgent(name: string, reason?: string): Promise<void> {
+  async restartAgent(name: string, reason?: string): Promise<boolean> {
     if (!this.agents.has(name)) {
       console.log(`[agent-manager] Agent ${name} not found — cannot restart`);
-      return;
+      return false;
     }
 
     // Cross-path restart-in-flight lock (2026-07-13 storm fix): confirmed root
@@ -1207,7 +1207,7 @@ export class AgentManager {
     const lock = tryAcquireRestartLock(stateDir, 'manual-restart');
     if (!lock.acquired) {
       console.log(`[agent-manager] Restart SKIPPED for ${name} — ${lock.reason}`);
-      return;
+      return false;
     }
     try {
       console.log(`[agent-manager] Restarting ${name}`);
@@ -1234,7 +1234,16 @@ export class AgentManager {
         );
       } catch { /* non-fatal */ }
       await this.startAgent(name, '');
-      console.log(`[agent-manager] Restart complete for ${name}`);
+      // start() catches spawn failures and resolves with status 'crashed'.
+      // A resolved restartAgent is therefore not evidence a PTY is running —
+      // rotation uses this boolean and must not treat the promise alone as
+      // confirmation. Lock no-ops and not-found return false above, before
+      // this read, so a still-running previous PTY is not mistaken for a
+      // PTY this call started.
+      const proc = this.agents.get(name)?.process as { getStatus?: () => { status?: string } } | undefined;
+      const running = proc?.getStatus?.()?.status === 'running';
+      console.log(`[agent-manager] Restart complete for ${name} (pty running: ${running})`);
+      return running;
     } finally {
       // Release once the new session has actually been started (unlike the
       // fast-checker.ts actuators, which release right after TRIGGERING an

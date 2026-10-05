@@ -9,6 +9,14 @@ import { existsSync, readFileSync, writeFileSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { loadAccounts, setActiveAccount, writeTokenToAgents } from '../bus/oauth.js';
+import {
+  attemptGlmFallback,
+  clearGlmFallbackActive,
+  loadGlmFallbackState,
+  markGlmFallbackActive,
+  type GlmFallbackActiveEntry,
+  type GlmFallbackAttemptResult,
+} from './glm-fallback.js';
 import type { LimitEvent } from './limit-detector.js';
 
 export type PreflightResult = 'ok' | 'limit' | 'error';
@@ -19,9 +27,24 @@ export interface RotationDeps {
   org: string;
   now?: () => number;
   preflight: (accessToken: string) => Promise<PreflightResult>;
-  restartAgent: (name: string, reason?: string) => Promise<void>;
+  /**
+   * Restart `name`. A resolved promise is not confirmation that a PTY is
+   * running: AgentManager.restartAgent returns normally for not-found and
+   * restart-lock no-ops, and AgentProcess.start() swallows spawn errors
+   * (status `crashed`) then resolves. Return true only when THIS call left
+   * a running PTY. Return false for those no-op / swallowed-start cases.
+   * Throw only for unexpected failures — callers treat false and a throw
+   * the same way: the restart did not produce a running PTY.
+   */
+  restartAgent: (name: string, reason?: string) => Promise<boolean>;
   sendAlert: (text: string) => void;
   log: (msg: string) => void;
+  /**
+   * Injection point for Tier 2 (GLM-5.3 cross-provider fallback), tests only
+   * — defaults to the real glm-fallback.ts implementation. Called exactly
+   * once, from the "every Tier 1 account exhausted" halt branch below.
+   */
+  tryGlmFallback?: (ctxRoot: string, blockedAgents: string[], reason: string, log: (msg: string) => void) => GlmFallbackAttemptResult;
 }
 
 /**
@@ -136,11 +159,14 @@ export function isLimitBlocked(ctxRoot: string, agent: string): boolean {
 
 export class RotationManager {
   private readonly now: () => number;
+  private readonly tryGlmFallback: NonNullable<RotationDeps['tryGlmFallback']>;
   private timer: ReturnType<typeof setInterval> | null = null;
   private rotating = false;
 
   constructor(private readonly deps: RotationDeps) {
     this.now = deps.now ?? (() => Date.now());
+    this.tryGlmFallback = deps.tryGlmFallback ??
+      ((ctxRoot, blockedAgents, reason, log) => attemptGlmFallback(ctxRoot, blockedAgents, reason, { log, now: this.now }));
   }
 
   private save(state: RotationState): void {
@@ -169,11 +195,28 @@ export class RotationManager {
   }
 
   /**
+   * Put a Tier 2 marker back exactly as it was. Used when a Tier 1 restart
+   * does not leave a running PTY: the marker was cleared first so a
+   * successful spawn would not re-apply GLM, and a failed spawn must not
+   * lose it.
+   */
+  private restoreGlmFallback(agent: string, prior: GlmFallbackActiveEntry | undefined): void {
+    if (!prior) return;
+    markGlmFallbackActive(this.deps.ctxRoot, agent, prior.reason, () => prior.since);
+  }
+
+  /**
    * Restart every currently limit-blocked agent (writing its
    * `.rotation-recovered` marker first) and clear it from `state.limitBlocked`
-   * on success. Shared by both doRotation() recovery branches — rotating onto
-   * a newly-available candidate account, and the active account recovering in
-   * place — which were previously two copies of this same loop.
+   * only when restartAgent confirms a running Tier 1 PTY. A resolved call is
+   * not that confirmation — see RotationDeps.restartAgent. Shared by both
+   * doRotation() recovery branches — rotating onto a newly-available
+   * candidate account, and the active account recovering in place.
+   *
+   * Any GLM-active marker is cleared immediately before the restart so the
+   * new PTY does not pick the override back up, and restored (with
+   * limitBlocked retained) when the restart throws or does not confirm a
+   * running PTY.
    *
    * `restartReason` is the `.restart-planned` text restartAgent() writes.
    * It stays distinct from `markerReason`: classifyFromMarkers reads
@@ -182,11 +225,20 @@ export class RotationManager {
   private async restartBlockedAgents(state: RotationState, markerReason: string, restartReason: string): Promise<string[]> {
     const toRestart = Object.keys(state.limitBlocked);
     for (const agent of toRestart) {
+      const existing = loadGlmFallbackState(this.deps.ctxRoot).active[agent];
+      const priorGlm = existing ? { since: existing.since, reason: existing.reason } : undefined;
+      if (priorGlm) clearGlmFallbackActive(this.deps.ctxRoot, agent);
       try {
         this.writeRestartMarker(agent, markerReason);
-        await this.deps.restartAgent(agent, restartReason);
-        delete state.limitBlocked[agent];
+        const started = await this.deps.restartAgent(agent, restartReason);
+        if (started === true) {
+          delete state.limitBlocked[agent];
+        } else {
+          this.restoreGlmFallback(agent, priorGlm);
+          this.deps.log(`[rotation] restart for ${agent} resolved without a running Tier 1 PTY — stays blocked for next tick`);
+        }
       } catch (err) {
+        this.restoreGlmFallback(agent, priorGlm);
         this.deps.log(`[rotation] restart failed for ${agent}: ${err} — stays blocked for next tick`);
       }
     }
@@ -332,6 +384,10 @@ export class RotationManager {
         writeTokenToAgents(this.deps.frameworkRoot, this.deps.org, store.accounts[name].access_token);
         // Reload: preflights are slow (real inference); more agents may have blocked meanwhile.
         state = loadState(this.deps.ctxRoot);
+        // GLM markers are cleared inside restartBlockedAgents immediately
+        // before each restart, and restored unless that call confirms a
+        // running Tier 1 PTY. Do not clear them here first — a pre-clear
+        // throws away the entry a failed restart has to put back.
         const toRestart = await this.restartBlockedAgents(
           state,
           `rotation recovery: account "${name}" now active (${reason})`,
@@ -375,6 +431,8 @@ export class RotationManager {
       attempted += 1;
       if (activeResult === 'ok') {
         state = loadState(this.deps.ctxRoot);
+        // Same as the candidate-rotation branch: restartBlockedAgents owns
+        // the GLM clear/restore. A pre-clear here cannot be undone.
         const toRestart = await this.restartBlockedAgents(
           state,
           `rotation recovery: account "${store.active}" recovered (${reason})`,
@@ -428,5 +486,44 @@ export class RotationManager {
     const msg = `⛔ cortextOS: ALL OAuth accounts exhausted. Blocked: ${Object.keys(state.limitBlocked).join(', ') || 'none yet'}. Auto-retry at ${new Date(state.retryAt).toISOString()}.`;
     this.deps.log('[rotation] ' + msg);
     if (alertNeeded) this.deps.sendAlert(msg);
+
+    // Tier 2 (GLM-5.3 cross-provider fallback) — entered ONLY here, having
+    // just verified every Tier 1 account (bench + active recheck) failed
+    // preflight this invocation. Ships disabled; a no-config or
+    // enabled:false fleet gets a guaranteed no-op. See glm-fallback.ts.
+    const blockedNow = Object.keys(state.limitBlocked);
+    if (blockedNow.length > 0) {
+      const glmResult = this.tryGlmFallback(this.deps.ctxRoot, blockedNow, reason, this.deps.log);
+      if (glmResult.candidates.length > 0) {
+        // Mark BEFORE restartAgent. AgentPTY.spawn reads the marker while
+        // building the env, so a mark that lands only after the promise
+        // resolves never reaches the new PTY. Keep the mark (and count the
+        // agent as entered) only when the call confirms a running PTY.
+        // A throw or a resolved no-op clears it — otherwise the next
+        // attempt's already-active filter would skip an agent that never
+        // actually started on GLM.
+        const entered: string[] = [];
+        for (const agent of glmResult.candidates) {
+          markGlmFallbackActive(this.deps.ctxRoot, agent, reason, this.now);
+          try {
+            const started = await this.deps.restartAgent(agent);
+            if (started === true) {
+              entered.push(agent);
+            } else {
+              clearGlmFallbackActive(this.deps.ctxRoot, agent);
+              this.deps.log(`[glm-fallback] restart for ${agent} resolved without a running PTY — mark cleared, remains a candidate for the next attempt`);
+            }
+          } catch (err) {
+            clearGlmFallbackActive(this.deps.ctxRoot, agent);
+            this.deps.log(`[glm-fallback] restart failed for ${agent}: ${err} — NOT marked Tier-2-active, remains a candidate for the next attempt`);
+          }
+        }
+        if (entered.length > 0) {
+          const glmMsg = `🟡 cortextOS: Tier 2 (GLM-5.3/Z.ai) entered for ${entered.join(', ')} — all Tier 1 accounts exhausted. Held on Tier 1: ${glmResult.excluded.join(', ') || 'none'}.`;
+          this.deps.log('[glm-fallback] ' + glmMsg);
+          this.deps.sendAlert(glmMsg);
+        }
+      }
+    }
   }
 }
