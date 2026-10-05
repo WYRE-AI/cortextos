@@ -9,6 +9,7 @@ import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
 import { WsUnixJsonRpcClient, type JsonRpcResponse } from '../utils/ws-unix-client.js';
+import { loadEnvFileInto } from './agent-pty.js';
 
 interface IPty {
   pid: number;
@@ -1002,9 +1003,9 @@ export class CodexAppServerPTY {
     env['CTX_PROJECT_ROOT'] = this._env.projectRoot;
 
     if (this._env.org && this._env.projectRoot) {
-      this.loadEnvFile(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env);
+      loadEnvFileInto(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env);
     }
-    this.loadEnvFile(join(this._env.agentDir, '.env'), env);
+    loadEnvFileInto(join(this._env.agentDir, '.env'), env);
 
     if (env['CHAT_ID']) env['CTX_TELEGRAM_CHAT_ID'] = env['CHAT_ID'];
     if (this._config.timezone) {
@@ -1013,22 +1014,6 @@ export class CodexAppServerPTY {
     }
 
     return env;
-  }
-
-  private loadEnvFile(path: string, env: Record<string, string>): void {
-    if (!existsSync(path)) return;
-    try {
-      for (const line of readFileSync(path, 'utf-8').split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const eqIdx = trimmed.indexOf('=');
-        if (eqIdx > 0) {
-          env[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-        }
-      }
-    } catch {
-      // Ignore env file read errors.
-    }
   }
 
   private getPackageVersion(): string {
