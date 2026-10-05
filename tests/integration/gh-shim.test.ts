@@ -294,16 +294,38 @@ ${fakeGhAppToken("WYRE-AI", "minted-once")}
     expect(stdout).toContain("GH_TOKEN=fresh-token");
   });
 
-  it("falls open LOUDLY (warns, still runs gh with ambient auth) when minting fails on an allowlisted org", async () => {
+  it("REFUSES (nonzero exit, real gh never invoked, no ambient-auth fallback) when minting fails on an allowlisted org", async () => {
+    // #210 (2026-10-02) was genuinely merged BY the shared Mac's personal
+    // asachs01 login after exactly this fallback fired -- the failure mode
+    // is proven, not hypothetical. A refusing guard beats a warning one.
     await initGitRepo("git@github.com:WYRE-AI/conduit.git");
     writeFakeExe("cortextos", `echo "boom: bad creds" >&2; exit 1`);
     writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
-    writeFakeExe("gh", `echo "GH_TOKEN=[$GH_TOKEN]"`);
+    writeFakeExe("gh", `echo "should never run" >&2; exit 1`);
 
     const { stdout, stderr, code } = await runShim(["pr", "list"], fakeRepo);
-    expect(code).toBe(0);
-    expect(stderr).toMatch(/WARNING.*failed to mint/);
-    expect(stdout).toContain("GH_TOKEN=[]"); // no token injected, but gh still ran
+    expect(code).not.toBe(0);
+    expect(stderr).toMatch(/REFUSING.*failed to mint/);
+    expect(stderr).not.toContain("should never run");
+    expect(stdout).toBe("");
+  });
+
+  it("REFUSES a write call (pr merge) the same way a read call is refused on mint failure", async () => {
+    // The 10-04 sharpening: #210 was specifically a WRITE (a merge) flowing
+    // through the ambient credential -- confirm the refusal isn't narrower
+    // than the read-only case above by construction.
+    await initGitRepo("git@github.com:WYRE-AI/conduit.git");
+    writeFakeExe("cortextos", `echo "boom: bad creds" >&2; exit 1`);
+    writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+    writeFakeExe("gh", `echo "should never run" >&2; exit 1`);
+
+    const { stdout, stderr, code } = await runShim(
+      ["pr", "merge", "123", "--merge"],
+      fakeRepo,
+    );
+    expect(code).not.toBe(0);
+    expect(stderr).toMatch(/REFUSING.*failed to mint/);
+    expect(stdout).toBe("");
   });
 
   it("writes the token cache atomically (temp file + rename, no partial file left behind)", async () => {

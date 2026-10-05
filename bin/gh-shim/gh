@@ -17,9 +17,13 @@
 # real `gh` with today's ambient auth, silently -- ordinary `gh` usage for
 # something outside the fleet's own repos must keep working exactly as
 # before. If the target IS on the allowlist but minting fails (network
-# blip, secrets unavailable), this also falls open to ambient auth, but
-# LOUDLY -- a silent fallback there would just reproduce the bug this
-# exists to fix.
+# blip, secrets unavailable), this REFUSES instead (nonzero exit, no real
+# `gh` invocation at all) -- the original design fell back to ambient auth
+# here too, loudly, but that's the exact silent-impersonation shape this
+# shim exists to close: #210 (2026-10-02) was genuinely merged BY the
+# shared Mac's personal asachs01 login after a fallback just like that one
+# fired. "A refusing guard beats a warning one" (this org's 2026-08-17
+# doctrine) -- see task_1790244063432.
 #
 # See bus/gh-bot.sh (the explicit opt-in sibling; same org-resolution
 # shape, no allowlist since it's explicit) and task_1790244063432.
@@ -152,14 +156,14 @@ if [[ -z "$TOKEN" ]]; then
         || rm -f "$TMP"
     fi
   else
-    echo "gh-shim: WARNING -- failed to mint a wyre-agent-fleet token for org \"$ORG\"; falling back to ambient gh auth for this call (check GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY via cortex-secret --context conduit)" >&2
+    echo "gh-shim: REFUSING -- failed to mint a wyre-agent-fleet token for org \"$ORG\" and will NOT fall back to ambient gh auth (that silent-impersonation shape is what this shim exists to close -- see #210, 2026-10-02). Fix the credential, don't retry around this: cortex-secret run --context conduit -- cortextos bus gh-app-token --org \"$ORG\"" >&2
     # Also log-event, not just stderr -- a stderr line inside some other
     # command's PTY transcript is easy to miss for days (this org's own
     # documented failure shape for silent misattribution). Best-effort:
     # if cortextos itself is what's failing, this may also fail; that's
     # fine, the stderr warning above still fired.
     cortextos bus log-event error gh_shim_mint_failed error --meta "{\"org\":\"$ORG\"}" >/dev/null 2>&1 || true
-    exec "$REAL_GH" "$@"
+    exit 1
   fi
 fi
 
