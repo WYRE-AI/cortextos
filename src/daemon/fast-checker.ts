@@ -394,8 +394,11 @@ ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
    * Format a Slack text message for injection. Same sanitization posture as
    * formatTelegramTextMessage (the sender/display-name is untrusted, the
    * body is untrusted) — see that method's docblock for the reasoning,
-   * unchanged here. `agentName` threads the `--as` flag so the reply command
-   * posts under the correct per-agent Slack identity (loadSlackIdentity).
+   * unchanged here. `agentName` threads the `--as` flag, which the CLI now
+   * uses purely as a self-identity assertion (it must equal the calling
+   * process's own CTX_AGENT_NAME or the send is refused) — the actual
+   * posted username always comes from SlackAPI's own RUNTIME_AGENT_NAME
+   * capture, never from this flag or any file (see src/slack/api.ts).
    */
   static formatSlackTextMessage(
     from: string,
