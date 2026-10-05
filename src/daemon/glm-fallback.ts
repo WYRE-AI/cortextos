@@ -69,6 +69,17 @@ export function loadGlmFallbackConfig(ctxRoot: string): GlmFallbackConfig {
   if (!existsSync(path)) return { ...DEFAULT_GLM_FALLBACK_CONFIG };
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    const excludedAgents = parsed.excludedAgents;
+    // A non-string member (null, number, …) would otherwise be accepted and
+    // drop the default exclusions, so pearl/marketing/scribe could be
+    // restarted onto GLM. That is malformed config: fail closed. An empty
+    // array is a valid explicit override (callers use it in tests) and stays.
+    if (
+      Array.isArray(excludedAgents) &&
+      !excludedAgents.every((agent: unknown) => typeof agent === 'string')
+    ) {
+      return { ...DEFAULT_GLM_FALLBACK_CONFIG };
+    }
     return {
       enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : DEFAULT_GLM_FALLBACK_CONFIG.enabled,
       excludedAgents: Array.isArray(parsed.excludedAgents)
@@ -143,6 +154,38 @@ export function buildGlmEnvVars(apiKey: string): Record<string, string> {
 
 export type SecretFetcher = () => string;
 
+/**
+ * Sink for a sanitized key-fetch failure. Populated only when the fetcher
+ * throws. `cause` is code/status/signal only — never stdout, stderr, the
+ * Error message, or the secret (execFileSync puts the command output on
+ * the thrown error, and that output can be the key).
+ */
+export interface ZaiKeyFetchFailure {
+  cause?: string;
+}
+
+/** Identifier-like errno / signal only. Anything else can be payload. */
+function safeToken(value: unknown, pattern: RegExp): string | undefined {
+  return typeof value === 'string' && pattern.test(value) ? value : undefined;
+}
+
+function sanitizeZaiKeyFetchError(err: unknown): string {
+  const e = err && typeof err === 'object' ? err as { code?: unknown; status?: unknown; signal?: unknown } : {};
+  const parts: string[] = [];
+  const code = safeToken(e.code, /^(?:E[A-Z0-9]{1,20}|[A-Z][A-Z0-9_]{0,20})$/);
+  if (code) parts.push(`code=${code}`);
+  else if (typeof e.code === 'number' && Number.isInteger(e.code)) parts.push(`code=${e.code}`);
+  if (typeof e.status === 'number' && Number.isInteger(e.status)) parts.push(`status=${e.status}`);
+  const signal = safeToken(e.signal, /^[A-Z][A-Z0-9]{0,15}$/);
+  if (signal) parts.push(`signal=${signal}`);
+  else if (typeof e.signal === 'number' && Number.isInteger(e.signal)) parts.push(`signal=${e.signal}`);
+  return parts.length > 0 ? parts.join(', ') : 'unknown';
+}
+
+function fetchFailureSuffix(failure: ZaiKeyFetchFailure): string {
+  return failure.cause ? ` (${failure.cause})` : '';
+}
+
 function defaultFetchZaiApiKey(): string {
   // Lives in `--context conduit`, NOT cortex-secret's default context —
   // verified directly 2026-09-14 (boss's "confirmed readable" didn't name
@@ -163,11 +206,16 @@ function defaultFetchZaiApiKey(): string {
  * falling back to a placeholder — per this org's cortex-secret doctrine,
  * a missing secret is a blocker to surface, not to route around.
  */
-export function fetchZaiApiKey(exec: SecretFetcher = defaultFetchZaiApiKey): string | null {
+export function fetchZaiApiKey(
+  exec: SecretFetcher = defaultFetchZaiApiKey,
+  failure?: ZaiKeyFetchFailure,
+): string | null {
   try {
     const value = exec().trim();
+    if (failure) failure.cause = undefined;
     return value.length > 0 ? value : null;
-  } catch {
+  } catch (err) {
+    if (failure) failure.cause = sanitizeZaiKeyFetchError(err);
     return null;
   }
 }
@@ -175,13 +223,11 @@ export function fetchZaiApiKey(exec: SecretFetcher = defaultFetchZaiApiKey): str
 export interface GlmFallbackAttemptResult {
   /**
    * Agents eligible to enter Tier 2 (not excluded, not already active, and a
-   * key fetch succeeded) — NOT yet marked active. The caller must call
-   * markGlmFallbackActive itself, and ONLY after confirming restartAgent
-   * actually succeeded for that agent (PR #186 review, dev): marking active
-   * before the restart is confirmed means a restart failure leaves the agent
-   * permanently stuck — the next attempt's `alreadyActive` filter would
-   * exclude it from ever being retried, despite a log line claiming it
-   * would be.
+   * key fetch succeeded) — NOT yet marked active. The caller marks each
+   * candidate immediately BEFORE restartAgent, because AgentPTY.spawn applies
+   * the GLM env while starting the process. It must then clear that mark
+   * unless the restart confirms a PTY actually started (a throw or a resolved
+   * no-op both leave the agent unmarked, so the next attempt can retry it).
    */
   candidates: string[];
   excluded: string[];
@@ -215,10 +261,12 @@ export function attemptGlmFallback(
     return { candidates: [], excluded, skippedReason: 'no-eligible-agents' };
   }
 
-  const apiKey = fetchZaiApiKey(opts.fetchKey);
+  const failure: ZaiKeyFetchFailure = {};
+  const apiKey = fetchZaiApiKey(opts.fetchKey, failure);
   if (!apiKey) {
     opts.log(
-      '[glm-fallback] ZAI_API_KEY fetch failed (cortex-secret get ZAI_API_KEY --context conduit) — ' +
+      `[glm-fallback] ZAI_API_KEY fetch failed${fetchFailureSuffix(failure)} ` +
+        '(cortex-secret get ZAI_API_KEY --context conduit) — ' +
         'cannot enter Tier 2, staying on Tier 1 halt',
     );
     return { candidates: [], excluded, skippedReason: 'key-fetch-failed' };
@@ -251,9 +299,10 @@ export function applyGlmFallbackEnv(
   // only for agents that haven't restarted yet.
   if (!loadGlmFallbackConfig(ctxRoot).enabled) return;
 
-  const apiKey = fetchZaiApiKey(opts.fetchKey);
+  const failure: ZaiKeyFetchFailure = {};
+  const apiKey = fetchZaiApiKey(opts.fetchKey, failure);
   if (!apiKey) {
-    log(`[glm-fallback] ${agentName} is marked Tier-2-active but the key fetch failed at spawn time — spawning with whatever Tier 1 token is already in .env (likely stale/exhausted) rather than a broken env.`);
+    log(`[glm-fallback] ${agentName} is marked Tier-2-active but the key fetch failed at spawn time${fetchFailureSuffix(failure)} — spawning with whatever Tier 1 token is already in .env (likely stale/exhausted) rather than a broken env.`);
     return;
   }
   Object.assign(env, buildGlmEnvVars(apiKey));

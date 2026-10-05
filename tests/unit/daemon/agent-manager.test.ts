@@ -417,7 +417,7 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
     const stopSpy = vi.spyOn(am, 'stopAgent').mockResolvedValue();
     const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
 
-    await am.restartAgent('nonexistent');
+    await expect(am.restartAgent('nonexistent')).resolves.toBe(false);
 
     expect(stopSpy).not.toHaveBeenCalled();
     expect(startSpy).not.toHaveBeenCalled();
@@ -439,7 +439,7 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
     const preAcquired = tryAcquireRestartLock(stateDir, 'hang-detector');
     expect(preAcquired.acquired).toBe(true); // sanity: the simulated actuator got it first
 
-    await am.restartAgent('alice');
+    await expect(am.restartAgent('alice')).resolves.toBe(false);
 
     expect(stopSpy).not.toHaveBeenCalled();
     expect(startSpy).not.toHaveBeenCalled();
@@ -532,6 +532,19 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
 
     expect(existsSync(markerPath)).toBe(true);
     expect(readFileSync(markerPath, 'utf-8').trim().length).toBeGreaterThan(0);
+  });
+
+  it('returns true only when the agent status after start is running (a resolved start is not enough)', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const getStatus = vi.fn().mockReturnValue({ status: 'running', name: 'alice' });
+    (am as any).agents.set('alice', { process: { getStatus }, checker: {}, poller: { stop() {} } });
+    vi.spyOn(am, 'stopAgent').mockResolvedValue();
+    vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await expect(am.restartAgent('alice')).resolves.toBe(true);
+
+    getStatus.mockReturnValue({ status: 'crashed', name: 'alice' });
+    await expect(am.restartAgent('alice')).resolves.toBe(false);
   });
 });
 

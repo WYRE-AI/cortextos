@@ -44,6 +44,37 @@ describe('loadGlmFallbackConfig', () => {
     expect(cfg.enabled).toBe(true);
     expect(cfg.excludedAgents).toEqual(['pearl']);
   });
+
+  it('fails closed (disabled defaults) when excludedAgents contains a non-string', () => {
+    mkdirSync(join(ctxRoot, 'state', 'glm-fallback'), { recursive: true });
+    writeFileSync(
+      join(ctxRoot, 'state', 'glm-fallback', 'config.json'),
+      JSON.stringify({ enabled: true, excludedAgents: ['pearl', null] }),
+    );
+    expect(loadGlmFallbackConfig(ctxRoot)).toEqual(DEFAULT_GLM_FALLBACK_CONFIG);
+  });
+
+  it('keeps an empty excludedAgents array as an explicit override', () => {
+    mkdirSync(join(ctxRoot, 'state', 'glm-fallback'), { recursive: true });
+    writeFileSync(
+      join(ctxRoot, 'state', 'glm-fallback', 'config.json'),
+      JSON.stringify({ enabled: true, excludedAgents: [] }),
+    );
+    const cfg = loadGlmFallbackConfig(ctxRoot);
+    expect(cfg.enabled).toBe(true);
+    expect(cfg.excludedAgents).toEqual([]);
+  });
+
+  it('leaves a non-array excludedAgents on the previous path: enabled flag kept, default exclusions', () => {
+    mkdirSync(join(ctxRoot, 'state', 'glm-fallback'), { recursive: true });
+    writeFileSync(
+      join(ctxRoot, 'state', 'glm-fallback', 'config.json'),
+      JSON.stringify({ enabled: true, excludedAgents: null }),
+    );
+    const cfg = loadGlmFallbackConfig(ctxRoot);
+    expect(cfg.enabled).toBe(true);
+    expect(cfg.excludedAgents).toEqual(DEFAULT_GLM_FALLBACK_CONFIG.excludedAgents);
+  });
 });
 
 describe('GLM fallback active-state tracking', () => {
@@ -92,6 +123,43 @@ describe('fetchZaiApiKey', () => {
     expect(fetchZaiApiKey(() => { throw new Error('cortex-secret: not found'); })).toBeNull();
   });
 
+  it('records a sanitized code/status and never the stdout or the secret', () => {
+    const secret = 'zai-live-key-do-not-log';
+    const err = Object.assign(new Error(`Command failed: cortex-secret\n${secret}`), {
+      code: 'ENOENT',
+      status: 1,
+      signal: 'SIGTERM',
+      stdout: secret,
+      stderr: secret,
+    });
+    const failure: { cause?: string } = {};
+    expect(fetchZaiApiKey(() => { throw err; }, failure)).toBeNull();
+    expect(failure.cause).toBe('code=ENOENT, status=1, signal=SIGTERM');
+    expect(failure.cause).not.toContain(secret);
+    expect(JSON.stringify(failure)).not.toContain(secret);
+  });
+
+  it('drops a code or signal that is not an errno — those fields can carry the secret', () => {
+    const secret = 'zai-live-key-do-not-log';
+    const failure: { cause?: string } = {};
+    const err = Object.assign(new Error(secret), { code: secret, signal: secret, status: 2, stdout: secret });
+    expect(fetchZaiApiKey(() => { throw err; }, failure)).toBeNull();
+    expect(failure.cause).toBe('status=2');
+    expect(failure.cause).not.toContain(secret);
+  });
+
+  it('records unknown when the throw carries no code or exit status', () => {
+    const failure: { cause?: string } = { cause: 'stale' };
+    expect(fetchZaiApiKey(() => { throw new Error('stdout has the key'); }, failure)).toBeNull();
+    expect(failure.cause).toBe('unknown');
+  });
+
+  it('does not keep a stale cause after a successful fetch', () => {
+    const failure: { cause?: string } = { cause: 'stale' };
+    expect(fetchZaiApiKey(() => 'abc123\n', failure)).toBe('abc123');
+    expect(failure.cause).toBeUndefined();
+  });
+
   it('returns null on an empty value rather than a blank token', () => {
     expect(fetchZaiApiKey(() => '   ')).toBeNull();
   });
@@ -134,13 +202,18 @@ describe('attemptGlmFallback', () => {
   it('fails closed and returns no candidates when the key fetch fails', () => {
     enable();
     const log = vi.fn();
+    const secret = 'zai-live-key-do-not-log';
+    const err = Object.assign(new Error(`Command failed\n${secret}`), { status: 7, stdout: secret });
     const result = attemptGlmFallback(ctxRoot, ['boss'], 'all exhausted', {
       log,
-      fetchKey: () => { throw new Error('secret not found'); },
+      fetchKey: () => { throw err; },
     });
     expect(result).toEqual({ candidates: [], excluded: [], skippedReason: 'key-fetch-failed' });
     expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false);
-    expect(log).toHaveBeenCalledWith(expect.stringMatching(/ZAI_API_KEY fetch failed/));
+    const line = String(log.mock.calls[0]?.[0]);
+    expect(line).toMatch(/ZAI_API_KEY fetch failed/);
+    expect(line).toContain('status=7');
+    expect(line).not.toContain(secret);
   });
 
   it('excludes an agent already marked active from the candidate list — the caller marks after entry, this checks the caller did', () => {
@@ -157,10 +230,10 @@ describe('attemptGlmFallback', () => {
   });
 
   it('regression (PR #186 review, dev): an agent whose restart FAILED must remain a candidate on the next attempt, not get silently stuck forever', () => {
-    // This models what a naive "mark active before restart" implementation
-    // gets wrong — a real caller (rotation-manager) marks active only AFTER
-    // a confirmed restartAgent success, so a restart failure leaves the
-    // agent unmarked and it must show up as a candidate again here.
+    // attemptGlmFallback itself never marks. The caller (rotation-manager)
+    // marks immediately before restart so the PTY sees the override, then
+    // clears that mark if the restart throws or does not start a PTY. An
+    // agent left unmarked must show up as a candidate again here.
     enable();
     const fetchKey = vi.fn(() => 'key');
     const result1 = attemptGlmFallback(ctxRoot, ['boss'], 'r1', { log: vi.fn(), fetchKey });
@@ -211,8 +284,13 @@ describe('applyGlmFallbackEnv (the PTY spawn-time hook)', () => {
 
     const env: Record<string, string> = { CLAUDE_CODE_OAUTH_TOKEN: 'stale-tok' };
     const log = vi.fn();
-    applyGlmFallbackEnv(env, ctxRoot, 'boss', { fetchKey: () => { throw new Error('down'); }, log });
+    const secret = 'zai-live-key-do-not-log';
+    const err = Object.assign(new Error(`down\n${secret}`), { code: 'ETIMEDOUT', stdout: secret });
+    applyGlmFallbackEnv(env, ctxRoot, 'boss', { fetchKey: () => { throw err; }, log });
     expect(env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'stale-tok' });
-    expect(log).toHaveBeenCalledWith(expect.stringMatching(/key fetch failed at spawn time/));
+    const line = String(log.mock.calls[0]?.[0]);
+    expect(line).toMatch(/key fetch failed at spawn time/);
+    expect(line).toContain('code=ETIMEDOUT');
+    expect(line).not.toContain(secret);
   });
 });

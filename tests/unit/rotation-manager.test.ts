@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { RotationManager, isLimitBlocked, loadRotationState } from '../../src/daemon/rotation-manager.js';
-import { isGlmFallbackActive, attemptGlmFallback } from '../../src/daemon/glm-fallback.js';
+import { isGlmFallbackActive, attemptGlmFallback, loadGlmFallbackState } from '../../src/daemon/glm-fallback.js';
 import type { LimitEvent } from '../../src/daemon/limit-detector.js';
 
 const EV: LimitEvent = { kind: 'session', resetAt: null, matchedText: "You'vehityoursessionlimit" };
@@ -46,7 +46,8 @@ describe('RotationManager', () => {
     makeAgentEnvs(frameworkRoot, 'wyre', ['boss', 'dev']);
     t = T0;
     preflight = vi.fn().mockResolvedValue('ok');
-    restartAgent = vi.fn().mockResolvedValue(undefined);
+    // true = this call left a running PTY. A bare resolve is not confirmation.
+    restartAgent = vi.fn().mockResolvedValue(true);
     sendAlert = vi.fn();
     rm = new RotationManager({
       ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
@@ -61,6 +62,7 @@ describe('RotationManager', () => {
     restartAgent.mockImplementation(async (agent: string) => {
       const p = join(ctxRoot, 'state', agent, '.rotation-recovered');
       markerAtCallTime = existsSync(p) ? readFileSync(p, 'utf-8') : null;
+      return true;
     });
     await rm.onLimitEvent('boss', EV);
     expect(preflight).toHaveBeenCalledWith('tok-b');
@@ -241,7 +243,8 @@ describe('disabled accounts on the daemon rotation path (#93 warden finding)', (
     makeAgentEnvs(frameworkRoot, 'wyre', ['boss', 'dev']);
     t = T0;
     preflight = vi.fn().mockResolvedValue('ok');
-    restartAgent = vi.fn().mockResolvedValue(undefined);
+    // true = this call left a running PTY. A bare resolve is not confirmation.
+    restartAgent = vi.fn().mockResolvedValue(true);
     sendAlert = vi.fn();
     rm = new RotationManager({
       ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
@@ -298,7 +301,8 @@ describe('exhaustion observations (2026-08-20 fix)', () => {
     makeAgentEnvs(frameworkRoot, 'wyre', ['boss', 'dev']);
     t = T0;
     preflight = vi.fn().mockResolvedValue('ok');
-    restartAgent = vi.fn().mockResolvedValue(undefined);
+    // true = this call left a running PTY. A bare resolve is not confirmation.
+    restartAgent = vi.fn().mockResolvedValue(true);
     sendAlert = vi.fn();
     rm = new RotationManager({
       ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
@@ -388,7 +392,8 @@ describe('RotationManager -> Tier 2 (GLM-5.3) trigger wiring', () => {
     makeAgentEnvs(frameworkRoot, 'wyre', ['boss', 'dev']);
     t = T0;
     preflight = vi.fn().mockResolvedValue('limit'); // every Tier 1 candidate dry, every time
-    restartAgent = vi.fn().mockResolvedValue(undefined);
+    // true = this call left a running PTY. A bare resolve is not confirmation.
+    restartAgent = vi.fn().mockResolvedValue(true);
     sendAlert = vi.fn();
   });
 
@@ -431,19 +436,53 @@ describe('RotationManager -> Tier 2 (GLM-5.3) trigger wiring', () => {
 
   it('regression (PR #186 review, dev): a candidate whose restartAgent() FAILS is NOT marked active, and no Tier 2 alert fires for it', async () => {
     const tryGlmFallback = vi.fn().mockReturnValue({ candidates: ['boss'], excluded: [] });
-    restartAgent.mockRejectedValueOnce(new Error('spawn ENOENT'));
+    let markedDuringRestart = false;
+    restartAgent.mockImplementation(async () => {
+      // The mark has to be visible to AgentPTY.spawn, which runs inside restart.
+      markedDuringRestart = isGlmFallbackActive(ctxRoot, 'boss');
+      throw new Error('spawn ENOENT');
+    });
     const rm = new RotationManager({
       ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
       preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
     });
     await rm.onLimitEvent('boss', EV);
     expect(restartAgent).toHaveBeenCalledWith('boss');
-    // The bug this test pins: marking active BEFORE a confirmed restart
-    // would leave a failed agent permanently un-retryable (the next
-    // attempt's already-active filter excludes it forever). It must stay
-    // unmarked so the next halt-branch pass offers it as a candidate again.
+    expect(markedDuringRestart).toBe(true);
+    // Cleared after the throw, so the next halt-branch pass can offer it again.
     expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false);
     // No Tier 2 "entered" alert for an agent that never actually entered.
+    expect(sendAlert.mock.calls.some(c => /Tier 2/.test(c[0]))).toBe(false);
+  });
+
+  it('clears the GLM mark when restartAgent resolves without confirming a running PTY', async () => {
+    const tryGlmFallback = vi.fn().mockReturnValue({ candidates: ['boss'], excluded: [] });
+    let markedDuringRestart = false;
+    restartAgent.mockImplementation(async () => {
+      markedDuringRestart = isGlmFallbackActive(ctxRoot, 'boss');
+      return false;
+    });
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
+    });
+    await rm.onLimitEvent('boss', EV);
+    expect(markedDuringRestart).toBe(true);
+    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false);
+    expect(sendAlert.mock.calls.some(c => /Tier 2/.test(c[0]))).toBe(false);
+    expect(isLimitBlocked(ctxRoot, 'boss')).toBe(true);
+  });
+
+  it('does not treat a resolved undefined restart as a running PTY', async () => {
+    const tryGlmFallback = vi.fn().mockReturnValue({ candidates: ['boss'], excluded: [] });
+    restartAgent.mockResolvedValue(undefined);
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {}, tryGlmFallback,
+    });
+    await rm.onLimitEvent('boss', EV);
+    expect(restartAgent).toHaveBeenCalledWith('boss');
+    expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false);
     expect(sendAlert.mock.calls.some(c => /Tier 2/.test(c[0]))).toBe(false);
   });
 
@@ -494,5 +533,55 @@ describe('RotationManager -> Tier 2 (GLM-5.3) trigger wiring', () => {
     // restarted this agent, not that the call is single-argument.
     expect(restartAgent).toHaveBeenCalledWith('boss', expect.any(String)); // restarted back onto a real Tier 1 account
     expect(isGlmFallbackActive(ctxRoot, 'boss')).toBe(false); // and no longer Tier-2-marked
+    expect(isLimitBlocked(ctxRoot, 'boss')).toBe(false);
+  });
+
+  it('candidate-account recovery restores the GLM marker and keeps limitBlocked when restart does not confirm a running PTY', async () => {
+    mkdirSync(join(ctxRoot, 'state', 'glm-fallback'), { recursive: true });
+    writeFileSync(join(ctxRoot, 'state', 'glm-fallback', 'config.json'), JSON.stringify({ enabled: true, excludedAgents: [] }));
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {},
+      tryGlmFallback: (root, blocked, reason, log) =>
+        attemptGlmFallback(root, blocked, reason, { log, fetchKey: () => 'real-zai-key', now: () => t }),
+    });
+    await rm.onLimitEvent('boss', EV);
+    const prior = loadGlmFallbackState(ctxRoot).active.boss;
+    expect(prior).toBeDefined();
+
+    preflight.mockResolvedValue('ok');
+    let activeDuringRestart: boolean | undefined;
+    restartAgent.mockImplementation(async () => {
+      activeDuringRestart = isGlmFallbackActive(ctxRoot, 'boss');
+      return false;
+    });
+    t += 36 * 60_000;
+    await rm.tick();
+    // Cleared before the restart so a Tier 1 PTY would not re-apply GLM,
+    // then put back because this call did not leave one running.
+    expect(activeDuringRestart).toBe(false);
+    expect(loadGlmFallbackState(ctxRoot).active.boss).toEqual(prior);
+    expect(isLimitBlocked(ctxRoot, 'boss')).toBe(true);
+  });
+
+  it('active-account recovery restores the GLM marker and keeps limitBlocked when restart throws', async () => {
+    mkdirSync(join(ctxRoot, 'state', 'glm-fallback'), { recursive: true });
+    writeFileSync(join(ctxRoot, 'state', 'glm-fallback', 'config.json'), JSON.stringify({ enabled: true, excludedAgents: [] }));
+    const rm = new RotationManager({
+      ctxRoot, frameworkRoot, org: 'wyre', now: () => t,
+      preflight, restartAgent, sendAlert, log: () => {},
+      tryGlmFallback: (root, blocked, reason, log) =>
+        attemptGlmFallback(root, blocked, reason, { log, fetchKey: () => 'real-zai-key', now: () => t }),
+    });
+    await rm.onLimitEvent('boss', EV);
+    const prior = loadGlmFallbackState(ctxRoot).active.boss;
+
+    // Bench stays dry; the active account is the one that recovers.
+    preflight.mockImplementation(async (tok: string) => (tok === 'tok-a' ? 'ok' : 'limit'));
+    restartAgent.mockRejectedValue(new Error('stop failed'));
+    t += 36 * 60_000;
+    await rm.tick();
+    expect(loadGlmFallbackState(ctxRoot).active.boss).toEqual(prior);
+    expect(isLimitBlocked(ctxRoot, 'boss')).toBe(true);
   });
 });
