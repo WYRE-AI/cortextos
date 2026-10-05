@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { existsSync, readFileSync } from 'fs';
+import { delimiter } from 'path';
 
 // node-pty is native; stub it so constructing AgentPTY never touches it.
 vi.mock('node-pty', () => ({ spawn: vi.fn() }));
@@ -92,9 +93,10 @@ describe('applyEnvAssignment (PATH prepend, not overwrite)', () => {
   // whole thing (which would break every other binary lookup for that
   // agent — node, git, homebrew, etc. all live on the base PATH).
   it('prepends PATH onto an existing value instead of replacing it', () => {
-    const ptyEnv: Record<string, string> = { PATH: '/usr/bin:/bin' };
+    const basePath = ['/usr/bin', '/bin'].join(delimiter);
+    const ptyEnv: Record<string, string> = { PATH: basePath };
     applyEnvAssignment(ptyEnv, 'PATH', '/opt/gh-shim');
-    expect(ptyEnv.PATH).toBe('/opt/gh-shim:/usr/bin:/bin');
+    expect(ptyEnv.PATH).toBe(`/opt/gh-shim${delimiter}${basePath}`);
   });
 
   it('sets PATH directly when no base PATH exists yet', () => {
@@ -131,7 +133,7 @@ describe('buildPtyEnv (.env-driven PATH prepend, end to end)', () => {
     const env = ptyEnvFor({}, {
       '/tmp/fw/orgs/acme/agents/alice/.env': 'PATH=/opt/gh-shim\nBOT_TOKEN=xyz\n',
     });
-    expect(env.PATH).toBe(`/opt/gh-shim:${basePath}`);
+    expect(env.PATH).toBe(`/opt/gh-shim${delimiter}${basePath}`);
     expect(env.BOT_TOKEN).toBe('xyz');
   });
 
@@ -141,6 +143,6 @@ describe('buildPtyEnv (.env-driven PATH prepend, end to end)', () => {
       '/tmp/fw/orgs/acme/secrets.env': 'PATH=/opt/org-wide-shim\n',
       '/tmp/fw/orgs/acme/agents/alice/.env': 'PATH=/opt/gh-shim\n',
     });
-    expect(env.PATH).toBe(`/opt/gh-shim:/opt/org-wide-shim:${basePath}`);
+    expect(env.PATH).toBe(`/opt/gh-shim${delimiter}/opt/org-wide-shim${delimiter}${basePath}`);
   });
 });
