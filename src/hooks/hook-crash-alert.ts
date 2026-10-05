@@ -75,6 +75,7 @@ const QUIET_SUPPRESSED_TYPES = new Set([
   'user-disable',
   'user-stop',
   'rate-limited',
+  'rotation-recovered',
 ]);
 
 function isQuietHoursLA(now: Date): boolean {
@@ -303,6 +304,14 @@ async function main(): Promise<void> {
   // system before the Claude Code session exits). Markers are NOT consumed
   // here — see classifyFromMarkers for why (restart fires this hook twice).
   const markers = [
+    // Written by rotation-manager.ts before it restarts a previously
+    // limit-blocked agent onto a newly-available account (or the active
+    // account recovering in place) — a routine, expected daemon action, not
+    // a crash. See task_1789351994840_86202746.
+    // Must precede .restart-planned: restartAgent() also writes that marker,
+    // and classifyFromMarkers returns the first fresh match. A later slot
+    // would make this classification unreachable on the rotation path.
+    { file: '.rotation-recovered', type: 'rotation-recovered' },
     { file: '.restart-planned', type: 'planned-restart' },
     { file: '.session-refresh', type: 'session-refresh' },
     { file: '.user-restart', type: 'user-restart' },
@@ -452,6 +461,9 @@ async function main(): Promise<void> {
       break;
     case 'rate-limited':
       message = `⏳ ${agentName} paused — Anthropic rate limit hit. Will resume when the window resets.`;
+      break;
+    case 'rotation-recovered':
+      message = `🔄 ${agentName} restarted — OAuth rotation recovery: ${reason || 'no reason given'}`;
       break;
     case 'crash':
       message = `🚨 CRASH: ${agentName} died unexpectedly.`;
