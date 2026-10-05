@@ -1177,9 +1177,20 @@ busCommand
   .argument('<metric>', 'Metric to measure')
   .argument('<hypothesis>', 'Hypothesis to test')
   .option('--surface <path>', 'Surface file path')
-  .option('--direction <dir>', 'Direction: higher or lower', 'higher')
-  .option('--window <dur>', 'Measurement window', '24h')
-  .option('--kind <kind>', 'intervention or snapshot', 'intervention')
+  // No commander-level defaults on --direction/--window/--kind (task_1788740438657_41016651):
+  // a declared default here means commander ALWAYS populates opts.* even when the
+  // flag is omitted, so createExperiment's own options?.x ?? cycleDefaults.x ?? '<default>'
+  // fallback chain could never reach cycleDefaults for these three fields — a cycle
+  // registered with direction=lower/window=14d in experiments/config.json was silently
+  // overridden back to higher/24h on every call that didn't pass the flag explicitly.
+  // --surface/--measurement already have no CLI-level default and already fall back
+  // to cycleDefaults correctly; this makes --direction/--window/--kind consistent with
+  // them. createExperiment still supplies the same static defaults ('higher'/'24h'/
+  // 'intervention') when no cycle matches, so behavior for anyone not using cycles is
+  // unchanged.
+  .option('--direction <dir>', 'Direction: higher or lower (falls back to the matching cycle config, then "higher")')
+  .option('--window <dur>', 'Measurement window (falls back to the matching cycle config, then "24h")')
+  .option('--kind <kind>', 'intervention or snapshot (defaults to "intervention")')
   .option('--baseline <n>', 'Baseline value to compare the measured result against (required before evaluate-experiment will accept this experiment)')
   .option('--placeholder-baseline', 'Mark --baseline as a forced placeholder (no real prior measurement existed) rather than a genuine baseline — the completed record gets flagged needs_manual_review instead of shipping a mechanical decision silently')
   .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string; baseline?: string; placeholderBaseline?: boolean }) => {

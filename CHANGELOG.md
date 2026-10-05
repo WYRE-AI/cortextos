@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Fixed — `create-experiment`'s `--direction`/`--window`/`--kind` commander defaults made the cycle-config fallback dead code
+
+`createExperiment` (`src/bus/experiment.ts`) falls back to a matching `experiments/config.json`
+cycle's `direction`/`window` when the CLI option is omitted
+(`options?.direction ?? cycleDefaults.direction ?? 'higher'`), the same way `--surface` and
+`--measurement` already correctly do. But `create-experiment`'s commander options declared
+static defaults on `--direction` (`'higher'`), `--window` (`'24h'`), and `--kind`
+(`'intervention'`) — so commander always populated these three regardless of whether the flag
+was passed, and the cycle fallback could never be reached through the real CLI call path. A
+cycle registered with `direction: "lower"`/`window: "14d"` was silently overridden back to
+`higher`/`24h` on every `create-experiment` call that relied on the cycle instead of passing
+the flags explicitly — confirmed live three times in one night on 2026-09-07 (forge's and
+boss's own running experiments both recorded the wrong direction/window with no error at any
+point).
+
+Fixed by removing the commander-level defaults on all three flags, matching how
+`--surface`/`--measurement` are already declared. `createExperiment`'s own static defaults are
+unchanged, so behavior for any experiment with no matching cycle is unchanged. New CLI-level
+integration test (`tests/integration/bus-create-experiment-cycle-defaults-cli.test.ts`) drives
+the actual compiled CLI as a subprocess — a unit test against `createExperiment()` directly
+can't exercise this, since the bug lived specifically in the commander option-parsing layer.
+
 ### Fixed — `restartAgent()` had no pre-stop marker, so every rotation/manual restart paged as a false crash
 
 `agent-manager.ts`'s `stopAll()` writes a `.daemon-stop` marker in each agent's state dir before

@@ -53,6 +53,10 @@ jobs:
       - name: Install dashboard dependencies
         run: npm ci --prefix dashboard
 
+      # CLI integration suites skip when dist/cli.js is absent; build it so they run.
+      - name: Build CLI
+        run: npm run build
+
       - name: Run unit tests
         run: npm test
 
