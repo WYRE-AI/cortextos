@@ -30,6 +30,23 @@ const MONTHS = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov
 const RESET_DATE_RE = /resets([A-Za-z]{3})(\d{1,2})at(\d{1,2})(?::(\d{2}))?([ap])m\(UTC\)/i;
 const RESET_TIME_RE = /resets(?:at)?(\d{1,2})(?::(\d{2}))?([ap])m\(UTC\)/i;
 
+// A date-only hint (month+day, no year) is meant to cover a genuine
+// year-boundary rollover — e.g. matched on Dec 31 with "resets Jan 2" should
+// resolve to next year, only two days out. It is NOT meant to paper over a
+// STALE match: the LimitScanner's window is a rolling, only-cleared-on-fire
+// buffer, so old banner text can still be sitting in it well after the date
+// it named has passed. A match that's still implausibly far out even after
+// the year-boundary wrap (weekly/session/usage resets are never more than a
+// couple of weeks away) is far more likely stale scrollback than a real
+// forward-looking hint — trust the wrap only within a generous cap, and
+// otherwise fall back to "unparseable" so the caller's own safe fallback
+// (RETRY_FALLBACK_MS) applies instead of a bogus ~year-long exclusion.
+// Real incident: wyre-max20 observed 2026-09-20T02:16:33Z parsed a leftover
+// "resets Sep 14 at 3am (UTC)" match (its own genuine boundary six days
+// earlier) into resetAt=2027-09-14T03:00:00Z, silently excluding the
+// account from rotation for the better part of a year.
+const MAX_HINT_HORIZON_MS = 21 * 24 * 3600_000; // 21 days
+
 function toHour24(h: number, meridiem: string): number {
   const base = h % 12;
   return meridiem.toLowerCase() === 'p' ? base + 12 : base;
@@ -45,6 +62,7 @@ export function parseResetHint(normalized: string, now: number): number | null {
     const year = new Date(now).getUTCFullYear();
     let at = Date.UTC(year, month, parseInt(d[2], 10), hour, min);
     if (at < now) at = Date.UTC(year + 1, month, parseInt(d[2], 10), hour, min);
+    if (at - now > MAX_HINT_HORIZON_MS) return null;
     return at;
   }
   const t = RESET_TIME_RE.exec(normalized);

@@ -1,6 +1,6 @@
 // tests/unit/limit-detector.test.ts
 import { describe, it, expect } from 'vitest';
-import { stripAnsi, scanForLimit, LimitScanner } from '../../src/daemon/limit-detector.js';
+import { stripAnsi, scanForLimit, parseResetHint, LimitScanner } from '../../src/daemon/limit-detector.js';
 
 // Real sequences captured from the 2026-07-14/15 incidents. Cursor-positioning
 // escapes sit BETWEEN words — after stripping, words may join with no space.
@@ -105,5 +105,31 @@ describe('LimitScanner', () => {
     const s = new LimitScanner(() => NOW);
     s.push('x'.repeat(5000));
     expect(s.push(SESSION_RAW)).not.toBeNull();      // banner still detectable after big flush
+  });
+});
+
+describe('parseResetHint — date-only hint, stale-match guard (2026-09-21, wyre-max20 real incident)', () => {
+  it('wraps a genuine near-term year-boundary hint (Dec 31 -> Jan 2, 2 days out)', () => {
+    const dec31 = Date.UTC(2026, 11, 31);
+    const at = parseResetHint('resetsJan2at6am(UTC)', dec31);
+    expect(at).toBe(Date.UTC(2027, 0, 2, 6));
+  });
+
+  it('rejects a stale date-only match that would wrap to ~1 year out (real wyre-max20 shape)', () => {
+    // "resets Sep 14 at 3am (UTC)" was wyre-max20's genuine weekly boundary
+    // days earlier; matched again on 2026-09-20T02:16:33Z (6 days later,
+    // leftover in the rolling window) the old code silently manufactured
+    // resetAt=2027-09-14T03:00:00Z — see rotation-manager.ts's exhausted-map
+    // write and its year-long candidate-pool exclusion.
+    const sixDaysLater = Date.UTC(2026, 8, 20, 2, 16, 33, 430);
+    const at = parseResetHint('resetsSep14at3am(UTC)', sixDaysLater);
+    expect(at).toBeNull();
+  });
+
+  it('still accepts a date-only hint within the year but close enough to be plausible', () => {
+    // Same-month, a few days ahead — well within any real weekly/session/usage horizon.
+    const now = Date.UTC(2026, 8, 20);
+    const at = parseResetHint('resetsSep27at3am(UTC)', now);
+    expect(at).toBe(Date.UTC(2026, 8, 27, 3));
   });
 });
