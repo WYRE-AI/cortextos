@@ -433,6 +433,62 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(() => evaluateExperiment(testDir, id, 10)).toThrow("expected 'running'");
     });
 
+    // task_1788966052299_44596234 (dev, 2026-09-09): a throwaway probe call
+    // to check whether evaluate-experiment had a preview mode committed a
+    // real result and locked the experiment (only 'running' is accepted),
+    // forcing 3 files to be hand-edited to undo it.
+    describe('--dry-run', () => {
+      it('computes and returns the would-be result without writing anything', () => {
+        const id = createExperiment(testDir, 'testbot', 'engagement', 'More emojis', {
+          direction: 'higher',
+          baseline: 0,
+        });
+        runExperiment(testDir, id);
+        const preview = evaluateExperiment(testDir, id, 42, { learning: 'Emojis work', dryRun: true });
+
+        // the returned preview reflects the would-be completion
+        expect(preview.status).toBe('completed');
+        expect(preview.decision).toBe('keep');
+        expect(preview.result_value).toBe(42);
+        expect(preview.next_baseline_value).toBe(42);
+
+        // but nothing on disk moved: the stored record is still 'running'
+        const stored = JSON.parse(
+          readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8'),
+        );
+        expect(stored.status).toBe('running');
+        expect(stored.decision).toBeNull();
+
+        // active.json still exists (a real evaluation removes it)
+        expect(existsSync(join(testDir, 'experiments', 'active.json'))).toBe(true);
+
+        // no results.tsv / learnings.md created
+        expect(existsSync(join(testDir, 'experiments', 'results.tsv'))).toBe(false);
+        expect(existsSync(join(testDir, 'experiments', 'learnings.md'))).toBe(false);
+      });
+
+      it('still throws on genuine validation errors (no baseline) — dry-run previews shape, not just skips writes', () => {
+        const id = createExperiment(testDir, 'testbot', 'engagement', 'No baseline set');
+        runExperiment(testDir, id);
+        expect(() => evaluateExperiment(testDir, id, 42, { dryRun: true })).toThrow('no baseline_value');
+      });
+
+      it('leaves the experiment re-evaluable for real afterward', () => {
+        const id = createExperiment(testDir, 'testbot', 'engagement', 'More emojis', {
+          direction: 'higher',
+          baseline: 0,
+        });
+        runExperiment(testDir, id);
+        evaluateExperiment(testDir, id, 42, { dryRun: true });
+
+        // a real evaluation right after the dry-run still succeeds normally
+        const result = evaluateExperiment(testDir, id, 99);
+        expect(result.status).toBe('completed');
+        expect(result.result_value).toBe(99);
+        expect(existsSync(join(testDir, 'experiments', 'results.tsv'))).toBe(true);
+      });
+    });
+
     describe('baseline_is_placeholder / needs_manual_review (murph, exp_1787745238_vzgah shape)', () => {
       it('defaults to false when not marked as a placeholder', () => {
         const id = createExperiment(testDir, 'testbot', 'kb_freshness', 'test', { baseline: 5 });

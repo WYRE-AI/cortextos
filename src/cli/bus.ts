@@ -1252,7 +1252,8 @@ busCommand
   .option('--score <n>', 'Score 1-10')
   .option('--justification <text>', 'Justification text')
   .option('--decision <keep|discard>', 'Override the mechanically-computed decision (requires --justification)')
-  .action((id: string, value: string, opts: { score?: string; justification?: string; decision?: string }) => {
+  .option('--dry-run', 'Validate args and print the would-be result WITHOUT writing anything — the experiment stays running and re-evaluable for real afterward. Use this to check argument shape before a real evaluation; a real (non-dry-run) call commits immediately and cannot be undone.')
+  .action((id: string, value: string, opts: { score?: string; justification?: string; decision?: string; dryRun?: boolean }) => {
     if (opts.decision !== undefined && opts.decision !== 'keep' && opts.decision !== 'discard') {
       console.error(`--decision must be 'keep' or 'discard', got '${opts.decision}'`);
       process.exit(1);
@@ -1264,7 +1265,11 @@ busCommand
         score: opts.score ? parseFloat(opts.score) : undefined,
         justification: opts.justification,
         decision: opts.decision as 'keep' | 'discard' | undefined,
+        dryRun: opts.dryRun,
       });
+      if (opts.dryRun) {
+        console.log('DRY RUN — nothing written, experiment is still running:');
+      }
       console.log(JSON.stringify(experiment, null, 2));
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
