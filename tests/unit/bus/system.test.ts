@@ -529,6 +529,69 @@ describe('Bus System', () => {
       expect(report.entries).toHaveLength(0);
     });
 
+    // task_1791304069371_33839624 (analyst, 2026-10-06): the fleet's own
+    // check-stale-blockers re-verify convention converged on a second,
+    // independent dismissal idiom — "resolved-ref (analyst): PR #NNN =
+    // <repo>" — to record that a bare PR mention's repo has been determined.
+    // 10 real tasks were re-flagged daily for weeks despite already carrying
+    // this exact annotation, because the checker only recognized "tool
+    // artifact".
+    it('does not re-flag a PR reference already resolved via a "resolved-ref (analyst): ..." annotation', () => {
+      writeTask('myorg', {
+        id: 'task_resolved_ref',
+        title: 'm365 un-hide gated on confirmed live staging tool call',
+        status: 'blocked',
+        description:
+          "Un-hide only after a live tool call is confirmed on staging (the PR #501 gate). " +
+          '--- APPENDED later ---\n' +
+          'check-stale-blockers resolved-ref (analyst): PR #833 MERGED 2026-07-09, title states ' +
+          '"supersedes #501"; PR #501 confirmed CLOSED (superseded, not merged). Repo confirmed ' +
+          'for future cycles.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    // Mirrors the negated "tool artifact" test above (task_1788276323687) —
+    // the same negation-awareness mechanism must hold for the new cue too,
+    // since both share hasGenuineDismissalMarker/NEGATION_CUE_REGEX.
+    it('still flags a PR reference when "resolved-ref" appears negated ("not a resolved-ref")', () => {
+      writeTask('myorg', {
+        id: 'task_negated_resolved_ref',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'Checked carefully -- this is not a resolved-ref, PR #67 is a genuine still-open blocker.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    // Deliberately NOT suppressed: "re-verify" re-confirms a PR's
+    // time-varying MERGE STATE, which can genuinely change between cycles —
+    // unlike "resolved-ref" (which settles a fact, the repo, that cannot
+    // change), suppressing on "re-verify" would hide a real status change.
+    it('still flags a PR reference re-confirmed via a plain "re-verify" note, without "resolved-ref"', () => {
+      writeTask('myorg', {
+        id: 'task_reverify_only',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'Still blocked on PR #67. ' +
+          '--- APPENDED later ---\n' +
+          're-verify: PR #67 confirmed still OPEN, unmerged, no change.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
     // task_1786902033624 (grower/analyst, 2026-08-20 then again 2026-08-22):
     // a check-stale-blockers sweep flagged the SAME task twice, two days
     // apart, both times a false positive — conduit PR #1424 is a real,
