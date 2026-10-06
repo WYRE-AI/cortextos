@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { execFile } from "child_process";
@@ -388,6 +388,133 @@ describe.skipIf(!existsSync(DIST_CLI))(
       expect(code).toBe(0);
       expect(stderr).toBe("");
       expect(stdout).toMatch(/^task_\d+_\d+\s*$/);
+    });
+
+    // --assignee roster validation (cortextos#151, task_1786739337901_81484880):
+    // neither create-task nor update-task validated --assignee against a real
+    // agent, so a typo silently routed a task into the void. The tests above
+    // (and every other test in this file) run with CTX_FRAMEWORK_ROOT unset, so
+    // listAgents() finds an empty roster and validateAssigneeArg fails OPEN —
+    // they cover the fail-open path only. These populate a real roster under a
+    // throwaway CTX_FRAMEWORK_ROOT to exercise the actual rejection path, which
+    // is the one no prior test in this file touches.
+    describe("--assignee roster validation (populated roster)", () => {
+      let fakeFrameworkRoot: string;
+      const REAL_AGENT = "realagent";
+
+      beforeEach(() => {
+        fakeFrameworkRoot = mkdtempSync(join(tmpdir(), "bus-task-roster-"));
+        mkdirSync(
+          join(fakeFrameworkRoot, "orgs", ORG, "agents", REAL_AGENT),
+          { recursive: true },
+        );
+      });
+
+      afterEach(() => {
+        try {
+          rmSync(fakeFrameworkRoot, { recursive: true });
+        } catch {
+          /* ignore */
+        }
+      });
+
+      function runCliWithRoster(
+        args: string[],
+      ): Promise<{ stdout: string; stderr: string; code: number }> {
+        return runCliWithEnv(args, {
+          CTX_AGENT_NAME: "dev",
+          CTX_ORG: ORG,
+          CTX_FRAMEWORK_ROOT: fakeFrameworkRoot,
+        });
+      }
+
+      it("create-task --assignee <nonexistent> exits 1 with Invalid assignee, and writes no task file", async () => {
+        const { stderr, code } = await runCliWithRoster([
+          "bus",
+          "create-task",
+          "typo'd dispatch",
+          "--assignee",
+          "nonexistent-agent",
+        ]);
+
+        expect(code).toBe(1);
+        expect(stderr).toContain("Invalid assignee 'nonexistent-agent'");
+        expect(stderr).toContain(`enabled-agents roster for org '${ORG}'`);
+        const tasksDir = join(
+          fakeHome,
+          ".cortextos",
+          "default",
+          "orgs",
+          ORG,
+          "tasks",
+        );
+        const written = readdirSync(tasksDir).filter((f) => f.endsWith(".json"));
+        expect(written).toHaveLength(0);
+      });
+
+      it("create-task --assignee <real-fixture-agent> succeeds", async () => {
+        const { stdout, code } = await runCliWithRoster([
+          "bus",
+          "create-task",
+          "real dispatch",
+          "--assignee",
+          REAL_AGENT,
+        ]);
+
+        expect(code).toBe(0);
+        expect(stdout).toMatch(/^task_\d+_\d+\s*$/);
+      });
+
+      it("update-task <id> --assignee <nonexistent> exits 1, leaving assigned_to on disk unchanged", async () => {
+        writeTask("task_roster_001", { assigned_to: REAL_AGENT });
+        const { stderr, code } = await runCliWithRoster([
+          "bus",
+          "update-task",
+          "task_roster_001",
+          "--assignee",
+          "nonexistent-agent",
+        ]);
+
+        expect(code).toBe(1);
+        expect(stderr).toContain("Invalid assignee 'nonexistent-agent'");
+        const onDisk = JSON.parse(
+          readFileSync(
+            join(
+              fakeHome,
+              ".cortextos",
+              "default",
+              "orgs",
+              ORG,
+              "tasks",
+              "task_roster_001.json",
+            ),
+            "utf-8",
+          ),
+        );
+        expect(onDisk.assigned_to).toBe(REAL_AGENT);
+      });
+
+      it("--assignee human and --assignee user still bypass the check even with a populated roster", async () => {
+        const human = await runCliWithRoster([
+          "bus",
+          "create-task",
+          "for a human",
+          "--assignee",
+          "human",
+        ]);
+        expect(human.code).toBe(0);
+        expect(human.stdout).toMatch(/^task_\d+_\d+\s*$/);
+
+        const user = await runCliWithRoster([
+          "bus",
+          "create-task",
+          "for a user",
+          "--assignee",
+          "user",
+        ]);
+        expect(user.code).toBe(0);
+        expect(user.stdout).toMatch(/^task_\d+_\d+\s*$/);
+      });
     });
   },
 );
