@@ -6,7 +6,7 @@ import { homedir } from 'os';
 import { resolveAgentDir, parseQualifiedName, discoverAllAgents } from '../utils/agent-dir.js';
 import { sendMessage, checkInboxWithStatus, ackInbox } from '../bus/message.js';
 import { sendToCapability } from '../bus/agents.js';
-import { validateAgentName, validateTaskId, validatePriority, validateCapability, validateKBScope, validateKBQueryScope } from '../utils/validate.js';
+import { validateAgentName, validateTaskId, validatePriority, validateCapability, validateKBScope, validateKBQueryScope, validateOrgName } from '../utils/validate.js';
 import { randomDigits } from '../utils/random.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, checkBatchStaleness, archiveTasks, checkHumanTasks } from '../bus/task.js';
@@ -15,7 +15,7 @@ import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, COMMIT_LOG_LIMIT, postActivity, broadcastActivityViaBus } from '../bus/system.js';
-import { createExperiment, runExperiment, evaluateExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline, linkExperimentApproval } from '../bus/experiment.js';
+import { createExperiment, runExperiment, evaluateExperiment, correctExperimentDecision, closeExperiment, listExperiments, listAllExperiments, gatherContext, manageCycle, loadExperimentConfig, validateExperimentBaseline, linkExperimentApproval } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
@@ -23,7 +23,7 @@ import { createReminder, listReminders, ackReminder, pruneReminders } from '../b
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron, computeReferenceMs } from '../daemon/cron-scheduler.js';
-import { queryKnowledgeBase, ingestKnowledgeBase, deleteFromKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
+import { queryKnowledgeBase, ingestKnowledgeBase, deleteFromKnowledgeBase, ensureKBDirs, listKnowledgeBaseCollections } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, setActiveAccount, writeTokenToAgents, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { loadRotationState } from '../daemon/rotation-manager.js';
 import { mintInstallationToken, shouldRefuseInteractivePrint, redactForJson } from '../bus/github-app.js';
@@ -1187,7 +1187,7 @@ busCommand
 
 busCommand
   .command('post-activity')
-  .description('Post a message to the org activity channel (Telegram if configured, bus broadcast otherwise)')
+  .description('Post a message to the org activity channel (Slack if configured, bus broadcast otherwise)')
   .argument('<message>', 'Message to post')
   .action(async (message: string) => {
     const env = resolveEnv();
@@ -1197,9 +1197,9 @@ busCommand
       console.log('Activity posted');
       return;
     }
-    // No Telegram activity channel (activity-channel.env absent or incomplete):
+    // No Slack activity channel (activity-channel.env absent or incomplete):
     // fall back to a bus-native broadcast so fleet-wide activity never depends
-    // on a Telegram chat id — bus-only agents must be able to broadcast too.
+    // on a Slack channel id — bus-only agents must be able to broadcast too.
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
     const result = broadcastActivityViaBus(projectRoot, env.ctxRoot, env.instanceId, env.org, env.agentName, message);
     try {
@@ -1209,9 +1209,9 @@ busCommand
     } catch { /* non-fatal */ }
     if (result.delivered.length > 0) {
       const skippedNote = result.skipped.length > 0 ? ` (${result.skipped.length} skipped)` : '';
-      console.log(`No Telegram activity channel configured — broadcast over the bus to ${result.delivered.length} agent(s)${skippedNote}`);
+      console.log(`No Slack activity channel configured — broadcast over the bus to ${result.delivered.length} agent(s)${skippedNote}`);
     } else {
-      console.error('Failed to post activity: no Telegram activity channel and no reachable bus recipients. For the Telegram channel, create orgs/<org>/activity-channel.env with ACTIVITY_BOT_TOKEN and ACTIVITY_CHAT_ID.');
+      console.error('Failed to post activity: no Slack activity channel and no reachable bus recipients. For the Slack channel, create orgs/<org>/activity-channel.env with ACTIVITY_SLACK_CHANNEL_ID and orgs/<org>/secrets.env with SLACK_BOT_TOKEN.');
       process.exit(1);
     }
   });
@@ -1222,9 +1222,20 @@ busCommand
   .argument('<metric>', 'Metric to measure')
   .argument('<hypothesis>', 'Hypothesis to test')
   .option('--surface <path>', 'Surface file path')
-  .option('--direction <dir>', 'Direction: higher or lower', 'higher')
-  .option('--window <dur>', 'Measurement window', '24h')
-  .option('--kind <kind>', 'intervention or snapshot', 'intervention')
+  // No commander-level defaults on --direction/--window/--kind (task_1788740438657_41016651):
+  // a declared default here means commander ALWAYS populates opts.* even when the
+  // flag is omitted, so createExperiment's own options?.x ?? cycleDefaults.x ?? '<default>'
+  // fallback chain could never reach cycleDefaults for these three fields — a cycle
+  // registered with direction=lower/window=14d in experiments/config.json was silently
+  // overridden back to higher/24h on every call that didn't pass the flag explicitly.
+  // --surface/--measurement already have no CLI-level default and already fall back
+  // to cycleDefaults correctly; this makes --direction/--window/--kind consistent with
+  // them. createExperiment still supplies the same static defaults ('higher'/'24h'/
+  // 'intervention') when no cycle matches, so behavior for anyone not using cycles is
+  // unchanged.
+  .option('--direction <dir>', 'Direction: higher or lower (falls back to the matching cycle config, then "higher")')
+  .option('--window <dur>', 'Measurement window (falls back to the matching cycle config, then "24h")')
+  .option('--kind <kind>', 'intervention or snapshot (defaults to "intervention")')
   .option('--baseline <n>', 'Baseline value to compare the measured result against (required before evaluate-experiment will accept this experiment)')
   .option('--placeholder-baseline', 'Mark --baseline as a forced placeholder (no real prior measurement existed) rather than a genuine baseline — the completed record gets flagged needs_manual_review instead of shipping a mechanical decision silently')
   .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; kind?: string; baseline?: string; placeholderBaseline?: boolean }) => {
@@ -1285,14 +1296,68 @@ busCommand
   .argument('<value>', 'Measured value')
   .option('--score <n>', 'Score 1-10')
   .option('--justification <text>', 'Justification text')
-  .action((id: string, value: string, opts: { score?: string; justification?: string }) => {
+  .option('--decision <keep|discard>', 'Override the mechanically-computed decision (requires --justification)')
+  .action((id: string, value: string, opts: { score?: string; justification?: string; decision?: string }) => {
+    if (opts.decision !== undefined && opts.decision !== 'keep' && opts.decision !== 'discard') {
+      console.error(`--decision must be 'keep' or 'discard', got '${opts.decision}'`);
+      process.exit(1);
+    }
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
-    const experiment = evaluateExperiment(agentDir, id, parseFloat(value), {
-      score: opts.score ? parseFloat(opts.score) : undefined,
-      justification: opts.justification,
-    });
-    console.log(JSON.stringify(experiment, null, 2));
+    try {
+      const experiment = evaluateExperiment(agentDir, id, parseFloat(value), {
+        score: opts.score ? parseFloat(opts.score) : undefined,
+        justification: opts.justification,
+        decision: opts.decision as 'keep' | 'discard' | undefined,
+      });
+      console.log(JSON.stringify(experiment, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('correct-experiment-decision')
+  .description('Retroactively fix the decision on an already-completed experiment, with an audit trail')
+  .argument('<id>', 'Experiment ID')
+  .argument('<decision>', 'keep or discard')
+  .argument('<reason>', 'Why this correction is being made')
+  .action((id: string, decision: string, reason: string) => {
+    if (decision !== 'keep' && decision !== 'discard') {
+      console.error(`decision must be 'keep' or 'discard', got '${decision}'`);
+      process.exit(1);
+    }
+    const env = resolveEnv();
+    const agentDir = env.agentDir || process.cwd();
+    try {
+      const experiment = correctExperimentDecision(agentDir, id, decision, reason);
+      console.log(JSON.stringify(experiment, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('close-experiment')
+  .description("Close a 'proposed' or 'running' experiment that will never produce a measured result (declined approval, decision made without running, structurally unevaluatable) — a terminal state distinct from evaluate-experiment's keep/discard, which always requires a real measurement")
+  .argument('<id>', 'Experiment ID')
+  .argument('<reason>', 'Why this experiment is being closed without a result — name the concrete cause (approval id, superseding experiment id, surface doc)')
+  .action((id: string, reason: string) => {
+    if (!reason.trim()) {
+      console.error('close-experiment refused: --reason cannot be empty — this is the only durable record of why the experiment never completed.');
+      process.exit(1);
+    }
+    const env = resolveEnv();
+    const agentDir = env.agentDir || process.cwd();
+    try {
+      const experiment = closeExperiment(agentDir, id, reason);
+      console.log(JSON.stringify(experiment, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
   });
 
 /**
@@ -1697,6 +1762,7 @@ busCommand
       process.exit(1);
     }
     const env = resolveEnv();
+    validateOrgName(env.org);
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
     // await — createApproval fan-out posts to the activity channel, which
     // must complete before the CLI process exits or the post silently
@@ -1721,8 +1787,9 @@ busCommand
       process.exit(1);
     }
     const env = resolveEnv();
+    validateOrgName(env.org);
     const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
-    updateApproval(paths, id, status as ApprovalStatus, note);
+    updateApproval(paths, id, status as ApprovalStatus, env.agentName, note);
     console.log(`Approval ${id} -> ${status}`);
   });
 
@@ -1898,63 +1965,11 @@ busCommand
       process.exit(1);
     }
 
-    const { execFileSync } = require('child_process');
-    const { existsSync, readFileSync } = require('fs');
-    const { join: pjoin } = require('path');
-    const { homedir: hdir } = require('os');
-
-    const frameworkRoot = env.frameworkRoot || process.cwd();
-    const instanceId = env.instanceId;
-    const kbRoot = pjoin(hdir(), '.cortextos', instanceId, 'orgs', org, 'knowledge-base');
-    const chromaDir = pjoin(kbRoot, 'chromadb');
-    const isWin = process.platform === 'win32';
-    const venvBin = isWin ? 'Scripts' : 'bin';
-    const pythonExe = isWin ? 'python.exe' : 'python3';
-    const pythonPath = pjoin(frameworkRoot, 'knowledge-base', 'venv', venvBin, pythonExe);
-    const mmragPath = pjoin(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
-
-    // Load .env and secrets.env (same as bash `source`)
-    const envFiles = [
-      pjoin(frameworkRoot, '.env'),
-      pjoin(frameworkRoot, 'orgs', org, 'secrets.env'),
-    ];
-    const extraVars: Record<string, string> = {};
-    for (const ef of envFiles) {
-      if (existsSync(ef)) {
-        for (const line of readFileSync(ef, 'utf-8').split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const idx = trimmed.indexOf('=');
-          if (idx > 0) {
-            let val = trimmed.slice(idx + 1);
-            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-              val = val.slice(1, -1);
-            }
-            extraVars[trimmed.slice(0, idx)] = val;
-          }
-        }
-      }
-    }
-
-    if (!existsSync(chromaDir)) {
-      console.log('No collections found. Run kb-ingest first.');
-      process.exit(0);
-    }
-
-    const envVars: Record<string, string | undefined> = {
-      ...process.env,
-      ...extraVars,
-      CTX_ORG: org,
-      CTX_INSTANCE_ID: instanceId,
-      CTX_FRAMEWORK_ROOT: frameworkRoot,
-      MMRAG_DIR: kbRoot,
-      MMRAG_CHROMADB_DIR: chromaDir,
-      MMRAG_CONFIG: pjoin(kbRoot, 'config.json'),
-    };
     try {
-      execFileSync(pythonPath, [mmragPath, 'collections'], {
-        stdio: 'inherit',
-        env: envVars,
+      listKnowledgeBaseCollections({
+        org,
+        frameworkRoot: env.frameworkRoot || process.cwd(),
+        instanceId: env.instanceId,
       });
     } catch {
       // python printed error already
@@ -2434,6 +2449,7 @@ busCommand
         approvals = approvals.concat(listApprovals(orgPaths, effectiveStatus));
       }
     } else {
+      validateOrgName(env.org);
       const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
       approvals = listApprovals(paths, effectiveStatus);
     }
@@ -2441,10 +2457,10 @@ busCommand
     if (opts.format === 'text') {
       const label = effectiveStatus ? `${effectiveStatus} ` : '';
       if (approvals.length === 0) { console.log(`No ${label}approvals`); return; }
-      for (const a of approvals as Array<{ id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string }>) {
+      for (const a of approvals as Array<{ id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; resolved_at?: string | null; resolved_by?: string | null; resolution_note?: string | null; description?: string; org?: string }>) {
         console.log(`[${a.id}] ${a.title}`);
         console.log(`  Status: ${a.status} | Category: ${a.category} | Agent: ${a.requesting_agent} | Org: ${a.org ?? env.org} | Created: ${a.created_at}`);
-        if (a.resolved_at) console.log(`  Resolved: ${a.resolved_at}${a.resolved_by ? ` — ${a.resolved_by}` : ''}`);
+        if (a.resolved_at) console.log(`  Resolved: ${a.resolved_at}${a.resolved_by ? ` by ${a.resolved_by}` : ''}${a.resolution_note ? ` — ${a.resolution_note}` : ''}`);
         if (a.description) console.log(`  Context: ${a.description}`);
         console.log('');
       }
@@ -2474,9 +2490,10 @@ busCommand
   .action((approvalId: string, opts: { format?: string; allOrgs?: boolean }) => {
     const { getApproval } = require('../bus/approval.js');
     const env = resolveEnv();
+    if (!opts.allOrgs) validateOrgName(env.org);
 
     const orgs = opts.allOrgs ? listOrgDirs(env.instanceId, env.ctxRoot) : [env.org];
-    let found: { id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; updated_at?: string; resolved_at?: string | null; resolved_by?: string | null; description?: string; org?: string } | null = null;
+    let found: { id: string; title: string; category: string; status: string; requesting_agent: string; created_at: string; updated_at?: string; resolved_at?: string | null; resolved_by?: string | null; resolution_note?: string | null; description?: string; org?: string } | null = null;
     for (const org of orgs) {
       found = getApproval(resolvePaths(env.agentName, env.instanceId, org, env.ctxRoot), approvalId);
       if (found) break;
@@ -2498,8 +2515,8 @@ busCommand
       console.log(`  Status: ${found.status}`);
       console.log(`  Category: ${found.category} | Agent: ${found.requesting_agent} | Org: ${found.org ?? env.org}`);
       console.log(`  Created: ${found.created_at}`);
-      if (found.resolved_at) console.log(`  Resolved: ${found.resolved_at}`);
-      if (found.resolved_by) console.log(`  Decision note: ${found.resolved_by}`);
+      if (found.resolved_at) console.log(`  Resolved: ${found.resolved_at}${found.resolved_by ? ` by ${found.resolved_by}` : ''}`);
+      if (found.resolution_note) console.log(`  Decision note: ${found.resolution_note}`);
       if (found.description) console.log(`  Context: ${found.description}`);
     } else {
       console.log(JSON.stringify(found, null, 2));
@@ -2685,11 +2702,15 @@ busCommand
   .argument('<agent>', 'Agent name')
   .argument('<name>', 'Cron name (unique per agent, slug format recommended)')
   .argument('<interval>', 'Schedule: interval ("6h", "30m", "1d") or 5-field cron expr ("0 8 * * *")')
-  .argument('<prompt...>', 'Prompt text injected when the cron fires (all remaining words joined)')
+  .argument('<prompt...>', 'Prompt text injected when the cron fires. For an --action cron this is never injected -- it is still required, and serves as the cron\'s human-readable description in list-crons/dashboard output.')
   .option('--desc <description>', 'Human-readable description (optional)')
   .option('--timezone <tz>', 'IANA timezone for a cron-expression schedule (default: UTC). No effect on interval schedules.')
   .option('--goal <condition>', 'Verifiable completion condition registered via /goal, injected as its own standalone submission immediately before this cron fires (optional)')
-  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string; timezone?: string; goal?: string }) => {
+  .option('--action-repo <owner/repo>', 'Non-agent action cron: dispatch a GitHub Actions workflow directly from the daemon (no agent turn) instead of injecting the prompt. Requires --action-workflow.')
+  .option('--action-workflow <file-or-id>', 'Workflow file name (e.g. "signup-smoke.yml") or numeric ID to dispatch. Requires --action-repo.')
+  .option('--action-ref <ref>', 'Git ref to dispatch the workflow against (default: "main")')
+  .option('--action-input <json>', 'JSON object of workflow_dispatch input parameters (optional, only if the workflow declares inputs)')
+  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string; timezone?: string; goal?: string; actionRepo?: string; actionWorkflow?: string; actionRef?: string; actionInput?: string }) => {
     // Validate agent name format
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
@@ -2711,6 +2732,46 @@ busCommand
       try { timezone = validateTimezone(opts.timezone); } catch (err) { console.error(String(err)); process.exit(1); }
     }
 
+    // --action-repo and --action-workflow are a pair -- either both or neither.
+    if (Boolean(opts.actionRepo) !== Boolean(opts.actionWorkflow)) {
+      console.error('Error: --action-repo and --action-workflow must be given together.');
+      process.exit(1);
+    }
+    if (!opts.actionRepo && (opts.actionRef !== undefined || opts.actionInput !== undefined)) {
+      console.error('Error: --action-ref and --action-input require --action-repo and --action-workflow.');
+      process.exit(1);
+    }
+    let action: CronDefinition['action'];
+    if (opts.actionRepo && opts.actionWorkflow) {
+      if (!/^[^/\s]+\/[^/\s]+$/.test(opts.actionRepo)) {
+        console.error(`Error: --action-repo must be "owner/repo" (got "${opts.actionRepo}").`);
+        process.exit(1);
+      }
+      let inputs: Record<string, string> | undefined;
+      if (opts.actionInput !== undefined) {
+        try {
+          const parsed: unknown = JSON.parse(opts.actionInput);
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            throw new Error('must be a JSON object');
+          }
+          for (const [k, v] of Object.entries(parsed)) {
+            if (typeof v !== 'string') throw new Error(`input "${k}" must be a string`);
+          }
+          inputs = parsed as Record<string, string>;
+        } catch (err) {
+          console.error(`Error: --action-input must be a JSON object: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+      }
+      action = {
+        kind: 'github-workflow-dispatch',
+        repo: opts.actionRepo,
+        workflow: opts.actionWorkflow,
+        ...(opts.actionRef ? { ref: opts.actionRef } : {}),
+        ...(inputs ? { inputs } : {}),
+      };
+    }
+
     const prompt = promptWords.join(' ');
     const cron: CronDefinition = {
       name,
@@ -2721,6 +2782,7 @@ busCommand
       ...(opts.desc ? { description: opts.desc } : {}),
       ...(timezone ? { timezone } : {}),
       ...(opts.goal ? { goal: opts.goal } : {}),
+      ...(action ? { action } : {}),
     };
 
     try {

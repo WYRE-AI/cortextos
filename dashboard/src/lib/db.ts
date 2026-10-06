@@ -40,14 +40,34 @@ function createDatabase(): Database.Database {
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
 
-  // Run schema initialization
-  initializeSchema(db);
+  // Run schema initialization. Same SQLITE_BUSY race as the WAL switch above,
+  // on the same first-ever-access window (multiple Next.js build workers, no
+  // existing DB file yet) — busy_timeout already makes SQLite retry for 10s,
+  // but if every worker is doing the identical CREATE TABLE IF NOT EXISTS
+  // batch at once, that's not always enough headroom. Same guard: if we still
+  // hit SQLITE_BUSY after the timeout, check whether another worker's attempt
+  // already landed the schema (idempotent — IF NOT EXISTS — so "someone else
+  // created it" is as good as "we created it"); only re-throw if it didn't.
+  try {
+    initializeSchema(db);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException & { code?: string }).code !== 'SQLITE_BUSY') throw err;
+    const rows = db.pragma("table_info('tasks')") as unknown[];
+    if (rows.length === 0) throw err;
+    // Another worker already created the schema — we're fine.
+  }
 
   return db;
 }
 
 function initializeSchema(db: Database.Database): void {
-  db.exec(`
+  // Wrapped in a transaction so a SQLITE_BUSY partway through (e.g. after
+  // `tasks` lands but before a later table/index does) rolls back the whole
+  // batch instead of leaving a partially-applied schema. This is what makes
+  // createDatabase()'s recovery check safe: table_info('tasks') existing now
+  // implies the ENTIRE schema committed, not just that one table.
+  const createSchema = db.transaction(() => {
+    db.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -174,6 +194,8 @@ function initializeSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_org ON messages(org);
     CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
   `);
+  });
+  createSchema();
 }
 
 // globalThis singleton survives Next.js hot reload

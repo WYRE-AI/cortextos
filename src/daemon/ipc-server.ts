@@ -695,7 +695,7 @@ export class IPCServer {
             response = { success: false, error: 'Agent name required', code: 'INVALID_INPUT' };
           } else {
             const insp = this.agentManager.inspectAgentOp('restart', request.agent);
-            this.agentManager.restartAgent(request.agent)
+            this.agentManager.restartAgent(request.agent, 'manual restart (dashboard/CLI)')
               .catch(err => console.error(`Failed to restart ${request.agent}:`, err));
             if (insp.ok) {
               response = { success: true, data: `Restarting ${request.agent}` };

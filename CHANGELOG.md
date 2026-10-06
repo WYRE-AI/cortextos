@@ -17,6 +17,342 @@ and only exercises the fail-open branch): a typo'd `--assignee` is rejected on b
 (no task file written) and `update-task` (`assigned_to` on disk unchanged), a real roster name is
 accepted, and `human`/`user` still bypass the check with a populated roster present.
 
+### Added — Tier 2 cross-provider fallback (GLM-5.3 / Z.ai), shipped disabled
+
+New `src/daemon/glm-fallback.ts`, entered only from `rotation-manager.ts`'s existing "every Tier 1
+OAuth account exhausted" branch — not a new standalone watcher. Per-agent, with Aaron-facing agents
+(`pearl`, `marketing`, `scribe`) excluded by default so customer/stakeholder-visible output never
+falls to an unvalidated provider. The Z.ai key is fetched at spawn time via `cortex-secret get
+ZAI_API_KEY --context conduit` and merged straight into the PTY's in-memory env in `agent-pty.ts`'s
+`customizeEnv` hook — never written to any `.env` file. An agent restarted back onto a recovered
+Tier 1 account has its Tier 2 state cleared so it can't keep serving off a stale GLM override.
+
+**Ships with `enabled: false`** (no `state/glm-fallback/config.json` at all is the same as
+`enabled: false` — fails closed on a missing or malformed config, never open). Per the design doc
+(`orgs/wyre/deliverables/infra/task_1789176721585_85041330/glm-5.3-fallback-design.md`), flipping it
+on is gated behind a still-pending validation pass (tool-call fidelity, PTY/banner-parsing
+compatibility, restart/`--continue` semantics) against a throwaway canary — not done in this change.
+
+### Fixed — `migration-collision-check.yml` listed open PRs with a POST
+
+The cross-PR scan called `gh api repos/<repo>/pulls --paginate --slurp -f state=open -f base=<ref> -f per_page=100`. `gh api` defaults to GET, and switches to POST whenever any `-f`/`--raw-field` is present. That call was `POST /repos/{owner}/{repo}/pulls` (create a pull request), which `GITHUB_TOKEN` cannot do, so consumer CI (WYRE-AI/conduit PR #1895) failed with `gh: Resource not accessible by integration (HTTP 403)` and a `subprocess.CalledProcessError`. The 403 is not a permissions gap on GET listing and not a migration collision.
+
+The listing is now a real GET, with the filters in the query string (`repos/<repo>/pulls?state=open&base=<percent-encoded-ref>&per_page=100`). A non-zero `gh` exit or malformed listing JSON prints `::error::` including stderr and fails the check, instead of a bare traceback. Base-branch collisions (found via git, before the API call) are still reported when that listing fails. The base-branch collision check itself is unchanged.
+
+`tests/migration-collision-check.test.sh` matches the GET URL (a return to `-f` fails every case as an unexpected `gh` invocation), and covers the listing-failure annotation, a base-branch collision that must still surface when the listing fails, and a base ref containing `/` encoded as `%2F`.
+
+### Fixed — `create-experiment`'s `--direction`/`--window`/`--kind` commander defaults made the cycle-config fallback dead code
+
+`createExperiment` (`src/bus/experiment.ts`) falls back to a matching `experiments/config.json`
+cycle's `direction`/`window` when the CLI option is omitted
+(`options?.direction ?? cycleDefaults.direction ?? 'higher'`), the same way `--surface` and
+`--measurement` already correctly do. But `create-experiment`'s commander options declared
+static defaults on `--direction` (`'higher'`), `--window` (`'24h'`), and `--kind`
+(`'intervention'`) — so commander always populated these three regardless of whether the flag
+was passed, and the cycle fallback could never be reached through the real CLI call path. A
+cycle registered with `direction: "lower"`/`window: "14d"` was silently overridden back to
+`higher`/`24h` on every `create-experiment` call that relied on the cycle instead of passing
+the flags explicitly — confirmed live three times in one night on 2026-09-07 (forge's and
+boss's own running experiments both recorded the wrong direction/window with no error at any
+point).
+
+Fixed by removing the commander-level defaults on all three flags, matching how
+`--surface`/`--measurement` are already declared. `createExperiment`'s own static defaults are
+unchanged, so behavior for any experiment with no matching cycle is unchanged. New CLI-level
+integration test (`tests/integration/bus-create-experiment-cycle-defaults-cli.test.ts`) drives
+the actual compiled CLI as a subprocess — a unit test against `createExperiment()` directly
+can't exercise this, since the bug lived specifically in the commander option-parsing layer.
+
+### Fixed — `restartAgent()` had no pre-stop marker, so every rotation/manual restart paged as a false crash
+
+`agent-manager.ts`'s `stopAll()` writes a `.daemon-stop` marker in each agent's state dir before
+stopping, specifically so `hook-crash-alert.ts`'s SessionEnd hook classifies the exit correctly
+instead of alarming (BUG-034). `restartAgent()` — the single-agent path used by
+`rotation-manager.ts`, the dashboard/CLI `restart-agent` IPC command, and anything else that
+restarts one agent without going through `stopAll()` — had no equivalent, and had never had one.
+Confirmed 2026-09-30: an OAuth rotation restarting 10 agents in ~60s produced 10 false
+`type=crash reason=none` alerts in about a minute, even though every exit was clean (code 0,
+signal 0).
+
+The marker type this needed already existed: `.restart-planned` / `'planned-restart'` is already
+in `hook-crash-alert.ts`'s `classifyFromMarkers()` markers array, already produces an accurate
+per-agent message (`🔄 <agent> restarted (planned): <reason>`, distinct from the daemon-wide
+`daemon-stop` wording), and is already written by `src/bus/system.ts`'s `selfRestart`/`hardRestart`
+for the cooperative self-restart paths. `restartAgent()` was the one writer missing, not a new
+marker to add. Fixed by writing `.restart-planned` synchronously before `stopAgent()`, mirroring
+`stopAll()`'s ordering and its don't-block-on-write-failure handling. `restartAgent(name, reason?)`
+now takes an optional reason, threaded through from its three call sites: `rotation-manager.ts`
+passes `oauth rotation -> account "<name>" (<reason>)`, the IPC `restart-agent` handler passes
+`manual restart (dashboard/CLI)`.
+
+### Added — non-agent cron action: `github-workflow-dispatch`
+
+Some crons need no model judgment at all: dispatch a GitHub Actions workflow on a schedule
+GitHub's own `schedule:` trigger can't be trusted for. GitHub's scheduler-dispatch is delayed
+2-8h, uniformly, account-wide (task_1790882172065) — invisible on anything with more slack than
+the delay, but it destroys a cadence shorter than the delay itself (a 30-min cron observed
+firing at ~10-15% of nominal).
+
+`CronDefinition` gains an optional `action` field (`src/types/index.ts`). When set, the daemon's
+`onFire` handler (`src/daemon/agent-manager.ts`) runs the action directly — mint a GitHub App
+installation token (reusing the existing `mintInstallationToken()`, already used by the
+`gh-app-token` CLI command), POST the `workflow_dispatch` REST call, poll once for the resulting
+run's conclusion, log the result — and returns without ever injecting a PTY prompt. No agent
+turn at all, per the 2026-08-15 observer-principle lesson: a dispatcher that needs no judgment
+shouldn't ride a model-backed session, since it inherits credit-exhaustion and session-failure
+modes for zero benefit. Fully backward compatible — `action` is undefined for every existing
+cron fleet-wide, and the branch is a no-op when absent.
+
+`bus add-cron` gains `--action-repo`/`--action-workflow`/`--action-ref`/`--action-input` to
+author these from the CLI. Credentials (`GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY`) are read from
+the daemon's own process environment, the same place `SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN` already
+live — not per-agent `.env`, since this is one shared GitHub App installation, not a per-agent
+secret.
+
+New `src/daemon/cron-actions.ts` (the action runner) with its own unit tests
+(`tests/unit/daemon/cron-actions.test.ts`), plus `onFire`-branch tests in
+`tests/unit/daemon/agent-manager.test.ts` proving an action cron never calls `injectAgent` and a
+normal cron is completely unaffected.
+
+### Fixed — headless agents crash-looped on Claude Code's "trust this folder" screen after a CLI upgrade
+
+The `claude` binary on this box moved from `2.1.42` to `2.1.261` between daemon restarts. Somewhere in
+that range the "trust this folder?" first-run dialog's default selection flipped from "Yes, I trust"
+to "No, exit" — mirroring the already-known "Bypass Permissions mode" gotcha, but on the *other*
+first-run screen, which `agent-pty.ts`'s prompt-auto-accept logic still handled with a bare Enter.
+The next daemon restart forced every agent into a fresh spawn at once; nearly every agent's working
+directory had no persisted trust record, so every one of them hit this screen, had a bare Enter select
+"No, exit", and exited instantly (`exit_code=1`) — a fleet-wide crash storm that tripped PM2's 10-
+crashes/day breaker on almost every agent (`warden`, `grower`, `pearl`, `ruby`, `scribe`, `marketing`,
+`maintainer`, `dev`, `forge`, `analyst`, `infra`) within about 20 minutes.
+
+Fixed the trust-screen handler to send Down-arrow + Enter instead of a bare Enter, matching the
+existing Bypass-screen handling. Reproducing this against the live binary (via `node-pty`, same
+mechanism the daemon uses) also surfaced a second, independent timing bug: sending the Down-arrow the
+instant the prompt text is first detected is too early — the widget hasn't finished mounting its key
+listener and silently drops the keystroke, so Enter still lands on the un-moved default 350ms later.
+Fixing only the keystroke (Down+Enter) reproduced the exact production failure 3/3 times; adding a
+~1s settle delay before the Down-arrow and ~1.5s before the confirming Enter reproduced success 5/5
+times. Both first-run screens now share this timing via a small helper. Verified live: restarted
+`cortextos-daemon` with the fix built in and confirmed all 14 agents reached "Bootstrap complete" with
+zero `Exited with code`/`HALTED`/`CRASH_LOOP` log lines in the post-restart window (checked the
+per-agent structured `restarts.log`, not just the daemon's own status).
+
+### Fixed — Slack outbound identity had no gate against agent-name spoofing, and inbound text reached an agent's PTY unredacted
+
+Ported two concepts from grandamenium/cortextos's parallel Slack security
+hardening (commits d647b862d/761e949fd), deferred during the 2026-10-01
+upstream sync for its own review rather than a mechanical merge
+(task_1790871245210_64848240):
+
+**Identity gate.** `cortextos slack send/test-send <channel> <text> --as
+<agent>` loaded `--as <agent>`'s own `slack.json` and posted under whatever
+`display_name`/icon was in that file, with no check that the calling process
+actually was that agent. `slack.json` is routine org config, not a secret —
+any process that can read another agent's directory (every agent, by design)
+could make a Slack message read as having come from a different, possibly
+more-trusted agent. `SlackAPI.postMessage` now derives the outbound
+`username` exclusively from a module-private `RUNTIME_AGENT_NAME`, captured
+once at load from the process's own `CTX_AGENT_NAME` — never from a caller
+argument or a file — and `PostMessageRequest` no longer has a `username`/
+`icon_emoji`/`icon_url` field for a caller to set. `--as` is now a
+self-identity assertion: the CLI refuses (fail-closed, not a logged warning)
+when it doesn't match the calling process's own `CTX_AGENT_NAME`. A human
+operator running the CLI outside any agent's process context (no
+`CTX_AGENT_NAME` set) is unaffected — there is no runtime identity to spoof
+in that case. `loadSlackIdentity`/`SlackIdentity` (the function that WAS the
+vulnerability) are removed; `slack.json`'s display_name/icon fields remain
+in the schema for a possible future gated reintroduction but are read by
+nobody today.
+
+**Inbound redaction.** `dispatchSlackMessage` queued inbound Slack text
+verbatim into an agent's PTY and the persisted stdout.log — an SSN or a
+Slack/Telegram/Anthropic/GitHub/AWS token typed into an allowed inbound
+message would have reached both in the clear. A new `redactInboundText`
+(ported `slack-redact.ts`, backed by a verbatim port of upstream's
+self-contained `ssn-redaction.ts`) now scrubs structurally-unambiguous
+credential shapes plus SSNs before the text is ever formatted or queued —
+deliberately not the loose Bearer/Bot heuristics, which match ordinary prose
+and can invert its meaning.
+
+### Fixed — `migration-collision-check.yml`'s cross-PR scan had no base-branch filter and a hardcoded 300-PR cap
+
+Check 2 (the cross-PR migration-number collision scan) called `gh pr list --repo REPO --state open
+--limit 300 --json number,isDraft` with two real gaps (both CodeRabbit findings on #193's follow-up
+review): (1) no base-branch filter, so a PR targeting an unrelated, long-lived branch that can never
+actually land alongside the PR under test was still scanned as a collision candidate — a false
+positive risk; (2) a hardcoded `--limit 300` silently excluded any PR beyond the cap with no error or
+warning, so a repo with more than 300 simultaneously open PRs would go quietly blind to collisions
+among them.
+
+Replaced `gh pr list` with a direct call to the REST list-PRs endpoint (`gh api repos/<repo>/pulls
+--paginate --slurp -f state=open -f base=<base-ref> -f per_page=100`): `base=` filters server-side
+(closing gap 1), and `--paginate` walks every page with no artificial cap (closing gap 2). `--slurp`
+is required for the same reason it already was on the per-PR file listing — `--paginate` alone
+concatenates each page's JSON array as a separate top-level value rather than one valid document.
+The `-f` form in this paragraph is the one that shipped and then 403'd in consumer CI; `gh api -f`
+issues a POST. The GET correction is the entry above.
+
+`tests/migration-collision-check.test.sh` gained a new case proving a collision visible only on page
+2 of the PR listing is still caught (the pagination-cap regression case), and every existing case's
+fake-`gh` matcher now requires the exact `-f base=<ref>` argument to be present — verified this
+genuinely discriminates: reverted to the pre-fix `gh pr list` call and confirmed every single test
+case fails with an `unexpected fake gh invocation` diagnostic; separately reverted just the `-f
+base=` flag alone (keeping pagination) and confirmed that alone is also caught. Full suite passes
+against the fix.
+
+### Fixed — `leak-guard.sh --tree <ref>` read file content from the working directory, not from `<ref>` itself
+
+`git ls-tree -r --name-only "$ref"` correctly named the right files, but each was then scanned via
+a plain on-disk `grep`/`awk` against that path — always reading whatever the working directory
+happened to have checked out, regardless of `$ref`. Harmless in the normal CI invocation (a fresh
+checkout's working tree is always exactly at the commit under test), but silently wrong the moment
+`--tree` is run against a different ref than what's currently checked out — the common case for a
+human or agent doing local/manual verification against a shared checkout. Confirmed both failure
+directions are real, not just theoretical: a stale local `main` made `--tree origin/main` report a
+leak that had already been fixed on the real `origin/main` (false positive); the mirror image is
+worse for a security scanner — `--tree <a-commit-with-a-real-leak>` from a later, clean checkout
+wrongly reported clean (false negative).
+
+`--tree` now resolves `$ref` to a sha and compares it against `HEAD`: if they already match AND no
+tracked file differs from `HEAD` (the normal CI case), scanning proceeds unchanged with zero added
+overhead; otherwise — the sha differs, or it matches but the tracked tree is dirty — the ref is
+checked out into an isolated `git worktree --detach` (keyed on the resolved sha, never the ref name,
+so it can never collide with a branch checked out elsewhere) and scanned from inside that worktree,
+which is cleaned up via a trap on every exit path. `tests/leak-guard.test.sh` gained three new cases
+against a throwaway synthetic repo, proving both failure directions against the pre-fix scanner
+before confirming they pass against the fix — never relying on a specific commit existing in this
+repo's own history, which could be rewritten later.
+
+**Two follow-up fixes from CodeRabbit re-review, both mutation-tested against their own pre-fix
+commits before merge.** (1) The same-sha fast path (`$ref_sha == $head_sha`, skip the worktree
+entirely) checked sha equality but not tree cleanliness — a dirty tracked file with an uncommitted
+planted leak was scanned and reported even though `--tree HEAD` was asked about HEAD's actual
+(clean) committed content, the same false-positive bug class as above just hiding behind the
+sha-equality check instead of in front of it. The fast path now additionally requires `git diff
+--quiet HEAD --`, falling through to the worktree path on any dirty tracked file. (2) The
+leftover-worktree sweep added alongside the fast-path fix (finds and removes any abandoned
+`leak-guard-wt.*` worktree from a previously SIGKILLed run) had no liveness check, so two
+concurrent `--tree` invocations against the same checkout — ordinary usage for a fleet running many
+agents against a small number of shared checkouts — could have one invocation's sweep force-remove
+a second invocation's still-active worktree mid-scan; `scan_file()`'s `[ -f "$f" ] || return` then
+silently skipped the now-missing files, so the victim finished and reported "clean" despite
+scanning a real leak. Reproduced decisively (a real planted leak came back exit 0 "clean" once a
+racing sweep deleted the scanning process's worktree out from under it). Fixed by serializing the
+whole worktree lifecycle (stale sweep through final cleanup) behind an `mkdir`-based lock (portable
+— no `flock` binary on macOS) scoped to the repo's shared git-common-dir, so every worktree of a
+given repo contends on the same lock without over-serializing unrelated repos; a lock stuck behind
+a SIGKILLed holder times out loudly (`exit 2`) rather than silently proceeding. `tests/leak-guard.test.sh`
+gained a case racing a real (sed-slowed) invocation against a normal one at the same leaking ref,
+proven to reproduce the exact silent-false-clean failure against the pre-fix scanner before
+confirming both racing invocations correctly detect the leak post-fix.
+### Fixed — rotation-manager's recovery restarts wrote no marker, so a healthy OAuth-rotation recovery misclassified as a fleet-wide crash burst
+
+`rotation-manager.ts`'s `doRotation()` restarts every previously limit-blocked agent once a bench
+candidate (or the active account itself) recovers — a routine, expected daemon action — but neither
+restart loop wrote any of the marker files `hook-crash-alert.ts`'s `classifyFromMarkers()` checks
+for. Every agent it restarted therefore fell through to `type=crash reason=none` in `crashes.log`
+(or, worse, got swept into `type=rate-limited` by the hook's stdout-tail substring scan if its
+recent PTY output happened to contain a rate-limit-shaped phrase for unrelated reasons). Because
+this fires whenever the shared seat cycles through exhaustion-then-recovery, the recovery itself —
+nothing actually broken — paged a false 10-13-agent CRASH-alert burst and spawned root-cause
+investigations on a recurring, roughly-nightly cadence.
+
+Both restart loops in `doRotation()` (rotating onto a newly-available candidate account, and the
+active account recovering in place) now write a `.rotation-recovered` marker via a new
+`writeRestartMarker()` helper before calling `restartAgent()` — mirroring `soft-restart-all`'s
+existing `.user-restart` write in `src/cli/bus.ts`, synchronously before the call that actually
+kills the old PTY session. `hook-crash-alert.ts` gained a matching `.rotation-recovered` ->
+`rotation-recovered` marker entry, a `QUIET_SUPPRESSED_TYPES` addition (it's a routine event, same
+treatment as `user-restart`/`rate-limited`), and a distinctly-worded Telegram message rather than
+reusing `user-restart`'s misleading "restarted by user" text. `src/bus/heartbeat.ts`'s
+`END_TYPE_MARKERS` (the list `clearEndMarkers` uses to retire a marker on the next successful
+heartbeat) also gained the new marker — without it the marker would only ever clear via the hook's
+5-minute staleness TTL, not immediately on the post-restart heartbeat like every sibling marker.
+
+### Added — `evaluate-experiment --decision` override and `correct-experiment-decision` for retroactive fixes
+
+`evaluate-experiment` derived `decision` (keep/discard) purely from `result_value`/`score` vs
+`baseline_value`, ignoring the `--justification`/`--learning` text entirely — 3+ confirmed live
+instances where the mechanical decision contradicted the agent's own written reasoning (most
+concrete: marketing's `exp_1787745238_vzgah`, stored `decision=discard` against a corrupted
+`baseline_value=64.3` while `learning` argued KEEP with full reasoning). There was no CLI path to
+correct a stored decision after the fact — every real correction in this corpus (murph, adoption)
+was a hand-edit directly on the JSON file, with no audit trail of what changed or why
+(task_1789437846265_69785154).
+
+`evaluate-experiment` now accepts `--decision <keep|discard>`, which still computes the mechanical
+decision (stored in a new `mechanical_decision` field for audit) but makes the override value
+authoritative; it requires a non-empty `--justification` so an override always carries its stated
+reason in the same record. A new `correct-experiment-decision <id> <keep|discard> <reason>` command
+retroactively fixes an already-completed experiment's `decision` (refusing on running/proposed,
+pointing the caller at `--decision` instead), backfilling `mechanical_decision` from the old
+`decision` value on pre-fix records that don't have it. Both recompute `next_baseline_value` using
+the same keep/discard ratchet rule `evaluateExperiment` already used. `gatherContext`'s derived
+`results.tsv`/`learnings.md` views self-correct with no further changes, since they already
+recompute the effective baseline from `decision`/`score`/`result_value` on every call rather than
+trusting a possibly-stale stored value.
+
+The dashboard's `GET /api/experiments` had the same staleness gap on a different surface — it read
+`experiments/learnings.md` directly off disk, which `correctExperimentDecision`/`evaluateExperiment`
+never rewrite, so a corrected decision would show its pre-correction text on the dashboard forever
+(caught by CodeRabbit review on this PR). Fixed by regenerating the `learnings` field live from the
+JSON history records on every request, mirroring `formatLearnings()`/`displayBaseline()` in
+`src/bus/experiment.ts` as a local copy (the dashboard already keeps its own local `Experiment` type
+rather than importing root `src/`).
+
+### Fixed — `update-approval`/`create-approval`/`list-approvals` silently defaulted org to empty, and `resolved_by` was overloaded as a free-text note
+
+Aaron hit an unset-`CTX_ORG` gotcha directly running `update-approval` interactively: `resolveEnv()`
+resolved `org` to `''` with no validation (the `validateOrgName` import in `env.ts` was never
+called), `resolvePaths()` silently collapsed an empty org to the un-scoped `ctxRoot` instead of the
+real `orgs/<org>/` directory, and the resulting "approval not found" error gave no hint that the
+real cause was a missing `CTX_ORG` rather than a wrong ID.
+
+`create-approval`, `update-approval`, and `list-approvals`/`get-approval` (when not run with
+`--all-orgs`) now call `validateOrgName(env.org)` right after `resolveEnv()`, matching the existing
+inline status/category validation already in those same handlers — an unset org now fails loudly
+with "Invalid org name ''" instead of a misleading not-found.
+
+Separately, `updateApproval()` wrote its free-text `note` argument directly into `resolved_by` — a
+field the dashboard already renders under a "Resolved by" label (`approval-detail-dialog.tsx`) and
+already has a separate `resolution_note` column for (`dashboard/src/lib/db.ts`, populated via
+`sync.ts` but never fed by the CLI writer, so it was permanently `null`). `updateApproval()` now
+takes a required `resolverIdentity` parameter (the CLI passes `env.agentName`; the Telegram
+inline-button path in `fast-checker.ts` passes the actor string it already computes, `auditWho`)
+and writes it to `resolved_by`, while `note` now writes to a new `Approval.resolution_note` field.
+The dashboard needed no changes — `sync.ts`/`db.ts`/the detail dialog already expected this exact
+two-field shape.
+
+### Added — `bus close-experiment` — a terminal state for a `proposed`/`running` experiment that will never produce a measured result
+
+The experiment lifecycle had no way to close a proposal without running it. A `proposed`
+experiment whose linked approval was declined stayed stuck at `status: proposed` forever — every
+future fleet scan of proposed-but-never-run experiments re-flagged it (theta-wave cycle #34 spent
+cycles re-clearing a documented PARK; cycle #37 counted 3 live instances and bumped the underlying
+gap to high priority, task_1788276326374_26114110). The same shape hit `running` experiments too:
+one created before `--baseline` became required at create-time (`baseline_value: null`) is
+permanently refused by `evaluate-experiment` ("comparing against an implicit 0 baseline
+structurally forces every `direction=higher` result to KEEP" — a real, correct guard), with no
+repair or force-close path (task_1788228728494_04553223).
+
+`closeExperiment` adds a new terminal `status: 'closed'`, reachable directly from `proposed` or
+`running`, refusing on an already-`completed` or already-`closed` record. A required `reason`
+argument is stored verbatim in the new `closed_reason` field — the only durable record of why the
+experiment never completed normally — alongside a `closed_at` timestamp kept deliberately separate
+from `completed_at` (which stays `null`; a closed experiment never produced a real result).
+Deliberately does not touch `decision`: closing is never a keep/discard verdict.
+
+```bash
+cortextos bus close-experiment <experiment_id> "<reason>"
+```
+
+Considered and rejected the fuller MPAC-style state machine (REJECTED/ABANDONED/SUPERSEDED as
+distinct enum values) proposed in task_1788276326374_26114110's theta-wave append notes — a single
+terminal status with a free-text reason covers every concrete case seen in this corpus (declined
+approval, orphaned no-baseline record, superseded-in-practice) without a fixed taxonomy that would
+need its own maintenance as new closing reasons show up.
+
 ### Fixed — `add-cron`/`remove-cron` mutated `crons.json` with no corresponding audit trail
 
 Theta-wave cycle #33 finding (task_1788142055347_87999645): a cron's disappearance from an
@@ -1865,6 +2201,13 @@ context-% threshold can see (this is what took out several fleet agents).
     spawning-daemon pid to `state/<agent>/agent.pid`; new `AgentProcess.getPid()`.
     Covered by `tests/unit/utils/agent-pidfile.test.ts` (incl. explicit
     recycling-guard tests that assert an unverified live pid is never killed).
+
+### Added — Reusable CI workflow: Migration Collision Check (Theta Phase 8)
+
+- **`.github/workflows/migration-collision-check.yml`**: a `workflow_call` reusable workflow that consumer repos (initial target: conduit) wire into their PR CI to detect cross-PR migration-number collisions. Fails the calling PR's check if any migration it INTRODUCES has a number that (a) is already used by a migration on the base branch, or (b) is already proposed by another open (non-draft) PR in the same repo. Also catches internal duplicates within a single PR. Output is a GitHub `::error file=...::` annotation naming the colliding artifact (`on <base> as <path>` or `in open PR #N as <path>`). Defaults: `migrations-path: migrations`, `filename-pattern: ^([0-9]{3})_` (3-digit sequential prefix, the conduit convention from PR #283/#285); both are configurable inputs so timestamp-style migrations can opt in later. Permissions are minimal (`contents: read`, `pull-requests: read`), `actions/checkout` is SHA-pinned, all untrusted inputs go through `env:` (never inline `${{ }}` in shell).
+- **Fixed two CodeRabbit findings from re-review before merge.** (1) The cross-PR file scan called `gh api .../pulls/{n}/files --paginate` with no `--slurp` — multi-page output is several concatenated top-level JSON arrays, not one valid document, so `json.loads()` raised on any compared PR spanning more than one page (this endpoint pages at 30) and was silently treated as "malformed" and skipped, with only a `::warning::` — exactly the class of PR (many changed files) most likely to actually contain a colliding migration. Now uses `--paginate --slurp` (wraps every page into one JSON array of page-arrays) and flattens before parsing. New `tests/migration-collision-check.test.sh` extracts the workflow's real embedded Python at test time (never a duplicated copy) and proves a collision that exists only on a fake page 2 is detected, with a non-colliding same-shape control staying clean; verified it fails against the pre-fix source with exactly the `::warning::...(skipped)` symptom before confirming it passes against the fix. (2) The `filename-pattern` input's doc comment claimed "POSIX extended regex" while the implementation compiles it with Python's `re` module — different flavor, could silently mismatch a caller's pattern on edge cases; doc corrected to name the actual engine.
+- **Fixed three more CodeRabbit findings from a second re-review.** (1) An unscannable open PR (API error, or a malformed multi-page response) was logged as a `::warning::` and silently skipped from collision detection — including the case that motivated the `--slurp` fix above, now generalized: a rate-limited or transiently-failing `gh api` call defeated the check exactly as silently as the pagination bug did. The loop now calls a fresh `gh pr view <n> --json state` before skipping; a PR confirmed closed/merged since the initial listing is a legitimate skip, anything else (rate limit, network, permission, malformed data) is now `::error::` + `sys.exit(1)` — fails the check rather than passing it on a technicality. (2) `MIGRATIONS_PATH` only stripped a trailing `/`, so a caller-supplied `./migrations` would never match the API's filename strings (which never carry a `./` prefix) in the cross-PR `startswith` comparison, silently disabling that half of the check for such callers; now normalized with `os.path.normpath`. (3) `migration-collision-check-test.yml`'s self-test checks out and executes untrusted PR-supplied code (`tests/migration-collision-check.test.sh`) on the `pull_request` trigger; `actions/checkout` now sets `persist-credentials: false` so the (already read-only) `GITHUB_TOKEN` isn't left in local git config for that code to read.
+- **Fixed a rename-handling gap from a third re-review, in both directions.** The base-branch check diffed migration files by exact PATH (`pr_files - base_files`), so a pure rename of an existing migration (same number, cosmetic filename change) registered as a brand-new migration and then "collided" with the very file it was renamed from — still present on the (unaffected) base branch. The cross-PR check had the mirror-image gap: it only considered `status: "added"` records, so another open PR could introduce a colliding number purely by renaming an existing migration onto it, invisibly to this check. Both are now rename-aware: the base-branch side uses `git diff --name-status -M` and only treats a rename as a new candidate when its extracted migration number actually changed (an unchanged-number rename is the same migration, not a new one); the cross-PR side now also inspects `status: "renamed"` records via their `previous_filename`, with the identical unchanged-number exclusion applied symmetrically. `tests/migration-collision-check.test.sh` gained four new cases — a same-number rename must stay clean on both the base-branch and cross-PR sides (mutation-tested: both fail against the pre-fix source with the exact symptom, one false-positive and one false-negative), plus a control on each side proving a rename that *does* change the number is still correctly evaluated as a new candidate (not unconditionally ignored).
 
 ### Hook Framework — Loop Detection (B1)
 

@@ -1,10 +1,18 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
 import { selfRestart, hardRestart, checkGoalStaleness, checkStaleBlockers, checkDeployDrift, postActivity } from '../../../src/bus/system';
 import type { BusPaths, Task } from '../../../src/types';
+
+const slackPostMessageSpy = vi.fn().mockResolvedValue({ ok: true });
+vi.mock('../../../src/slack/api.js', () => ({
+  SlackAPI: class {
+    constructor(public token: string) { /* no-op */ }
+    async postMessage(...args: unknown[]) { return slackPostMessageSpy(...args); }
+  },
+}));
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
   return {
@@ -222,6 +230,24 @@ describe('Bus System', () => {
   });
 
   describe('postActivity', () => {
+    // Writes activity-channel.env / secrets.env into `dir`. Omit a field to
+    // leave that file (or that key within it) absent, so callers can target
+    // exactly the branch they mean to exercise.
+    function writeActivityConfig(
+      dir: string,
+      opts: { channelId?: string; token?: string; writeEmptySecrets?: boolean } = {},
+    ) {
+      mkdirSync(dir, { recursive: true });
+      if (opts.channelId !== undefined) {
+        writeFileSync(join(dir, 'activity-channel.env'), `ACTIVITY_SLACK_CHANNEL_ID=${opts.channelId}\n`);
+      }
+      if (opts.token !== undefined) {
+        writeFileSync(join(dir, 'secrets.env'), `SLACK_BOT_TOKEN=${opts.token}\n`);
+      } else if (opts.writeEmptySecrets) {
+        writeFileSync(join(dir, 'secrets.env'), 'OTHER_KEY=abc\n');
+      }
+    }
+
     it('returns false when not configured', async () => {
       const result = await postActivity(
         join(testDir, 'nonexistent'),
@@ -232,22 +258,64 @@ describe('Bus System', () => {
       expect(result).toBe(false);
     });
 
-    it('returns false when env file has no token', async () => {
+    it('returns false when activity-channel.env has no channel ID', async () => {
       const orgDir = join(testDir, 'orgdir');
       mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_CHAT_ID=123\n');
+      writeFileSync(join(orgDir, 'activity-channel.env'), 'SOME_OTHER_VAR=123\n');
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
     });
 
-    it('returns false when env file has no chat ID', async () => {
+    it('returns false when channel ID is set but secrets.env does not exist', async () => {
       const orgDir = join(testDir, 'orgdir');
-      mkdirSync(orgDir, { recursive: true });
-      writeFileSync(join(orgDir, 'activity-channel.env'), 'ACTIVITY_BOT_TOKEN=abc123\n');
+      writeActivityConfig(orgDir, { channelId: 'C123' });
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
+    });
+
+    it('returns false when secrets.env exists but SLACK_BOT_TOKEN is empty', async () => {
+      const orgDir = join(testDir, 'orgdir');
+      writeActivityConfig(orgDir, { channelId: 'C123', writeEmptySecrets: true });
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(false);
+    });
+
+    it('posts via Slack and returns true when channel ID and bot token are both configured', async () => {
+      const orgDir = join(testDir, 'orgdir');
+      writeActivityConfig(orgDir, { channelId: 'C123', token: 'xoxb-test' });
+      slackPostMessageSpy.mockClear();
+      slackPostMessageSpy.mockResolvedValueOnce({ ok: true });
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(true);
+      expect(slackPostMessageSpy).toHaveBeenCalledTimes(1);
+      expect(slackPostMessageSpy).toHaveBeenCalledWith({ channel: 'C123', text: 'hello' });
+    });
+
+    it('returns false when the Slack API call rejects', async () => {
+      const orgDir = join(testDir, 'orgdir');
+      writeActivityConfig(orgDir, { channelId: 'C123', token: 'xoxb-test' });
+      slackPostMessageSpy.mockClear();
+      slackPostMessageSpy.mockRejectedValueOnce(new Error('slack unreachable'));
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(false);
+    });
+
+    it('finds activity-channel.env / secrets.env at the ctxRoot-anchored fallback path when orgDir has neither', async () => {
+      const orgDir = join(testDir, 'orgdir-empty');
+      mkdirSync(orgDir, { recursive: true });
+      const anchoredOrgDir = join(testDir, 'orgs', 'myorg');
+      writeActivityConfig(anchoredOrgDir, { channelId: 'C456', token: 'xoxb-anchored' });
+      slackPostMessageSpy.mockClear();
+      slackPostMessageSpy.mockResolvedValueOnce({ ok: true });
+
+      const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
+      expect(result).toBe(true);
+      expect(slackPostMessageSpy).toHaveBeenCalledWith({ channel: 'C456', text: 'hello' });
     });
   });
 
@@ -367,6 +435,53 @@ describe('Bus System', () => {
       expect(report.entries[0].detail).not.toContain('PR #306');
     });
 
+    // task_1788535091729: task_1788446092100_21920670 / #170 and
+    // task_1788464546954_33593143 / #172 both re-flagged identically every
+    // scan even though a full github.com/.../pull/N URL for the same
+    // number, resolving the repo, was already on record right alongside the
+    // bare mention.
+    it('does not flag a bare "PR #N" mention when a full github.com URL for the same number appears anywhere in the same text', () => {
+      writeTask('myorg', {
+        id: 'task_url_resolved',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'blocked on PR#172 merging. See https://github.com/WYRE-AI/cortextos/pull/172 for status — currently blocked_by Aaron\'s click.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    it('still flags a bare "PR #N" mention when a full URL is present for a DIFFERENT PR number', () => {
+      writeTask('myorg', {
+        id: 'task_url_different',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'blocked on PR#67 merging. Related work landed in https://github.com/WYRE-AI/cortextos/pull/99.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    it('does not flag a PR cited ONLY as a full github.com URL, with no bare "PR #N" form anywhere', () => {
+      writeTask('myorg', {
+        id: 'task_url_only',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'blocked on https://github.com/WYRE-AI/cortextos/pull/181 merging.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
     it('does not flag other precedent-citation phrasings ("see PR #NN for the pattern", "e.g.", "prior art")', () => {
       writeTask('org-a', {
         id: 'task_see_pattern',
@@ -414,6 +529,28 @@ describe('Bus System', () => {
       expect(report.entries).toHaveLength(0);
     });
 
+    // task_1786902033624 (grower/analyst, 2026-08-20 then again 2026-08-22):
+    // a check-stale-blockers sweep flagged the SAME task twice, two days
+    // apart, both times a false positive — conduit PR #1424 is a real,
+    // correctly-cited reference, but it's cited as the source of a
+    // supporting statistic ("13 lapsed rows verified against prod"), not as
+    // the fix for this task's blocker. Distinct from precedent-citation
+    // (that class isn't naming a blocker at all; this one names a real,
+    // relevant PR, just not as the thing that resolves the block).
+    it('does not flag a PR mention cited as the source of a supporting fact, not the fix ("documented ... by PR #NN as", "verified against")', () => {
+      writeTask('myorg', {
+        id: 'task_stat_source',
+        title: 'Trialing rows with NULL current_period_end are invisible to the scheduler',
+        status: 'blocked',
+        description:
+          '14 of 15 trialing rows are lapsed, documented in-code by conduit PR #1424 as 13 verified against prod 2026-08-15.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
     it('still flags a genuine PR reference when "tool artifact" appears but not near that PR number', () => {
       writeTask('myorg', {
         id: 'task_unrelated_dismissal',
@@ -429,6 +566,54 @@ describe('Bus System', () => {
       expect(report.entries).toHaveLength(1);
       expect(report.entries[0].detail).toContain('PR #67');
       expect(report.entries[0].detail).not.toContain('PR #55');
+    });
+
+    // NOTE: the two mentions are kept far apart on purpose (separate
+    // sentences, no shared clause) — this exercise found that a stat-source
+    // cue sitting in the GAP between two close references (e.g. "...verified
+    // against prod. This one is blocked on PR#67...") can leak into the
+    // NEXT reference's before-window despite the existing prev-match-end
+    // clamp, because that clamp only protects against reaching before/into
+    // the previous match's own span, not the trailing prose after it. Not
+    // fixed here — pre-existing architecture limitation (the after-window
+    // has no symmetric next-match-start clamp), same class as the "e.g."
+    // trailing-period note above, just not previously triggered because no
+    // existing cue phrase naturally sits in that gap zone. Flagging in case
+    // a tighter mixed-citation case is ever reported for real.
+    it('still flags a genuine blocking PR mention even when a stat-source citation appears earlier, well-separated, in the same description', () => {
+      writeTask('myorg', {
+        id: 'task_stat_source_mixed',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'Documented in-code by conduit PR #1424 as 13 verified against prod 2026-08-15. ' +
+          'Separately, this task itself cannot proceed until PR#67 merges.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+      expect(report.entries[0].detail).not.toContain('PR #1424');
+    });
+
+    it('does not flag other stat-source citation phrasings ("sourced from", "per PR #NN\'s own data")', () => {
+      writeTask('org-a', {
+        id: 'task_sourced_from',
+        title: 'reconcile the counts',
+        status: 'blocked',
+        description: 'The 41-org figure is sourced from PR #914.',
+      });
+      writeTask('org-a', {
+        id: 'task_own_data',
+        title: 'confirm the regression window',
+        status: 'blocked',
+        description: 'Per PR #200\'s own data, the window is 72 hours.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
     });
 
     it('does not suppress a PR reference on the generic word "resolved" alone, only the narrow "tool artifact" cue', () => {

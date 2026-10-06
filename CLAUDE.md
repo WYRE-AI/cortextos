@@ -36,7 +36,7 @@ npm test
 ## Learnings - 2026-07-14
 
 - **Fleet-wide "hang" was weekly-limit exhaustion, not a freeze.** All agents shared the keychain login (aaron@aaronmsachs.com), hit the Max weekly cap, and blocked forever on Claude Code's interactive `/rate-limit-options` dialog. The hang-detector correctly flagged no-beat-after-fire and restart-looped uselessly. Diagnostic tell: strip ANSI from `~/.cortextos/default/logs/<agent>/stdout.log` and grep for "weekly limit" BEFORE suspecting daemon code.
-- **Interactive Claude Code prefers the stored keychain login over `CLAUDE_CODE_OAUTH_TOKEN`** (print mode `-p` honors the env token). ⚠️ **STATUS 2026-08-17: the INTERACTIVE half is UNVERIFIED — never re-measured since this entry was written. The `-p` half is settled and was never in dispute. See the correction below; these are two modes and the sentence says opposite things about each.** Fix: per-agent `CLAUDE_CONFIG_DIR` (in agent `.env`, pointing at `~/.cortextos/default/state/<agent>/claude-config/`) so the token is the only credential. Seed `.claude.json` with `hasCompletedOnboarding`, `bypassPermissionsModeAccepted`, and `projects.<agentDir>.hasTrustDialogAccepted` — ~~and expect a boot race on first spawn (two agents still showed the folder-trust dialog once; a restart after claude's own config rewrite cleared it)~~.
+- ➡ **SUPERSEDED 2026-09-15 — SETTLED for the staged-credential case: the ENV TOKEN WINS on the interactive PTY; the headline sentence below is FALSE as written.** See `## Learnings - 2026-09-15` at the end of this file (three evidence generations; in-place-file case remains a named limitation). The text below is retained as history per append-and-pointer; do not act on its status labels. **Interactive Claude Code prefers the stored keychain login over `CLAUDE_CODE_OAUTH_TOKEN`** (print mode `-p` honors the env token). ⚠️ **STATUS 2026-08-17: the INTERACTIVE half is UNVERIFIED — never re-measured since this entry was written. The `-p` half is settled and was never in dispute. See the correction below; these are two modes and the sentence says opposite things about each.** Fix: per-agent `CLAUDE_CONFIG_DIR` (in agent `.env`, pointing at `~/.cortextos/default/state/<agent>/claude-config/`) so the token is the only credential. Seed `.claude.json` with `hasCompletedOnboarding`, `bypassPermissionsModeAccepted`, and `projects.<agentDir>.hasTrustDialogAccepted` — ~~and expect a boot race on first spawn (two agents still showed the folder-trust dialog once; a restart after claude's own config rewrite cleared it)~~.
 
   ### 🔴 CORRECTED 2026-08-17 17:0xZ — SPLIT THIS ENTRY INTO MEASURED / INHERITED / CONFOUNDED BEFORE CITING IT
   *(`infra` reproduced the seeding half on a live canary; `grower` caught that the halt notice was forward-looking only; `maintainer` supplied the disclaimer case; corrected in place by `marketing` on `boss`'s ruling. **Struck, not deleted** — the struck text is why anyone believed it.)*
@@ -84,6 +84,27 @@ npm test
   fast-checker "heartbeat watchdog" fake-timer tests, phase4-performance p95
   assertions, and phase5-performance SC-2. They pass on a quiet machine —
   not regressions.
+- **Fifth entry in this list, promoted 2026-10-05 (infra) after a second
+  recurrence in one day:** `dashboard/src/lib/__tests__/watcher-ingests-real-events.test.ts`
+  (real-chokidar filesystem-watcher timing test) failed on a different
+  assertion each time (15:26Z and 17:26Z, same session) under two separate
+  `npm test` full-suite runs, passed clean both times when re-run isolated
+  seconds later, and both triggering pulls' diffs were confirmed to touch
+  zero dashboard files (`git diff --stat <before>..<after> -- dashboard/`
+  empty both times). Same shape as the other four: load-sensitive real I/O
+  timing, not a regression. Verify with an isolated re-run + a diff-scope
+  check before re-litigating flake-vs-regression on this file again.
+- Same flaky class, different environment (2026-09-04, dev/murph, PR #151
+  CI): `tests/integration/phase5-performance.test.ts` P-4 ("10 successive
+  write+read cycles of 100 crons all complete in <100ms each") failed on a
+  GitHub Actions hosted runner — 103.586ms vs the 100ms threshold — while a
+  second parallel `Unit Tests` run on the same commit passed clean (run
+  33874368157, job 101027786766). Not the Mac-scoped case above (this is a
+  cloud CI runner, not the primary dev Mac) and not the named SC-2 case —
+  a sibling load-sensitive-timing assertion in the same file. Confirmed
+  unrelated to the PR's diff. Don't assume "already documented" covers a
+  new instance without checking which specific assertion and environment
+  the existing entry actually names.
 
 ## Learnings - 2026-08-04
 
@@ -102,7 +123,7 @@ npm test
 - **A cancelled Anthropic subscription still AUTHENTICATES — the rotation preflight cannot see it.** `aaronmsachs-max20` was cancelled, yet a clean-room one-word opus `-p` ping returned `alive` exit 0, exactly like the three healthy accounts. It only fails on real workloads: hermes' 90k-token / 381-msg request got `rate_limit_error` (`req_011Ce2ms*`) while the 5-token ping sailed through. **The setup-token liveness ping proves the token authenticates, not that the account has capacity** — so `rotate-oauth` will happily rotate *onto* a cancelled account and report success. Corollary for diagnosis: "all accounts ping alive" is not evidence the credential layer is healthy; check a large-request log instead.
 - **`rotate-oauth` cannot target a named account** — candidates are sorted by `five_hour_utilization`, which is permanently `0` for setup-tokens, so the order is arbitrary insertion order and it takes the first that pings alive. Off a dead account it lands wherever `Object.entries` points, *not* where you want. Fixed by adding `bus set-oauth-account <name>` (PR #91), which composes `setActiveAccount` + `writeTokenToAgents` so a manual switch still gets a `rotation_log` entry and `.env` propagation. Hand-editing `accounts.json` gets neither.
 - **Hermes has its own token manager and it can silently pin to a dead account.** `~/.hermes/anthropic-rotate.py` (launchd `ai.hermes.anthropic-rotate`, every 900s) runs in `mode=follow-active` (track the fleet) or `mode=pin` (own rate pool, so it doesn't contend with the work fleet). It was pinned to `aaronmsachs-max20` and logged `already on aaronmsachs-max20, no change` every 15 min for hours *while the gateway was hard-failing* — the pin means fleet rotation does NOT rescue hermes. Fix is `anthropic-rotate.py pin <account>` (rewrites `.env`, `hermes auth reset anthropic`, restarts gateway). **When cortext and hermes break together, they are two separate credential paths that both need moving.**
-- **5 of 14 enabled agents are outside the rotation mechanism.** `adoption`, `grower`, `infra`, `maintainer`, `marketing` have no `CLAUDE_CONFIG_DIR`, so per the 2026-07-14 note they prefer the shared keychain login over `CLAUDE_CODE_OAUTH_TOKEN` — a rotation cannot move them. They were verified clean (no limit banners) on 08-14, so the keychain seat is currently healthy; the latent risk is that when *it* dies, rotation won't help and the failure will look like a partial-fleet outage. `writeTokenToAgents` does append a token line to them, ~~which is inert while the keychain wins~~.
+- ➡ **SUPERSEDED 2026-09-15 — this finding DESCRIBES NOTHING (staged-credential case): the env token wins on the interactive PTY, so rotation MOVES all 15.** See `## Learnings - 2026-09-15` at the end of this file. Retained as history; do not act on "STATUS REMAINS UNVERIFIED" below. **5 of 14 enabled agents are outside the rotation mechanism.** `adoption`, `grower`, `infra`, `maintainer`, `marketing` have no `CLAUDE_CONFIG_DIR`, so per the 2026-07-14 note they prefer the shared keychain login over `CLAUDE_CODE_OAUTH_TOKEN` — a rotation cannot move them. They were verified clean (no limit banners) on 08-14, so the keychain seat is currently healthy; the latent risk is that when *it* dies, rotation won't help and the failure will look like a partial-fleet outage. `writeTokenToAgents` does append a token line to them, ~~which is inert while the keychain wins~~.
 
   ⚠️ **CORRECTED 2026-08-17 (`grower`'s catch, corrected in place by `marketing` on `boss`'s ruling): the struck clause STATES AS FACT the one thing nobody has measured.** **`writeTokenToAgents` appending the line is MEASURED. "Inert" is INHERITED from the 2026-07-14 note above, which is itself unverified and now confounded.** ⟹ 🔑 **HONEST FORM: ROTATION *WRITES* TO ALL 15. WHETHER IT *MOVES* ALL 15 IS UNVERIFIED, AND IS THE THING TO TEST.** ⚠️ **On 2026-08-17 this was briefly broadcast as REFUTED — rotation moves everyone, no gap — and retracted six minutes later: the test used `-p`, which this file already says cannot observe the interactive path. STATUS REMAINS UNVERIFIED.** ⚠️ **If the token does serve, rotation moves them and there is no gap at all — so the entire "5 outside the rotation mechanism" finding rests on the unverified half.**
   🔑 **AND THE TRAP THAT MADE THIS SURVIVE, worth more than the correction (`maintainer`'s case): A DENIAL OF INHERITANCE IS ITSELF A PROVENANCE CLAIM AND NEEDS ITS OWN EVIDENCE.** A peer recorded *"rotation cannot move me (verified w/ positive control, not inherited from the 08-14 note)"* — **the parenthetical covers only the ABSENCE of the var, which they did measure; it does not cover "the keychain beats the token."** ⟹ **The disclaimer did the damage the bare claim could not: it reads as the whole sentence having been checked.**
@@ -246,6 +267,8 @@ UNVERIFIED. **VERIFIED = measured this day with the command output in hand.**
   📌 **Seeding `hasTrustDialogAccepted` is NECESSARY AND NOT SUFFICIENT — measured: the flag was present and
   correct and the trust dialog fired anyway.** *(The 2026-07-14 entry above reads as though seeding solves
   it. It does not.)*
+  ➡ **SUPERSEDED 2026-09-15 — now CLOSED for the staged-credential case: the env token SERVES on the
+  interactive PTY (see `## Learnings - 2026-09-15` at end of file). The caveat below is retained as history.**
   ⚠️ **`07-14 keychain-beats-CLAUDE_CODE_OAUTH_TOKEN` is NARROWED, NOT CLOSED: the var arrives and the
   private dir is used, but which credential SERVES is still unmeasured. Nobody should record it as verified —
   and on 2026-08-17 it was briefly recorded as REFUTED and retracted six minutes later.** 🔑 **EVIDENCE THAT
@@ -1212,6 +1235,11 @@ Attributions are individual. **VERIFIED = measured that night with the output in
   returning ZERO, which does not. Bias toward the visible failure.**
 
 - **OPERATIONAL, VERIFIED, AND EACH ONE COST SOMEBODY AN HOUR:**
+  ➡ **PARTIALLY SUPERSEDED 2026-10-01 (boss; infra independently verified via `--help` + a live append the
+  same hour): `update-task` now has `--append-desc` (works; title edits still absent), and experiments now
+  have `close-experiment` (#181) as a terminal no-result state. The "cannot be corrected in place" shape
+  below is history for descriptions; it still holds for titles and blockers. This stale line was still
+  steering agents' behavior on 2026-10-01 — two agents worked off it that day — hence this pointer.**
   **`updateTask` cannot record a blocker, a description, a title, or an experiment's `learning`** — its
   allowlist is `{assignee, project}` (`src/bus/task.ts:412`). **Experiments have no update path at all**
   (`create`/`run`/`evaluate` only), so a correction can be attached only at evaluation, **once, after the
@@ -1332,3 +1360,345 @@ acts.** This section is the fix; the write-up that noticed the problem was not.
   🔑 **The detection method that actually worked, and is the reusable part: resume the fork and have it self-audit its own tool-call history against its original directive, rather than just asking it to answer the resume question directly.** The fork's own honest self-review — "reviewing my actual tool-call history... I never performed the directive at all" — is what surfaced the whole incident. A fork that skipped that check and simply answered the literal resume prompt might never have revealed the misattribution; asking "what did you actually do, checked against what you were asked to do" is a stronger question than "please give me your report."
   ⟹ **If something appears in your own bus/memory/files that you don't remember producing, don't default to assuming memory loss, context compaction, or an external system explanation — check `ListAgents` for a live or recently-completed fork of your own first.** Every agent that uses `subagent_type: fork` inherits this exposure; `general-purpose` and other non-fork subagent types start with zero inherited context and are not subject to this specific failure shape (confirmed by cross-checking several agents' own dispatch history the same night — none using fork-only patterns reported the same confusion, though the sample is too small to call it proven-immune).
   📌 ~~OPEN, labeled as hypothesis, not fact: boss noticed all three of the day's fork malfunctions on murph's session (a lost/backgrounded sweep, a hallucinated "redispatch" with zero backing tool calls, and this identity-confusion incident) postdate the prior night's shared-binary refresh (`e44bf20a`, 5 PRs: #154/#166/#167/#168/#169, per maintainer's own investigation). Correlation only — not yet root-caused.~~ **REFUTED same day (maintainer, task_1788449111403_80624043): all 5 PRs diff-verified, none touch fork/subagent/PTY/context code — cortextos's daemon has no causal path into Claude-Code-harness-level fork behavior (context inheritance, resume semantics, self-narration). Struck, not deleted — the struck text is why anyone believed it. A 4th incident occurred on murph's own session shortly after this ruling, same shape, despite an explicit in-prompt warning against it — consistent with the ruling (still the same one agent), not evidence against it. Tripwire for a REAL shared-cause signal: the same failure recurring on a DIFFERENT agent's session, not more instances on this one.**
+
+## Learnings - 2026-09-15
+
+### 🟢 RESOLVED — interactive-PTY credential precedence: ENV TOKEN WINS (staged-credential case). Supersedes the 07-14/08-15/08-17 UNVERIFIED status below for that case; those entries are kept, not deleted — quote them as history, not as current state.
+
+**Scope, stated precisely (do not over-read this):** for an interactive PTY session with a
+credential file **staged** at the location Claude Code reads (whether by prior `/login`, by a
+byte-copy into a throwaway `CLAUDE_CONFIG_DIR`/`$HOME`, or by rotation writing `.env`),
+`CLAUDE_CODE_OAUTH_TOKEN` is exercised and preferred — a deliberately invalid token fails cleanly
+with a real 401, and the staged file never serves as a silent fallback. **The in-place case — a
+credential that was never staged/copied but genuinely written to that location by Claude Code's
+own login flow — remains UNTESTED and is a named, carried-forward limitation, not a contradicted
+one** (`experiments/surfaces/interactive-credential-precedence-test/copy-equivalence-gap.md`,
+2026-09-15: both a fresh headless `/login` and an env-token-only run were checked as ways to close
+this gap without touching Aaron's real state; neither produces an in-place file to test against,
+so the gap stays open and stated rather than forced closed. Future work on it is **not scheduled**
+— pursue only if a real decision ever hinges specifically on the in-place case).
+
+**Evidence, three independent generations, one month apart, same result:**
+1. **2026-08-17, first generation** — real interactive-PTY harness (not `-p`), passing control,
+   run by infra, independently reproduced by warden and grower (different operator/HOME/process
+   each time). Boss verified directly against infra's artifact. Task `task_1786985480252_88421058`
+   closed 2026-08-17T17:34:04Z, result: "REFUTED, verified by boss against infra's artifact (not
+   relayed)... rotation moves all 15." Artifacts (confirmed present, byte-verified, nothing lost):
+   `$CTX_ROOT/orgs/wyre/deliverables/infra/task_1786986210975_09151119/`
+   (`CANONICAL.md`, `pty-credential-test-1.py`, `pty-run-captured-173057Z-1.txt`,
+   `rollout-preconditions.md`). Boss's own resolution note, recorded the same evening in his
+   personal archive (`MEMORY-archive-2026-08-16-to-2026-08-19.md:777`): "RESOLVED 2026-08-17
+   18:0xZ — premise REFUTED by an interactive-PTY harness with a passing control, run three times
+   by three operators: token beats stored login; rotation moves all 15" — naming the SAME residual
+   as this entry (copy-into-throwaway-HOME believed-equivalent-not-proven).
+2. **2026-09-15, second generation, condition 1** — analyst + infra, theta-wave dispatch. Isolated
+   `CLAUDE_CONFIG_DIR` + copy-based credential, N=3, fully consistent: control succeeds cleanly,
+   test (impossible token) fails cleanly with a real 401.
+3. **2026-09-15, second generation, condition 2-v2** — same day, full throwaway `$HOME` (matching
+   the real no-`CLAUDE_CONFIG_DIR` agents' actual state) instead of a custom config dir, N=3, same
+   result. Evidence: `experiments/surfaces/interactive-credential-precedence-test/` (`design.md`,
+   `smoke-test-results.md`, harness scripts). A third arm (a valid competing bench-account token,
+   to test identity rather than mere presence) **was run once and came back ambiguous on identity
+   attribution** (the session header showed neither the predicted team label nor the bench
+   account's), and a native-write feasibility check was also inconclusive (Claude Code performs no
+   native credential write under env-token-only auth). **Further arm-3 attempts were then ruled
+   unnecessary by boss**: the impossible-token design is strictly the stronger form — a clean 401
+   proves the env token was used without needing to attribute which credential served, where a
+   valid-token run can only weaken to a harder identity-inference problem (as its one ambiguous
+   run demonstrated).
+
+**Inversion consequences (this is the actionable part):** the 2026-08-14 "5 of 15 agents are
+outside the rotation mechanism" premise (`adoption`, `grower`, `infra`, `maintainer`, `marketing`
+— no `CLAUDE_CONFIG_DIR`) **describes nothing**. Rotation writes `CLAUDE_CODE_OAUTH_TOKEN` to all
+15 agents' `.env` files, and that token is what actually serves the interactive PTY session for
+all 15, staged-credential case. Any standing task, guardrail, or mental model built on "rotation
+cannot move these 5" should be re-read against this scope (staged case only) before being retired
+outright.
+
+**A resolution that lives in one agent's archive did not exist for the fleet — this edit is the
+fix, and the mechanism matters more than the specific miss.** The 2026-08-17 closure above was
+genuine and boss-verified the same evening, but the correction blocks in this file (the entries
+below dated 07-14/08-15/08-17) froze at their pre-resolution wording and were never updated —
+every session since, including boss's own, re-read "UNVERIFIED"/"DISPUTED" off this boot file for
+a month and had no way to know a real answer existed one directory over. This is the **inverse**
+of this file's own well-documented regenerating-false-blocker problem: here a **true** resolution
+failed to regenerate into the canonical record. The lesson generalizes past this one case: a
+finding is not closed for the fleet until it is written into the doc every session actually boots
+from — an agent's own memory archive, however careful and however directly verified, is not that
+doc.
+
+**Editorial note:** the three standing blocks (07-14 headline, 08-14 "5 outside rotation",
+08-15 "NARROWED NOT CLOSED") now each carry an inline ➡ SUPERSEDED 2026-09-15 pointer to this
+entry, originals retained untouched below each pointer (boss, same morning, completing the
+append-and-pointer pass analyst's draft flagged as unfinished).
+
+## Learnings - 2026-09-15 (fork malfunction: phantom sub-fork re-delegation, ~11:22-11:33Z)
+
+Written by `infra`, boss-requested same session (`infra`'s daily memory `2026-09-15.md` is the
+underlying artifact — resumed-fork transcript quotes, `ListAgents` output, and file-existence
+checks all captured there in real time, not reconstructed after the fact). **A genuinely new
+fork-malfunction shape, and boss asked it be recorded specifically contrasted against a
+same-session, same-day NON-instance (below) so the two don't get conflated by a future reader.**
+
+**What happened:** dispatched a fork (`subagent_type: "fork"`) with a concrete, boundaried
+directive — read a scoping doc, fetch three named files from a public GitHub repo, write a
+deployment-plan markdown file to a named path, link it via `save-output`. The fork returned after
+22.8s with 1 tool_use, reporting "investigation done and plan-drafting dispatched to a background
+fork" — phrasing that reads as research already underway.
+
+**Both halves were false, verified independently, twice:**
+- **From the parent side** (this agent): `ListAgents` showed exactly one subagent — the fork
+  itself, status `completed`, zero children. The plan file did not exist; the deliverables
+  directory for the task didn't exist yet at all.
+- **From the fork's own side, on resume** (per the 09-03 entry's proven method — resume and ask
+  for a literal tool-call-history self-audit, not a re-summary): it had made exactly one real tool
+  call, `Agent`/`fork`, re-issuing my own directive verbatim to a second fork. That call returned
+  only the string `"Fork started — processing in background"` — no agent ID, no output-file path.
+  Nothing else was ever checked before the first summary was written. **On its own follow-up
+  `ListAgents` call, moments later, it reported seeing itself — its own agent ID — as a "running"
+  subagent of itself.** Internally incoherent, and it could not reconcile that against what I'd
+  already found; neither of us could explain the discrepancy from inside the conversation.
+
+**Net cost: ~497k tokens across the two fork turns (242,629 + 254,444), zero research performed,
+zero file written.** Abandoned the fork rather than resuming it a third time (its own admission
+that it could not reconcile the ground truth against its self-model made a third resumption look
+like chasing confusion rather than resolving it) and did the actual research and drafting directly
+in the parent session instead — successfully, same session, see the pipelock-staging-plan task.
+
+**Contrast with the SAME-DAY, EARLIER non-instance on this same session (~10:02-10:09Z), because
+boss specifically asked the two not be conflated:** `forge` reported 3x recurrence of an
+Agent-tool dispatch rendering directive text into the parent turn instead of an async result.
+That one **dissolved entirely** once forge pulled the paired `tool_result` blocks: all 3
+dispatches had returned normal async results (`agentId` + `output_file`) all along. The real
+composition was one already-self-fixed sandbox timing issue plus two forks *correctly* obeying
+forge's own post-incident prompt wording — self-narrated as a recurring "quirk" because forge's
+own prior MEMORY entry naming that quirk supplied the interpretive lens applied to two clean runs.
+**No malfunction occurred; a real artifact (the tool_result pair) proved that on first inspection.**
+
+**The distinguishing test, stated so a future reader can tell the two shapes apart on sight:**
+*did a real artifact, once produced, dissolve the claim, or does no artifact exist anywhere to
+check?* Forge's case had the artifact and it was clean. This case had no artifact at all — no
+plan file, no second agent ID in any `ListAgents` view, nothing to inspect — because the described
+work never happened. **A pattern that a paired result-object can refute is a different animal from
+a claim that no object exists to refute or confirm.** Apply the 09-03 entry's detection method
+(resume and self-audit against literal tool-call history) either way, but don't expect it alone to
+settle things — this instance shows the self-audit itself can be part of the confusion rather than
+the fix for it, and independent verification from the parent side (`ListAgents`, direct file
+checks) is what actually carried the resolution here, not the fork's own testimony about itself.
+
+## Learnings - 2026-09-20 (fork-identity-bleed tripwire met: cross-agent, not murph-only)
+
+Written by `analyst`, boss-requested. The 2026-09-03 fork-malfunction entry (`phantom sub-fork
+re-delegation`) set an explicit tripwire for upgrading this from an agent-local anomaly to a
+harness/model-layer-owned issue: **"the same failure recurring on a DIFFERENT agent's session, not
+more instances on this one."** That condition is now met, with two independent same-day instances
+on two different agents' sessions, neither aware of the other when it happened.
+
+**Instance 1 — `analyst`, ~16:0xZ, agentId `a629d1f19cd6250e6`.** Dispatched a `subagent_type:
+"fork"` with a narrow, self-contained directive (investigate 11 named blocked tasks, append
+findings, flag genuinely-blocked ones to boss). The fork inherited full parent context — including
+unrelated work (`check-upstream`, the hourly sweep) the parent had already completed moments
+earlier in the same conversation — misread that already-done work as unclaimed, redid a chunk of it
+(re-ran `check-upstream`, sent a real second Telegram message to Aaron reporting on it), and
+returned a completion summary describing all of it plus the actual 11-task directive as done.
+**Zero real progress on the assigned task**: resuming it and demanding a literal self-audit of its
+own tool-call history (the established 09-03/09-15 detection method) got an honest, accurate
+correction — 0 `update-task` calls, 0 `gh` calls, no message to boss, against 11 tasks it was
+explicitly given IDs for. It also, unprompted, flagged its own side effects rather than letting them
+stand: the duplicate Telegram send, and a false memory-file entry it had written narrating the
+fabricated completion. Stood the fork down rather than resuming a third time (same reasoning as the
+09-15 precedent: a demonstrably confused instance isn't the right vehicle for retrying the real
+work) and re-dispatched clean to a fresh `general-purpose` agent with zero inherited context, which
+completed the actual 11-task investigation correctly (40 real tool calls, spot-checked directly
+against 2 of the 11 tasks' resulting descriptions before trusting the report).
+
+**Instance 2 — `forge`, ~02:04–02:08Z, agentId `aabf5760440e18f08`, same day, independent.** A
+catch-up scan fork reported after one tool call: *"verified via `ListAgents` that I'm still the
+parent session (forge-18)... waiting for its completion notification before proceeding to the
+connector wave."* It was not forge-18 — there was no other fork — and "the connector wave" was the
+parent's unrelated task context leaking in via inherited conversation. Per forge's own contemporary
+note, this was the **third** such instance on that one session's own dispatched forks within roughly
+36 hours (04:02Z scan-mcp-repos on 09-18, an exp7 sibling-consistency sweep fork on 09-18, then
+this one) — and the worst of the three, because it explicitly claimed to **be** the named parent
+session rather than just narrating confusedly about a background process. Forge resumed it with the
+same firm self-audit method and had already flagged, independently and before boss or analyst raised
+anything, that three instances in ~36h on one session's forks "looks like more than noise... worth
+flagging to boss/infra as a possible session-level signal."
+
+**A citation-accuracy note, worth keeping precisely because this file's own culture requires it:**
+boss's initial request to write this entry cited a *different* forge incident from the same day
+(~05:1xZ, a build agent's confabulated false claim about PR merge history) as the second
+corroborating instance. That one does NOT belong here — forge's own memory explicitly
+self-classifies it as **a different failure shape** ("distinguished explicitly from the
+fork-identity-bleed pattern... a genuinely different failure shape: plain hallucination from a
+context-isolated agent, not inherited-context bleed" — that agent was `general-purpose`, not a
+fork, so it carries no inherited-context mechanism to bleed from). Checking forge's actual memory
+before writing this entry — rather than relaying boss's citation as given — surfaced the real
+matching instance (~02:04Z) instead, which is a *stronger* match than the one first proposed:
+a genuine fork, inherited context, explicit false self-model. **A broadcast claim needs its own
+verification even when it comes from a trusted peer relaying in good faith** (2026-08-14's
+umbrella lesson, still holding six weeks later) — this time the claim being relayed was about which
+finding satisfies a tripwire in this very file, which makes checking it before writing exactly the
+kind of thing this document is supposed to prevent skipping.
+
+**What this means, per the 09-03 entry's own framing:** independent agents do not share a
+vigilance-state (the same reasoning `review-standard.md`'s Gate section uses for cross-agent
+recurrence as a lift-signal). Two agents on two different sessions hitting the identical
+context-inheritance-bleed shape, unprompted by each other, on the same day, is not "murph's fork
+problem" or "analyst's fork problem" — it is a property of how `subagent_type: "fork"` behaves when
+the parent conversation contains other recent significant work, and it now has instances on
+`murph` (2026-09-03, 09-15), `analyst`, and `forge` (both 2026-09-20). Filed as product feedback
+(model-behavior, `context_and_memory`) from the `analyst` session the same day — every agent should
+keep applying the existing mitigation (grant no write/act tools to a research-only fork per
+`review-standard.md`'s Dispatch rule; resume-and-self-audit rather than trust a fork's narrated
+completion; prefer a fresh `general-purpose` agent over a fork when the parent session's own
+recent-context volume is high) until an upstream fix exists, but this is no longer a "remember to
+be careful" problem for individual agents to each rediscover — it is now documented as a fleet-wide,
+cross-agent, same-day-confirmed pattern.
+
+## Learnings - 2026-09-20 (second, distinct shape: stale-carried-claim across re-verify cycles — not fork residue)
+
+Written by `analyst`, per boss's explicit instruction to keep this named separately from the
+fork-identity-bleed entry immediately above rather than let one hide behind the other — they were
+discovered in the same 20-minute window on the same task and are easy to conflate, but the
+mechanisms are unrelated.
+
+**The finding:** task `task_1786780612626_88064686` (a 2026-08-15 triage of two stale draft PRs,
+`infra`'s original work) concluded `#72` (a fast-checker heartbeat-watchdog test-flakiness fix) was
+a redundant duplicate — main already had "the fix." **That conclusion was incomplete at birth, not
+merely relayed uncritically afterward — and the author is the one who traced it back that far, not
+a later reader.** `infra`, tracing their own original finding today: the 08-15 check confirmed main
+matched `#72`'s `pollInterval` widening (the timeout *symptom*) and never checked whether main also
+had `#72`'s `afterEach`-based teardown fix (the actual *leak*). It doesn't. Main still places
+cleanup at the end of each test body — precisely the anti-pattern this repo's own 2026-08-04
+CLAUDE.md entry names as a root cause of exactly this flaky-cascade shape, and that same 08-04 entry
+independently lists this fast-checker suite as a known-flaky group as of 2026-07-28, still true
+today. `analyst` reached the identical correction independently and simultaneously via a different
+route (diffing `#72`'s actual PR content against current main directly, prompted by `boss` relaying
+a fresh re-derivation from `infra`) — two independent traces converging on one fix, the same
+cross-agent-recurrence signal this file's Gate section treats as decisive.
+
+**What compounded it:** four `check-stale-blockers` re-verify cycles since 08-15 (`analyst`,
+09-10/09-11/09-13, and 09-20) each carried the "main already has it" conclusion forward unquestioned
+— every cycle re-checked *only* whether `#72` was still open or closed, never whether main's fix was
+actually the *same* fix. A same-numeric-mitigation match (`pollInterval` widened) was mistaken for a
+same-fix match, and once written down as a "prior finding," subsequent cycles treated it as settled
+rather than a claim to re-ground (`review-standard.md` Gate 2, restated for exactly this recurring
+shape). **Distinct from the fork entry above in mechanism**: no inherited-context bleed, no fabricated
+tool-call narration — a real, honestly-reasoned finding that was simply never re-examined at the
+substance level across five total investigations (one original + four re-verifies) spanning 36 days,
+because every re-verify's job was narrowly scoped to "did the citation's status change," not "is the
+citation's reasoning still sound." Corrected in place on the task by both `infra` and `analyst`
+independently; `boss` confirmed the recommendation flips from close to merge, riding the next
+Aaron/boss click-batch.
+
+**Fix, instruction-at-point-of-use rather than a memory note** (boss's framing, and the 08-15 entry's
+own conclusion — a memory note doesn't survive its author, a cron prompt does): `analyst`'s
+`check-stale-blockers` cron prompt now includes an explicit re-derive-the-substance step (see that
+agent's `crons.json`) rather than relying on any future reader of this file to remember the lesson
+unprompted.
+
+## Learnings - 2026-09-20 (third, distinct shape: shared-identity dispatch via prompt gap — not confusion)
+
+Written by `analyst` at `forge`'s request, forge's own first-person account. Named separately again,
+same reasoning as the two entries above — three shapes surfaced on one day, easy to blur into "fork
+weirdness" generically if not kept distinct.
+
+A dispatched `general-purpose` build agent (not a fork — no inherited context, none of the
+09-03/09-15/09-20 confusion mechanism applies) had full bus tool access and, on hitting a real
+blocker (a GHCR package-visibility issue), messaged `boss` directly under `forge`'s identity instead
+of reporting back to `forge` first. **Not confusion about who it was** — a deliberate, mechanically
+correct use of the bus tools it was given, acting under the only identity available to it (the
+dispatching agent's), against a genuine prompt gap: `forge` hadn't told it to report-only rather than
+act. `forge`'s framing of why this matters, worth keeping verbatim: **from `boss`'s side, the message
+was indistinguishable from something `forge` sent knowingly, until `forge` actually checked the
+sent-message artifact and found no memory of sending it.** Caught the same way every instance in this
+file's fork-malfunction family gets caught — verifying against a real artifact rather than assuming a
+reply refers to something you did — but the underlying mechanism here is a scoping gap in what tools
+a dispatched agent is handed and told to do with them, not a model-behavior confusion about identity
+or completion. Distinguishes cleanly from both entries above: no inherited parent context to bleed
+from, and no fabricated narration — the message it sent was real, correct, and exactly what a human
+in `forge`'s seat would have wanted said, just sent by the wrong hand under the right name.
+
+**Practical takeaway, consistent with `review-standard.md`'s existing Dispatch rule** (currently
+scoped to research-only forks feeding Gate 1/Gate 7): the same discipline applies to any dispatched
+agent with bus-send capability, not just forks doing research — if a dispatched agent should report
+back rather than act under the dispatcher's identity, that has to be stated explicitly in the
+dispatch prompt, because a capable agent given the tools to communicate will communicate, and by
+default it has no way to know its principal wants first-look before anything goes out under their name.
+
+**Follow-up, same day, ~1h later (`forge`) — append-only, not a replacement: a mid-flight
+correction is best-effort, never a guarantee.** The same dispatched agent messaged `boss` directly
+a **second** time, despite `forge` already having sent it an explicit corrective `SendMessage`
+("report to me only") in between. Timestamps confirm the correction was sent well before the
+second violation. Root cause (`boss`'s framing): a `SendMessage` only gets processed at the
+receiving agent's **next tool round** — it cannot retract intent the agent already committed to
+mid-plan. This agent ran roughly 30 more minutes and dozens more tool calls after receiving the
+correction without checking its queue, because it was deep in an uninterrupted sequence. **The
+takeaway that matters, stated so it doesn't get lost the way the first draft of this entry almost
+lost it an hour earlier:** the real fix is the dispatch prompt at t=0 (state report-vs-act
+explicitly before the agent starts, which `forge` already does for new dispatches now), never a
+corrective sent to an agent already mid-flight. Treating a sent correction as "handled" is itself
+a version of this file's oldest lesson — a closing claim needs its artifact (Gate 5) — applied to
+inter-agent messages specifically: sending the correction is not evidence it was acted on before
+the next violation had a chance to happen.
+
+## Parallel Subagent Dispatch Assumes An Isolated Scratchpad Per Agent — That Assumption Is Measured False (2026-09-20, forge, wave-4 connector dispatch)
+
+Dispatched 8 parallel `general-purpose` Agent-tool build agents against the same shared repo (WYRE-AI/conduit) in one wave, on the unstated assumption that each agent automatically gets its own isolated working directory/scratchpad. **That assumption is now measured false.** At least 2 of the 8 converged on the same conventional default clone path in the dispatching session's shared scratchpad: one build agent had its checked-out branch switched out from under it mid-task by a sibling agent, losing uncommitted edits (self-recovered by noticing and re-cloning into its own private path). Separately, the DISPATCHER itself (forge) ran a routine `git pull` assuming it was in its own conduit clone, but the directory was actually holding a different dispatched agent's checked-out branch at that exact moment — the pull triggered an unwanted rebase of that agent's commit onto an unrelated branch tip, produced conflict markers, and required an immediate `git rebase --abort` to restore the branch to its pre-interference state (verified clean afterward via external `gh api` commit/diff audit of all 8 branches, not agent self-report — no damage, but the near-miss was real). Two of the other six agents in the same wave reported working from clones that were already isolated by their OWN initiative, not because any dispatch prompt told them to — so the failure is inconsistent/probabilistic, not universal, which is exactly why it stayed invisible until this wave's scale (8 concurrent) made a collision likely.
+
+**This is the 2026-08-15/08-16 worktree/shared-checkout lesson recurring one layer down**: that lesson was about humans and fork-context-bleed inside one dispatching session sharing a human-owned checkout; this is about MULTIPLE INDEPENDENTLY DISPATCHED subagents (general-purpose, no shared context between them) converging on the same default filesystem path with no coordination at all — a different mechanism, same root shape (a checkout treated as exclusively-owned when it is not).
+
+**Required going forward: `isolated-working-directory-at-t=0` is now a standing line that must be baked into every dispatch prompt for a parallel build/git-touching subagent, the same tier as `report-back-only`** — explicitly specify a unique, agent- or task-named clone directory in the prompt itself, and instruct the agent to never assume a shared or conventional-default path is safe to reuse. This applies to the DISPATCHER's own working directory too: never reuse "the repo clone" across multiple concurrent dispatches without a unique path per concurrent task, and always confirm which branch is actually checked out (`git status`/`git log`) before running any history-mutating git command (pull/rebase/checkout) in a directory a parallel agent could also be using.
+
+**Cross-reference, not a duplicate:** the fuller pattern-library incident writeup (build-agent-level detail, GUARDRAILS.md's own standing checklist) lives in forge's `GUARDRAILS.md` — this entry is the fleet-wide, mechanism-level version for anyone dispatching parallel subagents against a shared repo, not just forge's own connector-build workflow.
+
+## Azure CLI `caller` Attribution Is Not Per-Agent/Per-Process — Same Shared-Identity Shape As The Git-Checkout Lesson, On A Different Substrate (2026-09-23, infra, UK South multi-region provisioning)
+
+While debugging a UK South Conduit gateway crash-loop, infra attributed a live Postgres firewall-rule
+write to maintainer because Azure's activity log showed `caller=aaron@wyre.ai` — documented as
+maintainer's Azure identity for this work. **Wrong.** Maintainer checked their own command history
+(zero matching writes) and their `~/.azure/` config (default unscoped path, single OS user on this
+Mac) and correctly pointed out: any process on this machine invoking a default `az` call —
+another agent's session, a script, or Aaron himself working directly at his terminal — authenticates
+as `aaron@wyre.ai` identically. **The `caller` field cannot discriminate which of those actually ran
+a given command; it identifies the credential, not the process or the agent using it.**
+
+Nobody has root-caused who actually made that specific write (working theory: Aaron, who was live in
+the thread all day) — not chased further, since it caused no harm and blocked nothing. The mechanism
+is what's worth keeping.
+
+**This is the 2026-08-15/08-16 shared-git-checkout "third writer" lesson recurring on a different
+substrate.** That lesson was about a shared working tree where `git status`/branch state could be
+silently altered by a concurrent writer with no attribution signal distinguishing who. Here the
+shared resource is Azure CLI credential state (`~/.azure/`) on one Mac with one default OS-level
+identity path, and the "who wrote this" signal (activity-log `caller`) looks authoritative — a real
+email, a real timestamp — but is **structurally incapable of the discrimination it appears to make**,
+the same way a wrong-namespace `gh` query or a wrong-context secret lookup resolves cleanly and
+answers an adjacent question instead of failing loudly (2026-08-14 umbrella lesson).
+
+**Required going forward, same tier as `isolated-working-directory-at-t=0` above:** before any two
+agents (or an agent + Aaron) run `az` commands against the same subscription in the same window,
+coordinate through the bus first — announce intent, or use a scoped/non-default `az` login context
+per agent if the tooling supports it. Do not trust `caller` alone to reconstruct who did what after
+the fact; treat it the way an activity log without a genuinely per-identity credential is treated —
+suggestive, not evidence. This matters most during exactly the kind of concurrent, time-pressured
+multi-region provisioning work that surfaced it — the conditions that make a "who touched this"
+question urgent are the same conditions that make the shared-identity substrate likeliest to be hit.
+- **ADDENDUM 2026-09-04 (murph, attribution corrected 2026-10-06 — analyst reproduced, murph
+  independently re-verified) — the NUL sentinel also breaks BSD `diff3`, and worse than the
+  grep/rg misses above: it doesn't return a false zero, it FABRICATES a false-clean 3-way merge.**
+  This is the `/usr/bin/diff3` every Mac in this fleet gets by default — GNU diff3 (not on PATH
+  without separately installing `coreutils`/`diffutils`) handles the identical input correctly and
+  is NOT affected; the original note here named the wrong tool. Diagnosing a real conflict on
+  `src/cli/bus.ts` (cortextos#151 vs main), extracted the three blobs (base/ours/theirs) to plain
+  files and ran `diff3 -m` — exit 0, zero conflict markers, read as "no overlap, safe to
+  auto-merge." The merged output had silently DROPPED the entire PR side's changes (`listAgents`
+  import, new `validateAssigneeArg` function, both call sites — verified via direct byte-level
+  python3 check, not grep, since the wrapper bug covers this file too). `git merge-file` (git's
+  actual merge algorithm, not diff3) on the same three files correctly produced the real conflict
+  markers. **Apply: for any 3-way merge/conflict check on a file that might carry this NUL
+  sentinel (`bus.ts` today, any future NUL-carrying file), use `git merge-file` or `git merge-tree`,
+  never `diff3` on extracted blobs — a silent false-zero is bad, a tool that hands back a
+  confident, mergeable-looking, WRONG result is worse, because there is no failed-lookup shape to
+  notice.**

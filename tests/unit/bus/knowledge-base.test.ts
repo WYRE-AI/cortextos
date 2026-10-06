@@ -8,6 +8,7 @@ const fsMocks = {
   existsSync: vi.fn(),
   readFileSync: vi.fn(),
   mkdirSync: vi.fn(),
+  statSync: vi.fn(),
 };
 
 vi.mock('fs', async () => {
@@ -17,6 +18,7 @@ vi.mock('fs', async () => {
     existsSync: (...args: Parameters<typeof fsMocks.existsSync>) => fsMocks.existsSync(...args),
     readFileSync: (...args: Parameters<typeof fsMocks.readFileSync>) => fsMocks.readFileSync(...args),
     mkdirSync: (...args: Parameters<typeof fsMocks.mkdirSync>) => fsMocks.mkdirSync(...args),
+    statSync: (...args: Parameters<typeof fsMocks.statSync>) => fsMocks.statSync(...args),
   };
 });
 
@@ -75,6 +77,7 @@ beforeEach(() => {
   fsMocks.existsSync.mockReset();
   fsMocks.readFileSync.mockReset().mockReturnValue('');
   fsMocks.mkdirSync.mockReset();
+  fsMocks.statSync.mockReset().mockReturnValue({ size: 0 } as any);
   execFileSyncMock.mockReset();
 
   warnLog = [];
@@ -167,6 +170,97 @@ describe('ingestKnowledgeBase — scope requires no default', () => {
     ).toThrow(/Invalid scope/i);
 
     expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('ingestKnowledgeBase — timeout sizing (task_1787849190389_13577787)', () => {
+  const originalEnv = process.env.KB_INGEST_TIMEOUT_MS;
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.KB_INGEST_TIMEOUT_MS;
+    else process.env.KB_INGEST_TIMEOUT_MS = originalEnv;
+  });
+
+  function getTimeoutArg(): number {
+    const call = execFileSyncMock.mock.calls[0] as [string, string[], { timeout: number }];
+    return call[2].timeout;
+  }
+
+  it('small input: default stays at the existing 600s floor', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    fsMocks.statSync.mockReturnValue({ size: 1_000 } as any); // tiny file
+
+    ingestKnowledgeBase(['/some/file.md'], ingestBaseOptions);
+
+    expect(getTimeoutArg()).toBe(600_000);
+  });
+
+  it('large input: default scales up past 600s (1.5ms/byte, no override set)', () => {
+    delete process.env.KB_INGEST_TIMEOUT_MS;
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    // ~550KB, in line with a real long-lived agent's MEMORY.md.
+    fsMocks.statSync.mockReturnValue({ size: 550_000 } as any);
+
+    ingestKnowledgeBase(['/some/file.md'], ingestBaseOptions);
+
+    // 550_000 * 1.5 = 825_000ms — comfortably above the 600s flat default
+    // that used to ETIMEDOUT on files this size, and well under the 1h cap.
+    expect(getTimeoutArg()).toBe(825_000);
+  });
+
+  it('huge input: scaled default is capped at 1 hour, does not grow unbounded', () => {
+    delete process.env.KB_INGEST_TIMEOUT_MS;
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    fsMocks.statSync.mockReturnValue({ size: 10_000_000 } as any); // 10MB
+
+    ingestKnowledgeBase(['/some/file.md'], ingestBaseOptions);
+
+    expect(getTimeoutArg()).toBe(3_600_000);
+  });
+
+  it('KB_INGEST_TIMEOUT_MS override still wins outright, regardless of input size', () => {
+    process.env.KB_INGEST_TIMEOUT_MS = '120000';
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    fsMocks.statSync.mockReturnValue({ size: 10_000_000 } as any); // would otherwise cap at 1h
+
+    ingestKnowledgeBase(['/some/file.md'], ingestBaseOptions);
+
+    expect(getTimeoutArg()).toBe(120_000);
+  });
+
+  it('unreadable/missing path is skipped for sizing, not fatal', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    fsMocks.statSync.mockImplementation(() => {
+      throw new Error('ENOENT: no such file or directory');
+    });
+
+    expect(() =>
+      ingestKnowledgeBase(['/does/not/exist.md'], ingestBaseOptions),
+    ).not.toThrow();
+    // Size contribution is 0 for the unstatable path, so default floor applies.
+    expect(getTimeoutArg()).toBe(600_000);
+  });
+
+  it('multiple input paths: sizes sum for the scaling calculation', () => {
+    delete process.env.KB_INGEST_TIMEOUT_MS;
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    fsMocks.statSync.mockImplementation((p: any) => {
+      const sizes: Record<string, number> = {
+        '/a.md': 300_000,
+        '/b.md': 250_000,
+      };
+      return { size: sizes[String(p)] ?? 0 } as any;
+    });
+
+    ingestKnowledgeBase(['/a.md', '/b.md'], ingestBaseOptions);
+
+    // (300_000 + 250_000) * 1.5 = 825_000ms
+    expect(getTimeoutArg()).toBe(825_000);
   });
 });
 

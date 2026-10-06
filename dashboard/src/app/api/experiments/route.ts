@@ -20,6 +20,7 @@ interface Experiment {
   status: string;
   baseline_value: number;
   result_value: number | null;
+  score?: number | null;
   decision: string | null;
   changes_description?: string | null;
   learning: string | null;
@@ -82,6 +83,55 @@ function isIntervention(e: Experiment): boolean {
   return e.kind !== 'snapshot';
 }
 
+// The baseline a completed experiment's derived views should display —
+// mirrors displayBaseline() in src/bus/experiment.ts (duplicated rather than
+// imported: this route already keeps its own local Experiment type instead
+// of importing the root src/bus one, matching the dashboard's existing
+// pattern for daemon-side types, e.g. dashboard/src/lib/cron-utils.ts).
+// Recomputed live from decision/score/result_value rather than trusting a
+// stored value, so a decision correction (correct-experiment-decision /
+// evaluate-experiment --decision) is reflected without a separate patch.
+function displayBaseline(experiment: Experiment): number | null {
+  if (experiment.decision === null || experiment.result_value === null || experiment.baseline_value === null) {
+    return experiment.baseline_value;
+  }
+  const effectiveValue = experiment.score ?? experiment.result_value;
+  return experiment.decision === 'keep' ? effectiveValue : experiment.baseline_value;
+}
+
+// Regenerate the learnings.md markdown from live experiment records rather
+// than reading the static, append-only learnings.md file — that file is
+// never rewritten when a completed record's decision is corrected after the
+// fact (task_1789437846265_69785154's --decision override and
+// correct-experiment-decision command), so reading it directly here would
+// silently keep showing a pre-correction decision on the dashboard even
+// after the underlying JSON record was fixed. Mirrors formatLearnings() in
+// src/bus/experiment.ts (see the displayBaseline comment above for why this
+// is a local copy, not an import).
+function formatLearningsLive(completed: Experiment[]): string {
+  if (completed.length === 0) return '';
+  const rows = [...completed].sort(
+    (a, b) => new Date(a.completed_at ?? 0).getTime() - new Date(b.completed_at ?? 0).getTime(),
+  );
+  const entries = rows.map((exp) => {
+    const resultLine =
+      exp.score != null
+        ? `- **Result:** score ${exp.score} (measured_value: ${exp.result_value}, baseline: ${displayBaseline(exp)})`
+        : `- **Result:** ${exp.result_value} (baseline: ${displayBaseline(exp)})`;
+    return [
+      `## ${exp.id} (${exp.decision})`,
+      `- **Metric:** ${exp.metric}`,
+      `- **Hypothesis:** ${exp.hypothesis}`,
+      resultLine,
+      exp.learning ? `- **Learning:** ${exp.learning}` : '',
+      '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+  });
+  return '# Experiment Learnings\n\n' + entries.join('\n') + '\n';
+}
+
 function scanExperiments(filterKind?: 'intervention' | 'snapshot'): AgentExperiments[] {
   const frameworkRoot = getFrameworkRoot();
   const orgsDir = path.join(frameworkRoot, 'orgs');
@@ -136,12 +186,12 @@ function scanExperiments(filterKind?: 'intervention' | 'snapshot'): AgentExperim
           new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
       );
 
-      // Read learnings
-      let learnings = '';
-      const learningsPath = path.join(expDir, 'learnings.md');
-      if (fs.existsSync(learningsPath)) {
-        learnings = fs.readFileSync(learningsPath, 'utf-8');
-      }
+      // Regenerated live from `experiments` (see formatLearningsLive) rather
+      // than read from the static learnings.md file, so a decision
+      // correction shows up here without a separate propagation step.
+      const learnings = formatLearningsLive(
+        experiments.filter((e) => e.status === 'completed'),
+      );
 
       // Calculate stats
       const total = experiments.length;

@@ -2,7 +2,8 @@ import { execSync } from 'child_process';
 import { existsSync, readFileSync, readdirSync, appendFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { ensureDir } from '../utils/atomic.js';
-import { TelegramAPI } from '../telegram/api.js';
+import { parseEnvFile } from '../utils/env.js';
+import { SlackAPI } from '../slack/api.js';
 import type { BusPaths, TaskStatus } from '../types/index.js';
 import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -234,6 +235,33 @@ export interface StaleBlockerReport {
 // structured field.
 const PR_REFERENCE_REGEX = /\bPR\s*#\s*(\d+)\b/gi;
 
+// task_1788535091729: a bare "PR #NN" is unverifiable (task_1786068529924's
+// own research: no structured field names which repo it belongs to). A full
+// github.com/<owner>/<repo>/pull/<n> URL for the SAME number is the opposite
+// case — it names the repo explicitly, so there's nothing left to verify.
+// Two recurring false-positive shapes this fixes: (1) a task cites a PR only
+// as a full URL (never as bare "PR #N") — previously invisible to the
+// extraction regex entirely, so recognized here in its own right; (2) a task
+// cites the SAME PR both ways ("blocked on PR #172... see
+// https://github.com/WYRE-AI/cortextos/pull/172 for status") — the bare
+// mention re-flagged every scan even though the adjacent URL already
+// resolved it (confirmed live: task_1788446092100_21920670 / #170,
+// task_1788464546954_33593143 / #172, both with the full URL and a correct
+// blocked_by-Aaron's-click status already on record, re-flagged anyway).
+//
+// Deliberately matches ANYWHERE in the text, not proximity-windowed like
+// isPrecedentCitation/isDismissedElsewhere — those two are about judging
+// whether a mention is a genuine blocker vs. an example/dismissal, which is
+// proximity-sensitive prose disambiguation. This is just "does the task
+// record independently name which repo PR #N belongs to," which a URL
+// anywhere in the same text answers regardless of distance from the bare
+// mention.
+const GITHUB_PR_URL_REGEX = /\bgithub\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)\b/gi;
+
+function extractUrlResolvedPrNumbers(text: string): Set<string> {
+  return new Set([...text.matchAll(GITHUB_PR_URL_REGEX)].map(m => m[1]));
+}
+
 // task_1786548092193 (analyst/forge, 2026-08-12 first live run): the bare
 // regex above matches ANY "PR #NN" mention, including precedent-citation
 // prose ("...same shape as the action1 precedent, PR #306...") that isn't
@@ -249,11 +277,23 @@ const PR_REFERENCE_REGEX = /\bPR\s*#\s*(\d+)\b/gi;
 // narrow and nameable (precedent/example citation), so exclude it
 // specifically rather than narrowing the whole match surface.
 //
+// Widened 2026-08-22 (analyst, task_1786902033624 — a check-stale-blockers
+// sweep flagged the same false positive TWICE, two days apart, both times
+// resolved by the same peer): a genuinely real, correctly-cited PR can still
+// be a false positive if it's cited as the SOURCE OF A SUPPORTING FACT
+// ("documented in-code by conduit PR #1424 as 13 verified against prod")
+// rather than as the thing that resolves the blocker. This is a distinct
+// shape from precedent-citation (that class isn't naming a blocker at all;
+// this class names a real, relevant PR, just not as *the fix*) — added as a
+// second cue category on the same exclude-list mechanism rather than new
+// persisted state, since the failure mode (a citation-shape phrase near the
+// reference) and the fix (widen the window check) are identical in kind.
+//
 // No trailing \b: several cues end in a non-word char ("e.g."), and \b only
 // holds at a word/non-word transition — a trailing \b after "e.g." silently
 // never matches, since both the "." and the space after it are non-word.
 const PRECEDENT_CITATION_CUE_REGEX =
-  /\b(same (shape|pattern|approach|idiom) as|see .{0,10}for (the )?pattern|per the .{0,40}precedent|precedent|e\.g\.|for example|prior art)/i;
+  /\b(same (shape|pattern|approach|idiom) as|see .{0,10}for (the )?pattern|per the .{0,40}precedent|precedent|e\.g\.|for example|prior art|documented (in-code )?by|verified against|sourced from|per .{0,40}('s)? own (data|finding|number|stat))/i;
 
 // Some cues fully precede the reference ("same shape as ... PR #306"); one
 // straddles it ("see PR #12 for the pattern" — the reference sits INSIDE the
@@ -470,6 +510,7 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
       }
 
       const text = `${task.title} ${task.description}`;
+      const urlResolvedPrNumbers = extractUrlResolvedPrNumbers(text);
       // matchAll yields matches left-to-right; previousMatchEnd tracks the
       // prior match's end so each mention's precedent-cue window can be
       // clamped against it (see isPrecedentCitation's doc comment).
@@ -477,7 +518,10 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
       const keptRefs: string[] = [];
       for (const m of text.matchAll(PR_REFERENCE_REGEX)) {
         const matchIndex = m.index ?? 0;
-        if (!isPrecedentCitation(text, matchIndex, m[0].length, previousMatchEnd)) {
+        if (
+          !urlResolvedPrNumbers.has(m[1]) &&
+          !isPrecedentCitation(text, matchIndex, m[0].length, previousMatchEnd)
+        ) {
           keptRefs.push(`PR #${m[1]}`);
         }
         previousMatchEnd = matchIndex + m[0].length;
@@ -727,71 +771,72 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
 }
 
 /**
- * Post a message to the org's Telegram activity channel.
+ * Post a message to the org's Slack activity channel.
  *
  * Returns false if not configured (silent fail — callers can ignore the
  * return value and treat activity-channel posting as best-effort).
  *
- * `replyMarkup` is an optional Telegram inline keyboard (or any reply
- * markup shape). When provided, the message ships with the keyboard
- * attached — used for interactive workflows like approval Approve/Deny
- * buttons posted alongside approval creation. Leaving it undefined
- * preserves the prior one-way notification shape exactly.
+ * Migrated 2026-09-08 from Telegram to Slack: `activity-channel.env` now
+ * carries only `ACTIVITY_SLACK_CHANNEL_ID`; the bot token lives in the
+ * org's `secrets.env` as `SLACK_BOT_TOKEN` (shared with the daemon's
+ * Socket Mode connection), not in activity-channel.env itself.
+ *
+ * `replyMarkup` (the historical Telegram inline-keyboard shape, e.g.
+ * approval Approve/Deny buttons) is accepted for backward compatibility
+ * with existing callers but is intentionally NOT rendered as Slack Block
+ * Kit — there is no Slack interactive-callback handler wired up yet for
+ * `appr_allow_*`/`appr_deny_*` actions, so a translated button would look
+ * clickable and silently do nothing. Callers already include the
+ * approval/experiment id in the message body as plain text so an operator
+ * can act via `cortextos bus update-approval <id> approved|rejected` or
+ * the dashboard. Real interactive Slack buttons are a separate, larger
+ * follow-up (Socket Mode block_actions handling), not done here.
  *
  * Mirrors bash bus/post-activity.sh.
  */
+/** First candidate path that exists on disk, or null if none do. */
+function findFirstExisting(candidates: string[]): string | null {
+  return candidates.find(existsSync) ?? null;
+}
+
+/**
+ * Read `key` out of the first candidate env file that exists. `parseEnvFile`
+ * never throws (it swallows read errors and returns `{}`), so there is
+ * nothing to catch here — a missing file or missing key both fall through
+ * to `undefined`.
+ */
+function findConfigValue(candidates: string[], key: string): string | undefined {
+  const path = findFirstExisting(candidates);
+  return path ? parseEnvFile(path)[key] : undefined;
+}
+
 export async function postActivity(
   orgDir: string,
   ctxRoot: string,
   org: string,
   message: string,
-  replyMarkup?: object,
+  _replyMarkup?: object,
 ): Promise<boolean> {
-  // Look for activity-channel.env
-  const candidates = [
-    join(orgDir, 'activity-channel.env'),
-    join(ctxRoot, 'orgs', org, 'activity-channel.env'),
-  ];
-
-  let configPath: string | null = null;
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      configPath = candidate;
-      break;
-    }
-  }
-
-  if (!configPath) {
+  const channelId = findConfigValue(
+    [join(orgDir, 'activity-channel.env'), join(ctxRoot, 'orgs', org, 'activity-channel.env')],
+    'ACTIVITY_SLACK_CHANNEL_ID',
+  );
+  if (!channelId) {
     return false;
   }
 
-  // Parse the env file
-  let botToken: string | undefined;
-  let chatId: string | undefined;
-
-  try {
-    const content = readFileSync(configPath, 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx <= 0) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const value = trimmed.slice(eqIdx + 1).trim();
-      if (key === 'ACTIVITY_BOT_TOKEN') botToken = value;
-      if (key === 'ACTIVITY_CHAT_ID') chatId = value;
-    }
-  } catch {
-    return false;
-  }
-
-  if (!botToken || !chatId) {
+  // SLACK_BOT_TOKEN lives in the org's secrets.env, not activity-channel.env.
+  const botToken = findConfigValue(
+    [join(orgDir, 'secrets.env'), join(ctxRoot, 'orgs', org, 'secrets.env')],
+    'SLACK_BOT_TOKEN',
+  );
+  if (!botToken) {
     return false;
   }
 
   try {
-    const api = new TelegramAPI(botToken);
-    await api.sendMessage(chatId, message, replyMarkup);
+    const api = new SlackAPI(botToken);
+    await api.postMessage({ channel: channelId, text: message });
     return true;
   } catch {
     return false;
@@ -806,14 +851,14 @@ export interface BusBroadcastResult {
 }
 
 /**
- * Bus-native activity broadcast — the fallback used when no Telegram
+ * Bus-native activity broadcast — the fallback used when no Slack
  * activity channel is configured (activity-channel.env absent). Fans the
  * message out as a normal-priority inbox message to every enabled agent in
  * the sender's org except the sender itself.
  *
- * Telegram-independent by design: a fleet can contain bus-only agents (no
- * BOT_TOKEN at all), and fleet-wide broadcast must not depend on a Telegram
- * chat id existing anywhere.
+ * Slack-independent by design: a fleet can contain bus-only agents (no
+ * SLACK_BOT_TOKEN at all), and fleet-wide broadcast must not depend on a
+ * Slack channel id existing anywhere.
  */
 export function broadcastActivityViaBus(
   frameworkRoot: string,

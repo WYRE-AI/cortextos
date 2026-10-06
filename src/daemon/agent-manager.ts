@@ -8,6 +8,7 @@ import { CronScheduler } from './cron-scheduler.js';
 import { ReminderScheduler } from './reminder-scheduler.js';
 import { migrateCronsForAgent } from './cron-migration.js';
 import type { CronDefinition } from '../types/index.js';
+import { runCronAction } from './cron-actions.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
 import { SlackAPI } from '../slack/api.js';
@@ -159,7 +160,7 @@ export class AgentManager {
         frameworkRoot: this.frameworkRoot,
         org: env.org,
         preflight: preflightAccount,
-        restartAgent: (name) => this.restartAgent(name),
+        restartAgent: (name, reason) => this.restartAgent(name, reason),
         sendAlert: (text) => {
           const handle = this.alertHandle;
           if (handle) handle.api.sendMessage(handle.chatId, text).catch(() => {});
@@ -1180,11 +1181,19 @@ export class AgentManager {
    *
    * agentDir is auto-discovered by startAgent() from frameworkRoot/orgs/{org}/agents/{name}.
    * Participates in the pendingRestarts race protection used by restart-all.
+   *
+   * Writes a `.restart-planned` marker before stopping, same reasoning and
+   * same marker as stopAll()'s `.daemon-stop` (and src/bus/system.ts's
+   * selfRestart/hardRestart): without it, hook-crash-alert.ts's SessionEnd
+   * hook finds no marker and defaults to a false 🚨 crash alarm for every
+   * rotation-triggered or manual/dashboard restart on this path. The marker
+   * type already exists and is handled by classifyFromMarkers() — this was
+   * the one writer missing, not a new marker to add.
    */
-  async restartAgent(name: string): Promise<void> {
+  async restartAgent(name: string, reason?: string): Promise<boolean> {
     if (!this.agents.has(name)) {
       console.log(`[agent-manager] Agent ${name} not found — cannot restart`);
-      return;
+      return false;
     }
 
     // Cross-path restart-in-flight lock (2026-07-13 storm fix): confirmed root
@@ -1198,10 +1207,18 @@ export class AgentManager {
     const lock = tryAcquireRestartLock(stateDir, 'manual-restart');
     if (!lock.acquired) {
       console.log(`[agent-manager] Restart SKIPPED for ${name} — ${lock.reason}`);
-      return;
+      return false;
     }
     try {
       console.log(`[agent-manager] Restarting ${name}`);
+      try {
+        mkdirSync(stateDir, { recursive: true });
+        writeFileSync(join(stateDir, '.restart-planned'), (reason || 'restartAgent (no reason given)') + '\n', 'utf-8');
+      } catch (err) {
+        // Don't block the restart on marker-write failure — worst case the
+        // user gets the false crash alarm this fix exists to prevent.
+        console.error(`[agent-manager] Failed to write .restart-planned marker for ${name}: ${err}`);
+      }
       await this.stopAgent(name);
       // Reset context_status.json so the fresh FastChecker this creates (startAgent
       // below) doesn't read the dying session's last-written, possibly still-high
@@ -1217,7 +1234,16 @@ export class AgentManager {
         );
       } catch { /* non-fatal */ }
       await this.startAgent(name, '');
-      console.log(`[agent-manager] Restart complete for ${name}`);
+      // start() catches spawn failures and resolves with status 'crashed'.
+      // A resolved restartAgent is therefore not evidence a PTY is running —
+      // rotation uses this boolean and must not treat the promise alone as
+      // confirmation. Lock no-ops and not-found return false above, before
+      // this read, so a still-running previous PTY is not mistaken for a
+      // PTY this call started.
+      const proc = this.agents.get(name)?.process as { getStatus?: () => { status?: string } } | undefined;
+      const running = proc?.getStatus?.()?.status === 'running';
+      console.log(`[agent-manager] Restart complete for ${name} (pty running: ${running})`);
+      return running;
     } finally {
       // Release once the new session has actually been started (unlike the
       // fast-checker.ts actuators, which release right after TRIGGERING an
@@ -1493,6 +1519,33 @@ export class AgentManager {
     const GOAL_INJECTION_GAP_MS = 2000;
 
     const onFire = async (cron: CronDefinition): Promise<void> => {
+      // Action crons bypass the agent entirely — no PTY injection, no model
+      // turn. Same fleet-wide credential as Slack's socket-mode client above
+      // (process.env, not per-agent .env — a shared GitHub App installation,
+      // not a per-agent secret). Throws straight through to fireWithRetry's
+      // existing retry/logging wrapper on any failure, including a missing
+      // credential — unlike Slack's silent-skip-when-unconfigured, a cron
+      // someone deliberately created that can't authenticate is a real
+      // failure, not an optional-feature no-op, so it should fail loudly.
+      if (cron.action) {
+        const appId = process.env.GITHUB_APP_ID;
+        const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
+        if (!appId || !privateKey) {
+          throw new Error(
+            `cron "${cron.name}" has an action but GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY ` +
+            `are not set in the daemon's environment`,
+          );
+        }
+        const result = await runCronAction(cron.action, { appId, privateKey });
+        // `conclusion: null` means still in_progress at the one poll
+        // runCronAction takes (common for a workflow slower than the poll
+        // delay — see CronActionResult.conclusion) — NOT a failure. Log it
+        // as such so this line doesn't read as a dangling/ambiguous result.
+        const conclusionLabel = result.conclusion ?? 'still running, check run_url';
+        console.log(`[daemon] cron "${cron.name}" dispatched: ${result.run_url} (${conclusionLabel})`);
+        return;
+      }
+
       const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
       // Salt with the fire timestamp so MessageDedup (which hashes the last 100
       // injects) does not reject identical cron prompts on subsequent fires.

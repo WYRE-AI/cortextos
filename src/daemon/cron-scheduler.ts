@@ -296,6 +296,18 @@ export function computeNextFireAt(cron: CronDefinition, referenceMs: number): nu
 
 const RETRY_DELAYS_MS = [1_000, 4_000, 16_000];
 
+/**
+ * Thrown by an onFire handler when retrying would be unsafe, e.g. a cron
+ * action whose side effect (a workflow dispatch) may already have happened.
+ * fireWithRetry logs it as a failure immediately instead of re-firing.
+ */
+export class NonRetryableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NonRetryableError';
+  }
+}
+
 async function fireWithRetry(
   cron: CronDefinition,
   agentName: string,
@@ -319,7 +331,7 @@ async function fireWithRetry(
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       const duration_ms = Date.now() - start;
-      if (attempt < RETRY_DELAYS_MS.length) {
+      if (attempt < RETRY_DELAYS_MS.length && !(err instanceof NonRetryableError)) {
         const delay = RETRY_DELAYS_MS[attempt];
         logger(
           `[cron-scheduler] onFire failed for "${cron.name}" ` +
@@ -337,7 +349,9 @@ async function fireWithRetry(
       } else {
         logger(
           `[cron-scheduler] onFire failed for "${cron.name}" ` +
-          `after all 4 attempts — giving up. Last error: ${errMsg}`
+          (err instanceof NonRetryableError
+            ? `with a non-retryable error (attempt ${attempt + 1}/4) — giving up: ${errMsg}`
+            : `after all 4 attempts — giving up. Last error: ${errMsg}`)
         );
         appendExecutionLog(agentName, {
           ts: new Date().toISOString(),
@@ -347,6 +361,7 @@ async function fireWithRetry(
           duration_ms,
           error: errMsg,
         });
+        return false;
       }
     }
   }

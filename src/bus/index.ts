@@ -17,6 +17,7 @@ export {
   createExperiment,
   runExperiment,
   evaluateExperiment,
+  closeExperiment,
   listExperiments,
   gatherContext,
   manageCycle,

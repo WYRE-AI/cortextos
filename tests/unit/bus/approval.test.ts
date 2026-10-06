@@ -394,14 +394,14 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
 });
 
 describe('updateApproval (regression guard for activity-channel callback path)', () => {
-  it('moves the approval file from pending/ to resolved/ with status+note', async () => {
-    // The handleActivityCallback path calls updateApproval with an audit
-    // note ("via Telegram activity channel by <user>"). This test
-    // regression-guards that updateApproval still produces the exact file
-    // shape (move + status + resolved_by note) that the rest of the
-    // system expects downstream.
+  it('moves the approval file from pending/ to resolved/ with resolver identity + note kept separate', async () => {
+    // The handleActivityCallback path calls updateApproval with the
+    // Telegram actor as the identity ("Alice (@alice)") and a short note
+    // ("via Telegram activity channel") — this test regression-guards that
+    // updateApproval keeps resolved_by (identity) and resolution_note
+    // (free text) as two distinct fields rather than collapsing them.
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Test resolve', 'deployment', undefined, frameworkRoot);
-    updateApproval(paths, id, 'approved', 'via Telegram activity channel by Alice (@alice)');
+    updateApproval(paths, id, 'approved', 'Alice (@alice)', 'via Telegram activity channel');
 
     const pendingFile = join(paths.approvalDir, 'pending', `${id}.json`);
     const resolvedFile = join(paths.approvalDir, 'resolved', `${id}.json`);
@@ -410,12 +410,13 @@ describe('updateApproval (regression guard for activity-channel callback path)',
 
     const approval = JSON.parse(readFileSync(resolvedFile, 'utf-8'));
     expect(approval.status).toBe('approved');
-    expect(approval.resolved_by).toBe('via Telegram activity channel by Alice (@alice)');
+    expect(approval.resolved_by).toBe('Alice (@alice)');
+    expect(approval.resolution_note).toBe('via Telegram activity channel');
     expect(approval.resolved_at).toBeTruthy();
   });
 
   it('throws a clear error when the approval id does not exist', () => {
-    expect(() => updateApproval(paths, 'approval_999_nope', 'approved')).toThrow(/not found/);
+    expect(() => updateApproval(paths, 'approval_999_nope', 'approved', 'boss')).toThrow(/not found/);
   });
 });
 
@@ -423,7 +424,7 @@ describe('listPendingApprovals', () => {
   it('returns only approvals still in pending/ (not resolved)', async () => {
     const id1 = await createApproval(paths, 'alice', 'TestOrg', 'Still pending', 'deployment', undefined, frameworkRoot);
     const id2 = await createApproval(paths, 'alice', 'TestOrg', 'Will be resolved', 'deployment', undefined, frameworkRoot);
-    updateApproval(paths, id2, 'approved');
+    updateApproval(paths, id2, 'approved', 'boss');
 
     const pending = listPendingApprovals(paths);
     expect(pending).toHaveLength(1);
@@ -445,26 +446,28 @@ describe('getApproval — point lookup across both buckets', () => {
     expect(found?.status).toBe('pending');
   });
 
-  it('finds an approval AFTER it is resolved, and carries the decision', async () => {
+  it('finds an approval AFTER it is resolved, and carries the decision plus identity/note split', async () => {
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Ship it', 'deployment', undefined, frameworkRoot);
-    updateApproval(paths, id, 'approved', 'approved by boss');
+    updateApproval(paths, id, 'approved', 'boss', 'approved per Aaron ok');
 
     // The exact lookup that was impossible before: the approval has left
     // pending/, and its outcome exists nowhere the CLI could reach.
     const found = getApproval(paths, id);
     expect(found?.id).toBe(id);
     expect(found?.status).toBe('approved');
-    expect(found?.resolved_by).toBe('approved by boss');
+    expect(found?.resolved_by).toBe('boss');
+    expect(found?.resolution_note).toBe('approved per Aaron ok');
     expect(found?.resolved_at).toBeTruthy();
   });
 
-  it('preserves a rejected decision too', async () => {
+  it('preserves a rejected decision too, identity and note kept distinct', async () => {
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Nope', 'deployment', undefined, frameworkRoot);
-    updateApproval(paths, id, 'rejected', 'denied — out of scope');
+    updateApproval(paths, id, 'rejected', 'boss', 'denied — out of scope');
 
     const found = getApproval(paths, id);
     expect(found?.status).toBe('rejected');
-    expect(found?.resolved_by).toBe('denied — out of scope');
+    expect(found?.resolved_by).toBe('boss');
+    expect(found?.resolution_note).toBe('denied — out of scope');
   });
 
   it('returns null ONLY when the id is in neither bucket', () => {
@@ -504,8 +507,8 @@ describe('listApprovals — both buckets, optional status filter', () => {
     const pendingId = await createApproval(paths, 'alice', 'TestOrg', 'Pending one', 'deployment', undefined, frameworkRoot);
     const approvedId = await createApproval(paths, 'alice', 'TestOrg', 'Approved one', 'deployment', undefined, frameworkRoot);
     const rejectedId = await createApproval(paths, 'alice', 'TestOrg', 'Rejected one', 'deployment', undefined, frameworkRoot);
-    updateApproval(paths, approvedId, 'approved');
-    updateApproval(paths, rejectedId, 'rejected');
+    updateApproval(paths, approvedId, 'approved', 'boss');
+    updateApproval(paths, rejectedId, 'rejected', 'boss');
 
     const ids = listApprovals(paths).map(a => a.id).sort();
     expect(ids).toEqual([pendingId, approvedId, rejectedId].sort());
@@ -515,8 +518,8 @@ describe('listApprovals — both buckets, optional status filter', () => {
     const pendingId = await createApproval(paths, 'alice', 'TestOrg', 'Pending one', 'deployment', undefined, frameworkRoot);
     const approvedId = await createApproval(paths, 'alice', 'TestOrg', 'Approved one', 'deployment', undefined, frameworkRoot);
     const rejectedId = await createApproval(paths, 'alice', 'TestOrg', 'Rejected one', 'deployment', undefined, frameworkRoot);
-    updateApproval(paths, approvedId, 'approved');
-    updateApproval(paths, rejectedId, 'rejected');
+    updateApproval(paths, approvedId, 'approved', 'boss');
+    updateApproval(paths, rejectedId, 'rejected', 'boss');
 
     expect(listApprovals(paths, 'pending').map(a => a.id)).toEqual([pendingId]);
     expect(listApprovals(paths, 'approved').map(a => a.id)).toEqual([approvedId]);

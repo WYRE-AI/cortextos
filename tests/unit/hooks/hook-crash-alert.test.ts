@@ -247,11 +247,27 @@ describe('classifyFromMarkers', () => {
     writeFileSync(join(tmp, '.user-stop'), 'stopped', 'utf-8');
     expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('planned-restart');
   });
+
+  it('.rotation-recovered marker classifies as rotation-recovered, not crash (task_1789351994840_86202746)', () => {
+    // Written by rotation-manager.ts before restarting a previously
+    // limit-blocked agent onto a newly-available account. Without this
+    // marker the restart falls through to the crash default (or gets
+    // misclassified rate-limited by the substring scan) and pages a false
+    // 🚨 CRASH alert for a healthy, expected daemon action.
+    // restartAgent() also writes .restart-planned on this path. The more
+    // specific marker has to win, which means it has to be listed first.
+    const rotationMarkers = [{ file: '.rotation-recovered', type: 'rotation-recovered' }, ...MARKERS];
+    writeFileSync(join(tmp, '.rotation-recovered'), 'rotation recovery: account "b" now active (retry for blocked agents)', 'utf-8');
+    writeFileSync(join(tmp, '.restart-planned'), 'oauth rotation -> account "b"', 'utf-8');
+    const r = classifyFromMarkers(tmp, rotationMarkers);
+    expect(r.endType).toBe('rotation-recovered');
+    expect(r.reason).toContain('account "b" now active');
+  });
 });
 
 describe('clearEndMarkers (via heartbeat)', () => {
   let tmp: string;
-  const ALL = ['.restart-planned', '.session-refresh', '.user-restart', '.user-stop', '.daemon-stop'];
+  const ALL = ['.restart-planned', '.session-refresh', '.user-restart', '.user-stop', '.daemon-stop', '.rotation-recovered'];
 
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), 'crashalert-clear-'));

@@ -1,5 +1,5 @@
 import { Command } from 'commander';
-import { SlackAPI, loadSlackIdentity, type PostMessageRequest } from '../slack/index.js';
+import { SlackAPI, loadSlackConfig, type PostMessageRequest } from '../slack/index.js';
 
 export interface TestSendOptions {
   frameworkRoot: string;
@@ -9,15 +9,40 @@ export interface TestSendOptions {
   text: string;
 }
 
-/** Pure function — testable without process exit. */
+/**
+ * Pure function — testable without process exit.
+ *
+ * `--as <agent>` (opts.agent) is a SELF-IDENTITY ASSERTION, not a source of
+ * posting identity (task_1790871245210_64848240's identity-gate hardening —
+ * see src/slack/api.ts's RUNTIME_AGENT_NAME docblock for the finding this
+ * closes). It is checked against the calling process's own CTX_AGENT_NAME
+ * and the send is REFUSED on a mismatch — fail closed, not a logged warning
+ * (this fleet's own "a refusing guard beats a warning one" rule, CLAUDE.md
+ * 2026-08-17) — because a mismatch here is exactly the shape of one agent
+ * trying to post under another's name. When CTX_AGENT_NAME is unset (a
+ * human operator running this CLI directly, outside any agent's process
+ * context) the check does not apply: there is no runtime identity to
+ * protect in that case, and the human already has the filesystem access
+ * this check would otherwise be guarding.
+ *
+ * The flag still requires the named agent to have a slack.json (same
+ * Slack-enabled check as before), but no longer reads display_name/icon
+ * fields from it — the actual posted username is always SlackAPI's own
+ * RUNTIME_AGENT_NAME, sourced from the process's own environment, never
+ * from a file.
+ */
 export async function runTestSend(opts: TestSendOptions, api: SlackAPI): Promise<void> {
   const req: PostMessageRequest = { channel: opts.channel, text: opts.text };
   if (opts.agent) {
-    const id = loadSlackIdentity(opts.frameworkRoot, opts.org, opts.agent);
-    if (!id) throw new Error(`agent "${opts.agent}" has no slack.json (not Slack-enabled)`);
-    req.username = id.username;
-    if (id.icon_emoji) req.icon_emoji = id.icon_emoji;
-    if (id.icon_url) req.icon_url = id.icon_url;
+    const runtimeAgent = process.env.CTX_AGENT_NAME?.trim();
+    if (runtimeAgent && runtimeAgent !== opts.agent) {
+      throw new Error(
+        `refusing to send --as "${opts.agent}": this process is running as "${runtimeAgent}". ` +
+          `An agent may only post under its own identity.`,
+      );
+    }
+    const cfg = loadSlackConfig(opts.frameworkRoot, opts.org, opts.agent);
+    if (!cfg) throw new Error(`agent "${opts.agent}" has no slack.json (not Slack-enabled)`);
   }
   await api.postMessage(req);
 }

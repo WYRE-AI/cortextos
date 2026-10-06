@@ -113,6 +113,7 @@ function statusBadge(status: string) {
     completed: { variant: 'outline', icon: <IconCheck size={12} /> },
     crashed: { variant: 'destructive', icon: <IconX size={12} /> },
     discarded: { variant: 'destructive', icon: <IconX size={12} /> },
+    closed: { variant: 'outline', icon: <IconX size={12} /> },
   };
   const s = map[status] ?? { variant: 'secondary' as const, icon: null };
   return (
