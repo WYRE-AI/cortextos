@@ -44,7 +44,19 @@ existing tests (`tests/unit/rotation-manager.test.ts:89-101`,
 `:153-206`) and via tonight's own incident (`pm2` log shows the identical halt
 message logged 34+ times over the 32h window — logged every time `doRotation`
 re-reaches the branch, but `sendAlert` only actually fires once per the
-`alertedHalt` gate, exactly as designed). **No code change needed for goal 2.**
+`alertedHalt` gate, exactly as designed).
+
+**Correction (CodeRabbit, PR #197 review): the ETA calculation itself still has a
+gap — one line change, not "no code change needed" as first written.**
+`doRotation` excludes disabled accounts from `candidates`, but `knownResets`
+(built from `state.exhausted`) still includes their records. If a disabled
+account happens to carry the earliest `resetAt`, `retryAt` is computed against
+an account that will never actually become eligible — `tick()` can then retry
+before any genuinely eligible account has recovered, re-entering `doRotation`
+and preflighting the same already-known-exhausted candidates for nothing. Fix:
+filter disabled accounts out of `knownResets` before taking the min, same as
+`candidates` already does. **Goal 2 therefore does need a small code change
+after all — the "already exists, no change" framing above was premature.**
 
 ## Investigation: why "nobody was told" despite a working halt alert
 
@@ -132,6 +144,19 @@ Replace first-past-the-post claiming with a named, configured recipient:
   independent of which policy path fires. This alone would have made tonight's
   32-hour gap immediately diagnosable instead of requiring the boot-order forensic
   trace above.
+- **Ordering hazard (CodeRabbit, PR #197 review): `discoverAndStart()` awaits each
+  `startAgent()` in sequence, but `startAgent()` wires the limit-event scanner
+  callback *before* awaiting `agentProcess.start()` completes.** The first agent
+  started can therefore emit a limit event — and, if every account happens to
+  already be exhausted, trigger a halt alert through whatever fallback handle
+  exists at that instant — before later agents (including the configured
+  `ROTATION_ALERT_AGENT`) have registered Telegram and claimed the handle. That
+  halt send also sets `state.alertedHalt`, so the one-alert-per-halt gate means
+  the configured recipient never gets a replay once it does register. Either
+  delay halt-alert sends until recipient selection is settled (all agents have
+  finished their `startAgent` registration pass), or replay the most recent halt
+  alert once the configured handle supersedes a fallback — don't let the handle
+  swap silently orphan an already-fired alert.
 
 ### 3. `src/daemon/agent-manager.ts` — delivery logging (goal 5)
 
@@ -141,6 +166,15 @@ failure (`[agent-manager] rotation alert FAILED to send via "<name>": <error>`).
 Cheap, no behavior change on the RotationManager side (still fire-and-forget —
 alert delivery must never block or fail rotation itself), just makes the outcome
 observable for the first time.
+
+**No-recipient case (CodeRabbit, PR #197 review): `sendAlert` also has a branch
+where `alertHandle` is unset entirely (no agent has ever registered Telegram) —
+that branch drops the alert silently today, and the success/failure logging
+above doesn't cover it since it never reaches a `sendMessage` call at all.** Add
+an explicit log there too — `[agent-manager] rotation alert DROPPED: no Telegram
+recipient configured` — so a fleet with zero Telegram-capable agents is
+diagnosable the same way a failed send now is, rather than looking identical to
+a successful, silent delivery. Delivery itself stays fire-and-forget.
 
 ## Verify items (per boss — not blockers, carried forward)
 
@@ -171,7 +205,8 @@ New `tests/unit/rotation-manager.test.ts` cases:
 - `onLimitEvent` does NOT re-alert when the same agent re-fires while already
   blocked (repeated banner re-render).
 - Existing halt-alert tests (`:89-101`, the PR #54 infra-vs-exhaustion suite)
-  unchanged — goal 2 has no code delta.
+  unchanged except: a disabled account carrying the earliest `resetAt` must be
+  excluded from the `retryAt` calculation (goal 2's one-line fix above).
 
 New `tests/unit/agent-manager` coverage (or wherever `alertHandle` claiming is
 currently untested — check first, per the same "verify before building" rule
@@ -180,8 +215,13 @@ applied above):
   when a different agent registers first.
 - Configured agent absent/no-Telegram falls back to first-registered, with the
   fallback log line asserted.
+- A limit event fired before the configured agent has registered Telegram must
+  not permanently strand the halt alert on a fallback handle once the configured
+  recipient does register (the `discoverAndStart` ordering hazard above).
 - `sendAlert` logs on both a resolved and a rejected `sendMessage` promise
   (injected fake `TelegramAPI`).
+- `sendAlert` with `alertHandle` unset logs the explicit DROPPED line and does
+  not throw.
 
 ## Rollout
 
