@@ -467,7 +467,14 @@ export function evaluateExperiment(
   // the mechanical computation and (on discard) the next_baseline_value
   // ratchet, so a corrected comparison doesn't propagate the same
   // staleness into the next cycle.
-  if (options?.baseline !== undefined && !options?.justification) {
+  if (options?.baseline !== undefined && !Number.isFinite(options.baseline)) {
+    throw new Error(
+      `evaluate-experiment refused: --baseline must be a finite number, got ${options.baseline}. ` +
+      `A non-finite override would make every comparison false, mechanically forcing 'discard' ` +
+      `and silently writing next_baseline_value as null (NaN serializes to null in JSON).`,
+    );
+  }
+  if (options?.baseline !== undefined && !options?.justification?.trim()) {
     throw new Error(
       `evaluate-experiment refused: --baseline ${options.baseline} override given with no ` +
       `--justification. Overriding a stale stored baseline must explain what changed and why ` +

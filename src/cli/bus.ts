@@ -1278,6 +1278,20 @@ busCommand
       console.error(`--decision must be 'keep' or 'discard', got '${opts.decision}'`);
       process.exit(1);
     }
+    // Number(), not parseFloat(): parseFloat('12oops') silently returns 12,
+    // and a bare truthiness check on the raw string treats an explicitly
+    // empty operand as absent. Reject the whole operand up front rather
+    // than let a malformed --baseline reach evaluateExperiment as NaN,
+    // which would mechanically force 'discard' and serialize
+    // next_baseline_value as JSON null.
+    let baselineOverride: number | undefined;
+    if (opts.baseline !== undefined) {
+      baselineOverride = Number(opts.baseline);
+      if (opts.baseline.trim() === '' || !Number.isFinite(baselineOverride)) {
+        console.error(`--baseline must be a finite number, got '${opts.baseline}'`);
+        process.exit(1);
+      }
+    }
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     try {
@@ -1286,7 +1300,7 @@ busCommand
         justification: opts.justification,
         decision: opts.decision as 'keep' | 'discard' | undefined,
         dryRun: opts.dryRun,
-        baseline: opts.baseline ? parseFloat(opts.baseline) : undefined,
+        baseline: baselineOverride,
       });
       if (opts.dryRun) {
         console.log('DRY RUN — nothing written, experiment is still running:');

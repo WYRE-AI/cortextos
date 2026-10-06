@@ -723,6 +723,22 @@ describe('Sprint 3: Experiment Framework', () => {
         );
       });
 
+      it('refuses a --baseline override with a blank/whitespace-only --justification', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'h', { baseline: 37.6 });
+        runExperiment(testDir, id);
+        expect(() =>
+          evaluateExperiment(testDir, id, 48.65, { baseline: 50.77, justification: '   ' }),
+        ).toThrow('no --justification');
+      });
+
+      it('refuses a non-finite --baseline override (CodeRabbit #217: NaN would mechanically force discard and serialize next_baseline_value as null)', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'h', { baseline: 37.6 });
+        runExperiment(testDir, id);
+        expect(() =>
+          evaluateExperiment(testDir, id, 48.65, { baseline: NaN, justification: 'bad input' }),
+        ).toThrow('must be a finite number');
+      });
+
       it('reproduces the real bug without an override: stale stored baseline mechanically reads keep', () => {
         // The stored baseline_value (37.6) is from a non-adjacent window and
         // reads as an improvement; this is exactly what happened to
