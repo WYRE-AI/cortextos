@@ -132,8 +132,22 @@ run_mmrag_ingest() {
   "$VENV_DIR/bin/python3" "$MMRAG_PY" ingest "${PATHS[@]}" \
     --collection "$COLLECTION" \
     ${FORCE} 2>&1 | tee "$OUT_FILE"
-  local rc=${PIPESTATUS[0]}
+  # Capture the whole array in one assignment -- reading PIPESTATUS[0] and
+  # PIPESTATUS[1] on separate statements loses index 1, because each
+  # subsequent command (even a bare assignment) resets PIPESTATUS to
+  # reflect only itself.
+  local statuses=("${PIPESTATUS[@]}")
+  local rc="${statuses[0]}"
+  local tee_rc="${statuses[1]:-0}"
   set -e
+  # If tee itself failed, OUT_FILE may be missing/truncated — the later
+  # per-file "Errors: N" check would then default to 0 and this script
+  # would report completion without ever having verified the real output.
+  # Treat a failed capture as a failure regardless of mmrag.py's own rc.
+  if [[ "$tee_rc" -ne 0 ]]; then
+    echo "ERROR: failed to capture mmrag.py output (tee exit $tee_rc) — cannot verify per-file errors" >&2
+    return 1
+  fi
   return "$rc"
 }
 
