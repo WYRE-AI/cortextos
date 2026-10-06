@@ -440,6 +440,33 @@ describe('AgentManager.claimA2AInboxOwner — exactly-one-per-instance enforceme
 
     expect((am as any).a2aInboxOwner).toBe('alice');
   });
+
+  it('REGRESSION (CodeRabbit, PR #179): evictDeadEntry releases the claim too, so a different configured owner is not refused until the dead entry is separately stopped', () => {
+    (am as any).claimA2AInboxOwner('alice', true, () => {});
+    (am as any).agents.set('alice', {
+      process: { dispose() {} },
+      checker: { stop() {} },
+    });
+
+    (am as any).evictDeadEntry('alice');
+    expect((am as any).a2aInboxOwner).toBeNull();
+
+    const granted = (am as any).claimA2AInboxOwner('bob', true, () => {});
+    expect(granted).toBe(true);
+    expect((am as any).a2aInboxOwner).toBe('bob');
+  });
+
+  it('REGRESSION (CodeRabbit, PR #179): evictDeadEntry for a NON-owner does not clear an unrelated owner claim', () => {
+    (am as any).claimA2AInboxOwner('alice', true, () => {});
+    (am as any).agents.set('bob', {
+      process: { dispose() {} },
+      checker: { stop() {} },
+    });
+
+    (am as any).evictDeadEntry('bob');
+
+    expect((am as any).a2aInboxOwner).toBe('alice');
+  });
 });
 
 describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', () => {

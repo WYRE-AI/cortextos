@@ -1504,6 +1504,58 @@ describe('FastChecker', () => {
       expect(result.formatted).not.toMatch(/\n=== /);
     });
 
+    it('REGRESSION (CodeRabbit, PR #179): bounds files processed per poll, leaving excess unnotified for the next cycle', () => {
+      const MAX = 20; // A2A_MAX_FILES_PER_POLL in src/daemon/fast-checker.ts
+      for (let i = 0; i < MAX + 5; i++) {
+        writeA2AMessage(`dispatch-${i}.json`);
+      }
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { a2aInboxOwner: true });
+
+      const result = (checker as any).checkA2AInbox();
+
+      expect(result.filenames.length).toBe(MAX);
+      // The excess 5 are neither formatted nor marked notified this cycle.
+      const remaining = result.filenames.length;
+      expect(remaining).toBeLessThan(MAX + 5);
+    });
+
+    it('REGRESSION (CodeRabbit, PR #179): skips an oversized file without marking it notified, rather than reading it fully into memory', () => {
+      mkdirSync(paths.a2aInboxDir!, { recursive: true });
+      const hugePayload = 'x'.repeat(300 * 1024); // > 256KB cap
+      writeFileSync(join(paths.a2aInboxDir!, 'huge.json'), JSON.stringify({
+        id: 'msg-huge',
+        received_at: new Date().toISOString(),
+        sender: { name: 'angela', owner: 'x', host: 'x' },
+        kind: 'dispatch',
+        payload: { text: hugePayload },
+      }));
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { a2aInboxOwner: true });
+
+      const result = (checker as any).checkA2AInbox();
+
+      expect(result.formatted).toBe('');
+      expect(result.filenames).toEqual([]);
+      expect((checker as any).a2aNotified.has('huge.json')).toBe(false);
+    });
+
+    it('saveA2ANotified sets a dirty flag on a failed write and clears it on a successful one', () => {
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { a2aInboxOwner: true });
+      (checker as any).a2aNotified.add('dispatch-1.json');
+
+      const originalPath = (checker as any).a2aNotifiedPath;
+      (checker as any).a2aNotifiedPath = join(paths.a2aInboxDir!, 'no-such-dir', 'notified.json');
+      (checker as any).saveA2ANotified();
+      expect((checker as any).a2aNotifiedDirty).toBe(true);
+
+      (checker as any).a2aNotifiedPath = originalPath;
+      (checker as any).saveA2ANotified();
+      expect((checker as any).a2aNotifiedDirty).toBe(false);
+      expect(JSON.parse(readFileSync(originalPath, 'utf-8'))).toContain('dispatch-1.json');
+    });
+
     describe('via pollCycle (persist-after-injection semantics)', () => {
       beforeEach(() => { vi.useFakeTimers(); });
       afterEach(() => { vi.useRealTimers(); });
@@ -1536,6 +1588,21 @@ describe('FastChecker', () => {
 
         expect((checker as any).a2aNotified.has('dispatch-1.json')).toBe(false);
         expect(existsSync((checker as any).a2aNotifiedPath)).toBe(false);
+      });
+
+      it('REGRESSION (CodeRabbit, PR #179): a dirty notified-state retries its persist on the NEXT pollCycle, even with no new arrivals that cycle', async () => {
+        const agent = createMockAgent();
+        agent.injectMessage.mockReturnValue(false); // no messages this run; irrelevant to the retry
+        const checker = new FastChecker(agent, paths, '/tmp/framework', { a2aInboxOwner: true });
+        (checker as any).a2aNotified.add('dispatch-1.json');
+        (checker as any).a2aNotifiedDirty = true; // simulates an earlier cycle's failed save
+
+        const cyclePromise = (checker as any).pollCycle();
+        await vi.advanceTimersByTimeAsync(5000);
+        await cyclePromise;
+
+        expect((checker as any).a2aNotifiedDirty).toBe(false);
+        expect(JSON.parse(readFileSync((checker as any).a2aNotifiedPath, 'utf-8'))).toContain('dispatch-1.json');
       });
     });
   });

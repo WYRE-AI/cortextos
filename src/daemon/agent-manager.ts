@@ -569,6 +569,17 @@ export class AgentManager {
     // Start agent
     await agentProcess.start();
 
+    // start() catches PTY spawn failures internally and settles into
+    // 'crashed' rather than throwing (CodeRabbit PR #179 review) — without
+    // this check, a failed startup still leaves claimA2AInboxOwner's claim
+    // assigned above, permanently refusing every subsequent legitimate
+    // owner for the rest of the daemon's life. stopAgent() both tears down
+    // the registry entry just set above and releases that claim.
+    if (agentProcess.getStatus().status !== 'running') {
+      await this.stopAgent(name);
+      return;
+    }
+
     // The PTY pid is persisted by AgentProcess.start() itself. It used to be
     // written here, but this is only ONE of five callers of start() — the
     // other four are restart paths inside AgentProcess that respawn the PTY
@@ -1141,6 +1152,12 @@ export class AgentManager {
       this.reminderSchedulers.delete(name);
     }
     clearAgentPid(join(this.ctxRoot, 'state', name));
+    // Same release as stopAgent's (CodeRabbit PR #179 review): without it, a
+    // dead owner evicted and reloaded with a2a_inbox_owner:false leaves its
+    // stale claim in place, permanently refusing a different configured
+    // owner until the (now-gone) former owner is stopped through the other
+    // path.
+    if (this.a2aInboxOwner === name) this.a2aInboxOwner = null;
   }
 
   async stopAgent(name: string): Promise<void> {

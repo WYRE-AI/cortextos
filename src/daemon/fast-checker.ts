@@ -16,6 +16,16 @@ import { evaluateHang, evaluateBootstrapHang, mostRecentAnswerableFireMs, hasBea
  * was extracted to close.
  */
 const HANG_GRACE_MS = 15 * 60_000;
+
+/**
+ * Bounds for checkA2AInbox's per-poll work (CodeRabbit PR #179 review): a
+ * backlog accumulated while the owner agent was offline must not stall the
+ * daemon's synchronous poll tick reading/formatting an unbounded number of
+ * files in one pass. Excess files (by count or an individual oversized
+ * file) are left unprocessed for a later poll rather than skipped forever.
+ */
+const A2A_MAX_FILES_PER_POLL = 20;
+const A2A_MAX_FILE_BYTES = 256 * 1024;
 import { isLimitBlocked } from './rotation-manager.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
@@ -133,6 +143,12 @@ export class FastChecker {
   private a2aInboxOwner: boolean;
   private a2aNotifiedPath: string = '';
   private a2aNotified: Set<string> = new Set();
+  // Set when saveA2ANotified() fails to persist — a crash/restart before the
+  // next successful save would reload the OLD on-disk set and re-notify
+  // everything added to a2aNotified since (CodeRabbit PR #179 review). Each
+  // poll retries the save while this is true, independent of whether that
+  // poll found any new arrivals of its own.
+  private a2aNotifiedDirty = false;
 
   constructor(
     agent: AgentProcess,
@@ -308,6 +324,10 @@ export class FastChecker {
     // configured owner — see a2aInboxOwner above).
     let newlyNotified: string[] = [];
     if (this.a2aInboxOwner) {
+      // Retry a previously failed persist regardless of whether THIS poll
+      // finds any new arrivals — the in-memory set may already be ahead of
+      // disk from an earlier cycle (see a2aNotifiedDirty's doc).
+      if (this.a2aNotifiedDirty) this.saveA2ANotified();
       const { formatted, filenames } = this.checkA2AInbox();
       messageBlock += formatted;
       newlyNotified = filenames;
@@ -396,7 +416,9 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
   private saveA2ANotified(): void {
     try {
       writeFileSync(this.a2aNotifiedPath, JSON.stringify([...this.a2aNotified]));
+      this.a2aNotifiedDirty = false;
     } catch (err) {
+      this.a2aNotifiedDirty = true;
       this.log(`Failed to persist a2a-notified state: ${err}`);
     }
   }
@@ -426,10 +448,28 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
 
     let formatted = '';
     const filenames: string[] = [];
+    let processed = 0;
     for (const filename of entries) {
       if (this.a2aNotified.has(filename)) continue;
+      // Bound total work per poll cycle (CodeRabbit PR #179 review): a
+      // backlog that accumulated while the owner was offline must not block
+      // this synchronous tick on every outstanding file at once — stop and
+      // leave the rest for later polls instead. Excess files are NOT marked
+      // notified, so they're picked up (and counted again against this cap)
+      // next cycle.
+      if (processed >= A2A_MAX_FILES_PER_POLL) break;
+      const filePath = join(dir, filename);
       try {
-        const raw = readFileSync(join(dir, filename), 'utf-8');
+        const size = statSync(filePath).size;
+        if (size > A2A_MAX_FILE_BYTES) {
+          // Pathologically large for a single arrival — skip without
+          // marking notified so a human can investigate, same posture as a
+          // malformed file below, rather than reading it all into memory.
+          this.log(`Skipping oversized a2a-inbox file ${filename} (${size} bytes > ${A2A_MAX_FILE_BYTES} cap)`);
+          processed++;
+          continue;
+        }
+        const raw = readFileSync(filePath, 'utf-8');
         const msg = JSON.parse(raw);
         formatted += this.formatA2AMessage(msg);
         filenames.push(filename);
@@ -439,6 +479,7 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
         // upstream (or a manual repair) can be picked up next poll.
         this.log(`Failed to parse a2a-inbox file ${filename}: ${err}`);
       }
+      processed++;
     }
     return { formatted, filenames };
   }
