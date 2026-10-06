@@ -7,7 +7,13 @@ import { stripAnsi, scanForLimit, LimitScanner } from '../../src/daemon/limit-de
 const WEEKLY_RAW = `\x1b[38;5;246m  ⎿  \x1b[38;5;211mYou've hit your weekly limit · resets Jul 20 at 6am (UTC)\x1b[1B\x1b[39m` +
   `\x1b[48;5;237m\x1b[38;5;239m❯ \x1b[38;5;231m/rate-limit-options\x1b[39m` +
   `\x1b[3G\x1b[1mWhat\x1b[9Gdo\x1b[12Gyou\x1b[16Gwant\x1b[21Gto\x1b[24Gdo?\x1b[22m`;
-const SESSION_RAW = `⎿  You've hit your session limit · resets 3am (UTC)Brewed for 0sWhat do you want to do? 1`;
+// Includes the real dialog's menu option 1 text ("Stop and wait for limit to
+// reset"), not just the generic "What do you want to do?" question — a real
+// banner always renders both (see the golden sample below); a fixture using
+// only the generic question doesn't exercise LimitScanner's strict-marker
+// completion check (CodeRabbit PR #211 review) the way production output
+// actually does.
+const SESSION_RAW = `⎿  You've hit your session limit · resets 3am (UTC)Brewed for 0sWhat do you want to do? 1. Stop and wait for limit to reset`;
 
 // 2026-07-16T00:00:00Z
 const NOW = Date.UTC(2026, 6, 16);
@@ -174,5 +180,24 @@ describe('LimitScanner', () => {
     const s = new LimitScanner(() => NOW);
     s.push('x'.repeat(5000));
     expect(s.push(SESSION_RAW)).not.toBeNull();      // banner still detectable after big flush
+  });
+
+  it('REGRESSION (CodeRabbit, PR #211): a quoted limit phrase, followed by an unrelated genuine "What do you want to do?", does NOT fire a false event', () => {
+    let t = NOW;
+    const s = new LimitScanner(() => t);
+
+    // Someone discussing this very file quotes the limit phrase in prose —
+    // no real banner rendered, so no RATE_LIMIT_DIALOG_RE marker exists
+    // anywhere in the stream, only the generic question (which is NOT
+    // specific to the rate-limit dialog — an agent can ask it about
+    // anything).
+    expect(s.push(`the regex matches "You've hit your weekly limit · resets Jul 20 at 6am (UTC)"`)).toBeNull();
+    t = NOW + 30_000; // well within ARM_TTL_MS
+    expect(s.push(`anyway, what do you want to do? 1. keep going 2. stop`)).toBeNull();
+  });
+
+  it('a REAL banner (with the strict dialog marker) still fires even though it also matches the generic question text', () => {
+    const s = new LimitScanner(() => NOW);
+    expect(s.push(SESSION_RAW)).not.toBeNull();
   });
 });

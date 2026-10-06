@@ -142,12 +142,17 @@ export class LimitScanner {
     }
     if (!this.armed) return null;
 
-    // Banner still in the window: same co-occurrence rule as scanForLimit.
-    // Banner evicted: only a rate-limit-specific dialog marker completes the
-    // match, so a quoted limit phrase followed later by an unrelated
-    // "What do you want to do?" cannot trigger a rotation.
-    const dialogRe = inWindow ? DIALOG_RE : RATE_LIMIT_DIALOG_RE;
-    if (dialogRe.test(normalized)) {
+    // Always require the STRICT dialog marker to complete an event, whether
+    // the banner is still in the window or already evicted (CodeRabbit PR
+    // #211 review). The loose DIALOG_RE's "What do you want to do?" is
+    // generic enough to appear in an agent's ordinary conversation —
+    // e.g. this very file's own quoted limit phrase, discussed in a reply
+    // that separately asks "what do you want to do about this PR?" within
+    // ARM_TTL_MS — which would otherwise arm-and-complete a false event
+    // purely from co-occurrence, with no real banner involved at all. A
+    // genuine rate-limit dialog always renders one of RATE_LIMIT_DIALOG_RE's
+    // markers too, so this loses no real detections.
+    if (RATE_LIMIT_DIALOG_RE.test(normalized)) {
       const { armedAt, ...ev } = this.armed;
       this.armed = null;
       this.suppressedUntil = t + REFIRE_SUPPRESS_MS;
