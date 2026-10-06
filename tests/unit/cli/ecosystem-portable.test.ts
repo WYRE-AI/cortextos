@@ -103,15 +103,43 @@ describe('buildEcosystemConfig — portable, idempotent emission', () => {
     expect(cfg.apps[0].env.CTX_ORG).toBe('acme');
   });
 
-  it('includes the dashboard app at LOAD time only when dashboard/package.json exists next to the config', () => {
+  it('includes the dashboard app at LOAD time only when dashboard/package.json AND its next binary exist', () => {
     dir = mkdtempSync(join(tmpdir(), 'eco-portable-'));
     const content = buildEcosystemConfig({ instance: 'default', org: '' });
     const without = loadConfig(content, dir, { CTX_FRAMEWORK_ROOT: undefined });
     expect(without.apps.some((a: any) => a.name === 'cortextos-dashboard')).toBe(false);
 
-    mkdirSync(join(dir, 'dashboard'), { recursive: true });
-    writeFileSync(join(dir, 'dashboard', 'package.json'), '{}', 'utf-8');
+    const dashDir = join(dir, 'dashboard');
+    mkdirSync(join(dashDir, 'node_modules', 'next', 'dist', 'bin'), { recursive: true });
+    writeFileSync(join(dashDir, 'package.json'), '{}', 'utf-8');
+    writeFileSync(join(dashDir, 'node_modules', 'next', 'dist', 'bin', 'next'), '', 'utf-8');
     const withDash = loadConfig(content, dir, { CTX_FRAMEWORK_ROOT: undefined });
     expect(withDash.apps.some((a: any) => a.name === 'cortextos-dashboard')).toBe(true);
+  });
+
+  it('REGRESSION: a tracked dashboard/package.json with node_modules NOT installed (fresh clone, root `npm install` does not cascade into dashboard/) must NOT add a dashboard app', () => {
+    dir = mkdtempSync(join(tmpdir(), 'eco-portable-'));
+    const content = buildEcosystemConfig({ instance: 'default', org: '' });
+    mkdirSync(join(dir, 'dashboard'), { recursive: true });
+    writeFileSync(join(dir, 'dashboard', 'package.json'), '{}', 'utf-8');
+    // No dashboard/node_modules/next — exactly the fresh-clone state.
+    const cfg = loadConfig(content, dir, { CTX_FRAMEWORK_ROOT: undefined });
+    expect(cfg.apps.some((a: any) => a.name === 'cortextos-dashboard')).toBe(false);
+  });
+
+  it('dashMode resolves to start when dashboard/.next exists even without NODE_ENV=production, and forwards NODE_ENV accordingly', () => {
+    dir = mkdtempSync(join(tmpdir(), 'eco-portable-'));
+    const content = buildEcosystemConfig({ instance: 'default', org: '' });
+    const dashDir = join(dir, 'dashboard');
+    mkdirSync(join(dashDir, 'node_modules', 'next', 'dist', 'bin'), { recursive: true });
+    writeFileSync(join(dashDir, 'package.json'), '{}', 'utf-8');
+    writeFileSync(join(dashDir, 'node_modules', 'next', 'dist', 'bin', 'next'), '', 'utf-8');
+    mkdirSync(join(dashDir, '.next'), { recursive: true });
+
+    const cfg = loadConfig(content, dir, { CTX_FRAMEWORK_ROOT: undefined, NODE_ENV: undefined });
+    const dash = cfg.apps.find((a: any) => a.name === 'cortextos-dashboard');
+    expect(dash).toBeDefined();
+    expect(dash.args).toBe('run start');
+    expect(dash.env.NODE_ENV).toBe('production');
   });
 });

@@ -31,11 +31,18 @@ const DAEMON_PM2_NAME =
 // machine and checkout. `next dev` for laptops, `next start` when
 // NODE_ENV=production (assumes `next build` has run).
 const dashboardDir = path.join(FRAMEWORK_ROOT, 'dashboard');
-const hasDashboard = fs.existsSync(path.join(dashboardDir, 'package.json'));
-const isWindows = process.platform === 'win32';
-const dashMode = process.env.NODE_ENV === 'production' ? 'start' : 'dev';
 const nextBin = path.join(dashboardDir, 'node_modules', 'next', 'dist', 'bin', 'next');
-const useNextBin = isWindows && fs.existsSync(nextBin);
+const hasNextBin = fs.existsSync(nextBin);
+// Require the next binary, not just package.json — a fresh clone tracks
+// dashboard/package.json in git but does NOT install its node_modules via
+// root `npm install` (dashboard/ is a separate, non-workspace package); a
+// package.json-only check would add a pm2 app guaranteed to crash-loop on
+// `npm run dev` with no next installed.
+const hasDashboard = fs.existsSync(path.join(dashboardDir, 'package.json')) && hasNextBin;
+const isWindows = process.platform === 'win32';
+const hasNextBuild = fs.existsSync(path.join(dashboardDir, '.next'));
+const dashMode = (process.env.NODE_ENV === 'production' || hasNextBuild) ? 'start' : 'dev';
+const useNextBin = isWindows && hasNextBin;
 
 const apps = [
   {
@@ -117,6 +124,12 @@ if (hasDashboard) {
       CTX_PROJECT_ROOT: PROJECT_ROOT,
       CTX_ORG: CTX_ORG,
       PORT: process.env.PORT || '3000',
+      // dashMode can resolve to 'start' via the .next-build check above even
+      // when NODE_ENV was never explicitly set — forward a NODE_ENV that
+      // matches what we actually launched so dashboard code reading
+      // process.env.NODE_ENV directly (not just next's own dev/start split)
+      // sees the same mode PM2 chose.
+      NODE_ENV: process.env.NODE_ENV || (dashMode === 'start' ? 'production' : 'development'),
     },
     // Dashboard reads its real config from dashboard/.env.local — populated
     // by /onboarding Phase 7. PM2 just supervises the dashboard process.
