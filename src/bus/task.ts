@@ -477,6 +477,10 @@ export function updateTask(
     if (status !== undefined) task.status = status;
     if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
       noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
+      // priority filled in below, after the priority branch — a single
+      // call can carry both --assignee and --priority, and the
+      // notification must report the task's FINAL priority, not whatever
+      // it was before this same call's own priority change applied.
       reassignment = { from: task.assigned_to, to: opts.assignee, title: task.title, priority: task.priority };
       task.assigned_to = opts.assignee;
     }
@@ -494,6 +498,7 @@ export function updateTask(
       task.description = (task.description ?? '') + marker;
       noteParts.push(`description: appended ${opts.appendDesc.length} chars`);
     }
+    if (reassignment) reassignment.priority = task.priority;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
@@ -517,16 +522,20 @@ export function updateTask(
       try {
         sendMessage(paths, actor, reassignment.to, 'normal',
           `Reassigned to you: [${reassignment.priority}] ${reassignment.title} (id: ${taskId})`);
-      } catch {
-        // Never let a notification failure mask a write that already succeeded.
+      } catch (err) {
+        // Never let a notification failure mask a write that already
+        // succeeded — but it must be visible SOMEWHERE, or this just
+        // trades one silent-notification gap for another. No message
+        // text/credentials in the log line, only the safe identifiers.
+        console.warn(`[bus/task] WARNING: reassignment notification to '${reassignment.to}' for task ${taskId} failed: ${err}`);
       }
     }
     if (reassignment.from && reassignment.from !== actor && reassignment.from !== reassignment.to) {
       try {
         sendMessage(paths, actor, reassignment.from, 'normal',
           `Reassigned away from you, to ${reassignment.to}: [${reassignment.priority}] ${reassignment.title} (id: ${taskId})`);
-      } catch {
-        // Never let a notification failure mask a write that already succeeded.
+      } catch (err) {
+        console.warn(`[bus/task] WARNING: reassignment notification to '${reassignment.from}' for task ${taskId} failed: ${err}`);
       }
     }
   }

@@ -219,6 +219,22 @@ describe('Task Management', () => {
 
         expect(inboxTexts('boss')).toHaveLength(0);
       });
+
+      // CodeRabbit catch on #220: a single call carrying BOTH --assignee and
+      // --priority must report the task's FINAL priority in the
+      // notification, not whatever it was before this same call's own
+      // priority change applied.
+      it('reports the NEW priority when --assignee and --priority change in the same call', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Needs a new owner, urgently', {
+          assignee: 'boss', priority: 'normal',
+        });
+        updateTask(paths, taskId, undefined, { assignee: 'dev', priority: 'urgent', actor: 'paul' });
+
+        const texts = inboxTexts('dev');
+        expect(texts).toHaveLength(1);
+        expect(texts[0]).toContain('[urgent]');
+        expect(texts[0]).not.toContain('[normal]');
+      });
     });
 
     it('changes priority without a status argument', () => {
