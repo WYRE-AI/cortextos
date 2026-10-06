@@ -8,7 +8,9 @@ Least-privilege, per-installation scoped, no personal account in the loop.
 - Name: **WYRE Agent Fleet** (slug `wyre-agent-fleet`, App id `4317194`), owned by `wyre-technology`.
 - Permissions: `contents:write`, `pull_requests:write`, `actions:write`, `packages:write`, `checks:write`, `workflows:write`, `metadata:read`.
   Re-verified live 2026-09-20 via `GET /app` (see below) — this list was missing `workflows:write`, now corrected.
-  **No organization-level permissions at all** — this is load-bearing for the repo-creation gap two sections down.
+  **No `administration` permission at any scope (repo or org)** — this is load-bearing for the
+  repo-creation gap two sections down (that gap needs repository-level `administration: write`
+  specifically, see the correction there — not an organization-level permission).
 - Credentials live in Infisical, **conduit** context: `GITHUB_APP_ID`, `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_PRIVATE_KEY`.
   Fetch via `cortex-secret run --context conduit -- <cmd>` — never write the private key to disk.
 
@@ -89,28 +91,35 @@ installation token. Undocumented until now, and contradicted this doc's own stat
 ("no personal account in the loop").
 
 **Root cause, verified live 2026-09-20** (`GET /app` with the App's own JWT — see "Validating
-the install" above): the App's permission grant has **zero organization-level permissions**.
-Creating a repo under an org (`POST /orgs/{org}/repos`) requires the App to hold the
-**organization-level `administration: write`** permission — there is no narrower GitHub App
-permission that covers repo creation specifically; it is bundled with the same org-admin
-permission that also covers org webhooks and custom properties. Repository-level `administration`
-(a separate permission, scoped to a single existing repo) doesn't help here — the repo doesn't
-exist yet.
+the install" above): the App's permission grant has **zero `administration` permission at all**.
+Creating a repo under an org (`POST /orgs/{org}/repos`) requires the App to hold `administration:
+write` — but per GitHub's own permissions table, that's the **repository-level** `Administration`
+permission (listed under "Repository permissions," not "Organization permissions"), not an
+organization-level one. There is no separate, narrower permission that covers repo creation
+specifically. **Correction (CodeRabbit, PR #198 review) to this doc's original claim:** we had
+this backwards — it is repository-level `administration: write` that's needed, and that's
+sufficient here specifically *because* this installation's `repository_selection` is `all`: a
+repository-category permission granted to an "all repositories" install applies across the whole
+org, including repos the installation didn't exist to see yet at grant time. Org-level
+`administration` (org webhooks, custom properties, org-wide settings) is a different, broader
+permission this use case does not need at all.
 
-**Decision: expand the App's grant to include organization-level `administration: write`,
-rather than continue leaning on the PAT.** Reasoning:
+**Decision: expand the App's grant to include repository-level `administration: write`, rather
+than continue leaning on the PAT.** Reasoning:
 - The PAT is exactly the credential this system exists to eliminate. Leaving repo creation on it
   indefinitely is a standing regression against this doc's own design goal, and — worse — it was
   happening silently, which is a bigger risk than either option chosen deliberately.
 - There is only **one installation** (`WYRE-AI`, `repository_selection: all`, verified live via
   `GET /app/installations`), so this is a single, bounded action: the App owner (Aaron) edits the
-  App's permission manifest to add org `administration: write`, then accepts the resulting
+  App's permission manifest to add repository `administration: write`, then accepts the resulting
   permission-upgrade prompt for the one installation. Not a recurring credential to rotate or
   track, unlike a PAT.
-- Named tradeoff, not hidden: org-level `administration` is broader than "just repo creation" —
-  it also covers org webhook and custom-property management via the API. The fleet doesn't use
-  either today. Flagging this explicitly so whoever clicks "accept" knows the actual scope, not
-  just the motivating use case.
+- Named tradeoff, not hidden: repository-level `administration` is broader than "just repo
+  creation" within each repo it applies to — it also covers branch protection, collaborators,
+  per-repo webhooks, and Pages settings, across every repo the install can see (i.e. all of them,
+  per `repository_selection: all`). The fleet doesn't use most of that today, but it's a materially
+  smaller blast radius than the org-level grant this doc originally (incorrectly) called for, since
+  it doesn't touch org membership, org-wide webhooks, or custom properties at all.
 - Rejected alternative: provisioning a dedicated, narrowly-scoped fine-grained PAT under a
   non-personal bot account. Would be tighter in principle, but WYRE has no existing bot GitHub
   identity to hang it on, so it trades one small, well-understood App-grant click for setting up
@@ -119,7 +128,11 @@ rather than continue leaning on the PAT.** Reasoning:
 
 **Action item**: this needs Aaron directly (App-owner permission edit + install-level accept) —
 joins the existing click queue. Until it lands, wave-3 repo creation keeps using `GITHUB_PAT` —
-that's now a documented, deliberate, temporary exception rather than a silent one.
+that's now a documented, deliberate, temporary exception rather than a silent one. **Not yet
+empirically re-verified against this specific App installation** (the original root-cause
+investigation was live-verified 2026-09-20 per above, but this permission-scope correction is
+sourced from GitHub's own documentation, not a fresh live test) — confirm the repository-level
+grant actually clears the `GITHUB_PAT` fallback once Aaron applies it, before closing this out.
 
 ## What's still open (tracked separately)
 
