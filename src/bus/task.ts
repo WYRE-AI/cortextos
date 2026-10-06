@@ -1,9 +1,10 @@
-import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync } from 'fs';
-import { join } from 'path';
+import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync, mkdirSync } from 'fs';
+import { join, dirname, basename } from 'path';
 import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport, BatchStalenessReport } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
 import { validatePriority, validateTaskId } from '../utils/validate.js';
+import { withFileLockSync } from '../utils/lock.js';
 import { logEvent } from './event.js';
 
 /**
@@ -116,6 +117,41 @@ function addSymmetricEdge(
       atomicWriteSync(filePath, JSON.stringify(task));
     }
   } catch { /* best-effort */ }
+}
+
+/**
+ * Resolve `id` (which may be a unique prefix — see {@link findTaskFileByPrefix})
+ * to the canonical full id stored in that task's own JSON. Falls back to the
+ * raw `id` unchanged if the task can't be found or read, so a genuinely
+ * dangling/missing reference is still recorded faithfully as typed rather
+ * than silently dropped.
+ *
+ * Callers that store or compare blocker ids MUST resolve through this first —
+ * otherwise a prefix and the full id it resolves to are different strings for
+ * `===`/`includes()` purposes, which breaks both deduplication (the same task
+ * can be "added" twice under two spellings) and cycle detection (a cycle
+ * routed through a prefix form of the id it passes through is never equal to
+ * the canonical form being walked, so the walk never trips).
+ */
+function resolveTaskId(paths: BusPaths, id: string): string {
+  const filePath = findTaskFile(paths, id);
+  if (!filePath) return id;
+  try {
+    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+    return task.id ?? id;
+  } catch {
+    return id;
+  }
+}
+
+/**
+ * Lock directory for serializing concurrent read-modify-write updates to one
+ * task file. Scoped per-task (not per-tasks-directory) so unrelated tasks in
+ * the same org never contend with each other — only two updates racing on
+ * the SAME task actually serialize.
+ */
+function taskLockDir(filePath: string): string {
+  return join(dirname(filePath), '.task-locks', basename(filePath));
 }
 
 /**
@@ -478,46 +514,61 @@ export function updateTask(
   let prevStatus: TaskStatus | undefined;
   const noteParts: string[] = [];
   let newBlockers: string[] = [];
+  const lockDir = taskLockDir(filePath);
   try {
-    const content = readFileSync(filePath, 'utf-8');
-    const task: Task = JSON.parse(content);
-    prevStatus = task.status;
+    mkdirSync(lockDir, { recursive: true });
+    withFileLockSync(lockDir, () => {
+      const content = readFileSync(filePath, 'utf-8');
+      const task: Task = JSON.parse(content);
+      prevStatus = task.status;
+      const selfId = task.id ?? taskId;
 
-    const currentBlockedBy = task.blocked_by ?? [];
-    newBlockers = blockedByInput.filter(depId => !currentBlockedBy.includes(depId));
-    if (newBlockers.length) {
-      // Cycle check BEFORE any field mutation, same ordering rule createTask
-      // enforces — a rejected cycle must never leave partial state on disk.
-      // The virtual task carries the FULL post-update blocked_by set (old +
-      // new), not just the new edges, so a cycle running back through an
-      // already-existing blocker is still caught.
-      const virtualTask = { id: taskId, blocked_by: [...currentBlockedBy, ...newBlockers] };
-      detectCycleOrThrow(paths, taskId, newBlockers, virtualTask);
-      task.blocked_by = [...currentBlockedBy, ...newBlockers];
-      noteParts.push(`blocked_by: +[${newBlockers.join(', ')}]`);
-    }
+      const currentBlockedBy = task.blocked_by ?? [];
+      // Resolve every input through its canonical id BEFORE dedup/cycle-check/
+      // storage (see resolveTaskId's own doc) and dedup the resolved set —
+      // two different spellings (or two literal repeats) of the same blocker
+      // must collapse to one stored edge. A self-reference (including via a
+      // prefix of this task's own id, once resolved to selfId) is deliberately
+      // NOT filtered out here — it must reach detectCycleOrThrow below, whose
+      // `cur === newTaskId` check is what turns it into the same "Dependency
+      // cycle: X ultimately blocks itself via X" error a longer cycle gets.
+      // Filtering it out here would silently drop it instead of rejecting it.
+      const resolvedInput = [...new Set(blockedByInput.map(id => resolveTaskId(paths, id)))];
+      newBlockers = resolvedInput.filter(depId => !currentBlockedBy.includes(depId));
+      if (newBlockers.length) {
+        // Cycle check BEFORE any field mutation, same ordering rule createTask
+        // enforces — a rejected cycle must never leave partial state on disk.
+        // The virtual task carries the FULL post-update blocked_by set (old +
+        // new), not just the new edges, so a cycle running back through an
+        // already-existing blocker is still caught.
+        const virtualTask = { id: selfId, blocked_by: [...currentBlockedBy, ...newBlockers] };
+        detectCycleOrThrow(paths, selfId, newBlockers, virtualTask);
+        task.blocked_by = [...currentBlockedBy, ...newBlockers];
+        noteParts.push(`blocked_by: +[${newBlockers.join(', ')}]`);
+      }
 
-    if (status !== undefined) task.status = status;
-    if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
-      noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
-      task.assigned_to = opts.assignee;
-    }
-    if (opts.project !== undefined && opts.project !== task.project) {
-      noteParts.push(`project: '${task.project}' -> '${opts.project}'`);
-      task.project = opts.project;
-    }
-    if (opts.priority !== undefined && opts.priority !== task.priority) {
-      noteParts.push(`priority: ${task.priority} -> ${opts.priority}`);
-      task.priority = opts.priority;
-    }
-    if (opts.appendDesc !== undefined) {
-      const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-      const marker = `\n\n--- APPENDED ${stamp} ---\n${opts.appendDesc}`;
-      task.description = (task.description ?? '') + marker;
-      noteParts.push(`description: appended ${opts.appendDesc.length} chars`);
-    }
-    task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-    atomicWriteSync(filePath, JSON.stringify(task));
+      if (status !== undefined) task.status = status;
+      if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
+        noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
+        task.assigned_to = opts.assignee;
+      }
+      if (opts.project !== undefined && opts.project !== task.project) {
+        noteParts.push(`project: '${task.project}' -> '${opts.project}'`);
+        task.project = opts.project;
+      }
+      if (opts.priority !== undefined && opts.priority !== task.priority) {
+        noteParts.push(`priority: ${task.priority} -> ${opts.priority}`);
+        task.priority = opts.priority;
+      }
+      if (opts.appendDesc !== undefined) {
+        const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+        const marker = `\n\n--- APPENDED ${stamp} ---\n${opts.appendDesc}`;
+        task.description = (task.description ?? '') + marker;
+        noteParts.push(`description: appended ${opts.appendDesc.length} chars`);
+      }
+      task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      atomicWriteSync(filePath, JSON.stringify(task));
+    });
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
