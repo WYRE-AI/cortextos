@@ -132,6 +132,14 @@ export interface ExperimentEvaluateOptions {
    * mistaken real call has no CLI undo and requires hand-editing 3 files to
    * correct. */
   dryRun?: boolean;
+  /** Override the stored baseline_value used for THIS decision's mechanical
+   * computation and (on discard) the next_baseline_value ratchet. Use when
+   * the stored baseline has gone stale (e.g. a non-adjacent measurement
+   * window) and a freshly-validated comparison point exists. Does not touch
+   * `experiment.baseline_value` itself — that stays the frozen historical
+   * fact of what proposal time configured. Requires a non-empty
+   * `justification` — evaluateExperiment refuses otherwise. */
+  baseline?: number;
 }
 
 export interface ExperimentFilters {
@@ -445,7 +453,36 @@ export function evaluateExperiment(
       `valid measurement. Re-create the experiment with --baseline <n>.`,
     );
   }
-  const baseline = experiment.baseline_value;
+  // The stored baseline_value is fixed at proposal time and can go stale by
+  // evaluation time — e.g. a later-discovered non-adjacent-window baseline
+  // that no longer represents a valid apples-to-apples comparison (found
+  // live 2026-09-04, task_1788524506203_29047861: marketing's cookie-consent
+  // cycle mechanically read 'keep' off a stale 08-16 baseline while
+  // marketing's own fresh matched-window remeasurement showed a decrease —
+  // the decision and the written conclusion directly contradicted each
+  // other on the same record). --baseline here lets the caller supply a
+  // freshly-validated comparison point for THIS decision without silently
+  // rewriting history: experiment.baseline_value (the frozen original) is
+  // never touched, only the local `baseline` used below — which feeds both
+  // the mechanical computation and (on discard) the next_baseline_value
+  // ratchet, so a corrected comparison doesn't propagate the same
+  // staleness into the next cycle.
+  if (options?.baseline !== undefined && !options?.justification) {
+    throw new Error(
+      `evaluate-experiment refused: --baseline ${options.baseline} override given with no ` +
+      `--justification. Overriding a stale stored baseline must explain what changed and why ` +
+      `the new value is the valid comparison — the same accountability the mechanical decision ` +
+      `otherwise gets for free from create-experiment's stored value.`,
+    );
+  }
+  const baseline = options?.baseline ?? experiment.baseline_value;
+  if (options?.baseline !== undefined) {
+    console.error(
+      `⚠ ${experimentId}: evaluating against an OVERRIDDEN baseline (${options.baseline}), ` +
+      `not the stored baseline_value (${experiment.baseline_value}). Stored value is left ` +
+      `untouched for history; this run's decision uses the override.`,
+    );
+  }
 
   // score only ever drives the decision for a QUALITATIVE evaluation, whose
   // convention (see every --score test) is a placeholder measuredValue of 0.
@@ -525,6 +562,12 @@ export function evaluateExperiment(
 
   // Build learning from options
   const learningParts: string[] = [];
+  if (options?.baseline !== undefined) {
+    learningParts.push(
+      `[BASELINE OVERRIDE: decision computed against ${options.baseline}, not the stored ` +
+      `baseline_value of ${experiment.baseline_value}]`,
+    );
+  }
   if (options?.learning) learningParts.push(options.learning);
   if (options?.justification) learningParts.push(options.justification);
   if (learningParts.length > 0) {

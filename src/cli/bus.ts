@@ -1272,7 +1272,8 @@ busCommand
   .option('--justification <text>', 'Justification text')
   .option('--decision <keep|discard>', 'Override the mechanically-computed decision (requires --justification)')
   .option('--dry-run', 'Validate args and print the would-be result WITHOUT writing anything — the experiment stays running and re-evaluable for real afterward. Use this to check argument shape before a real evaluation; a real (non-dry-run) call commits immediately and cannot be undone.')
-  .action((id: string, value: string, opts: { score?: string; justification?: string; decision?: string; dryRun?: boolean }) => {
+  .option('--baseline <n>', 'Override the stored baseline_value for this decision (requires --justification) — use when the stored baseline has gone stale (e.g. a non-adjacent measurement window) and you have a freshly-validated comparison point. The stored baseline_value is left untouched for history.')
+  .action((id: string, value: string, opts: { score?: string; justification?: string; decision?: string; dryRun?: boolean; baseline?: string }) => {
     if (opts.decision !== undefined && opts.decision !== 'keep' && opts.decision !== 'discard') {
       console.error(`--decision must be 'keep' or 'discard', got '${opts.decision}'`);
       process.exit(1);
@@ -1285,6 +1286,7 @@ busCommand
         justification: opts.justification,
         decision: opts.decision as 'keep' | 'discard' | undefined,
         dryRun: opts.dryRun,
+        baseline: opts.baseline ? parseFloat(opts.baseline) : undefined,
       });
       if (opts.dryRun) {
         console.log('DRY RUN — nothing written, experiment is still running:');
