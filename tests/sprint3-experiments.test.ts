@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as fsNode from 'fs';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -420,6 +421,27 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(existsSync(activePath)).toBe(true);
       const active = JSON.parse(readFileSync(activePath, 'utf-8').trim());
       expect(active.id).toBe(otherRunningId);
+    });
+
+    it('REGRESSION (CodeRabbit, PR #207): propagates an unlinkSync failure on active.json cleanup instead of swallowing it', () => {
+      // Skip under root (e.g. some CI containers) — directory permissions
+      // don't block unlink for root, so the test setup itself wouldn't
+      // exercise the failure path.
+      if (process.getuid && process.getuid() === 0) return;
+
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'h1', { baseline: 0 });
+      runExperiment(testDir, id);
+
+      const experimentsDir = join(testDir, 'experiments');
+      // Deleting a file requires WRITE on its containing directory, not on
+      // the file itself — drop write there to make unlinkSync throw EACCES
+      // without touching mock internals (ESM fs exports aren't spy-able).
+      fsNode.chmodSync(experimentsDir, 0o555);
+      try {
+        expect(() => evaluateExperiment(testDir, id, 5)).toThrow();
+      } finally {
+        fsNode.chmodSync(experimentsDir, 0o755);
+      }
     });
 
     it('discards when measured < baseline (direction=higher)', () => {
