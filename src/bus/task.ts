@@ -79,22 +79,33 @@ export function createTask(
   // and the two could jointly create a cycle neither saw alone. Order within
   // the lock is unchanged — validate → write task → mutate peers → audit —
   // so a rejected cycle still never leaves partial state on disk.
-  const graphLock = taskGraphLockDir(paths);
-  mkdirSync(graphLock, { recursive: true });
-  withFileLockSync(graphLock, () => {
-    const virtualTask = { id: taskId, blocked_by: blockedBy };
-    if (blockedBy.length) detectCycleOrThrow(paths, taskId, blockedBy, virtualTask);
-    if (blocks.length) {
-      for (const downId of blocks) detectCycleOrThrow(paths, downId, [taskId], virtualTask);
-    }
-
+  //
+  // Only taken when blockedBy/blocks is non-empty: a dependency-free create
+  // (the common case) writes a brand-new, uniquely-id'd file nothing else
+  // can be racing to read yet, so there is no graph to protect and no
+  // reason to serialize it against every other create/update fleet-wide.
+  const writeTask = () => {
     atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
-
     // Cycle-safe now: validation already passed, so symmetric-edge
     // maintenance is just mutating peer JSONs.
     for (const depId of blockedBy) addSymmetricEdge(paths, depId, 'blocks', taskId);
     for (const downId of blocks) addSymmetricEdge(paths, downId, 'blocked_by', taskId);
-  });
+  };
+
+  if (blockedBy.length || blocks.length) {
+    const graphLock = taskGraphLockDir(paths);
+    mkdirSync(graphLock, { recursive: true });
+    withFileLockSync(graphLock, () => {
+      const virtualTask = { id: taskId, blocked_by: blockedBy };
+      if (blockedBy.length) detectCycleOrThrow(paths, taskId, blockedBy, virtualTask);
+      if (blocks.length) {
+        for (const downId of blocks) detectCycleOrThrow(paths, downId, [taskId], virtualTask);
+      }
+      writeTask();
+    });
+  } else {
+    writeTask();
+  }
 
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
 
@@ -559,13 +570,17 @@ export function updateTask(
   let blockersToSync: string[] = [];
   let canonicalId = taskId;
   const lockDir = taskLockDir(filePath);
+
   // Graph lock first, per-task lock second — see taskGraphLockDir's doc.
-  // Wraps validation, the primary write, AND the peer-edge sync below so a
-  // concurrent createTask/updateTask can never validate against (or mutate
-  // peers of) a graph this call is still in the middle of changing.
-  const graphLock = taskGraphLockDir(paths);
-  mkdirSync(graphLock, { recursive: true });
-  withFileLockSync(graphLock, () => {
+  // Only needed when this call actually touches blocked_by: a status/
+  // assignee/project/priority/appendDesc-only update never reads or writes
+  // the dependency graph, so forcing it through the single global lock would
+  // serialize every update against every other update fleet-wide for no
+  // reason. Gated on the caller's raw input, not the later-computed
+  // newBlockers/blockersToSync — an empty graph lock around an all-dedup
+  // call is harmless, but skipping it entirely when nothing was asked for
+  // keeps the common no-blockedBy case lock-free.
+  const runUpdate = () => {
     try {
       mkdirSync(lockDir, { recursive: true });
       withFileLockSync(lockDir, () => {
@@ -633,7 +648,15 @@ export function updateTask(
     // keyed by canonicalId, not the caller's possibly-a-prefix taskId, so the
     // peer's `blocks` list and this task's `blocked_by` list agree on spelling.
     for (const depId of blockersToSync) addSymmetricEdge(paths, depId, 'blocks', canonicalId);
-  }); // end graphLock
+  };
+
+  if (blockedByInput.length > 0) {
+    const graphLock = taskGraphLockDir(paths);
+    mkdirSync(graphLock, { recursive: true });
+    withFileLockSync(graphLock, runUpdate);
+  } else {
+    runUpdate();
+  }
 
   appendTaskAudit(paths, taskId, {
     event: 'update',
