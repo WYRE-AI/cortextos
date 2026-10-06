@@ -155,6 +155,88 @@ describe('Task Management', () => {
       expect(reassignEntry.agent).toBe('paul');
     });
 
+    // task_1786940455590_37884162: updateTask --assignee changed assigned_to
+    // on disk with zero signal to either party. One live incident: an agent
+    // reassigned away from itself, got no notification of the reassignment
+    // either, and kept doing real work under the task, which then recorded
+    // as completed by the WRONG assignee. Both directions need their own
+    // inbox-content assertion — neither is implied by the other.
+    describe('reassignment notification (task_1786940455590_37884162)', () => {
+      function inboxTexts(agent: string): string[] {
+        const dir = join(testDir, 'inbox', agent);
+        if (!existsSync(dir)) return [];
+        return readdirSync(dir).map((f) => JSON.parse(readFileSync(join(dir, f), 'utf-8')).text);
+      }
+
+      it('notifies the new assignee', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Needs a new owner', { assignee: 'boss' });
+        updateTask(paths, taskId, undefined, { assignee: 'dev', actor: 'paul' });
+
+        const texts = inboxTexts('dev');
+        expect(texts).toHaveLength(1);
+        expect(texts[0]).toContain('Reassigned to you');
+        expect(texts[0]).toContain('Needs a new owner');
+        expect(texts[0]).toContain(taskId);
+      });
+
+      it('also notifies the OLD assignee that the task moved on', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Needs a new owner', { assignee: 'boss' });
+        updateTask(paths, taskId, undefined, { assignee: 'dev', actor: 'paul' });
+
+        const texts = inboxTexts('boss');
+        expect(texts).toHaveLength(1);
+        expect(texts[0]).toContain('Reassigned away from you');
+        expect(texts[0]).toContain('dev');
+        expect(texts[0]).toContain(taskId);
+      });
+
+      it('does not notify the actor when they claim the task for themselves', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Self-claim', { assignee: 'boss' });
+        updateTask(paths, taskId, undefined, { assignee: 'dev', actor: 'dev' });
+
+        expect(inboxTexts('dev')).toHaveLength(0); // actor === new assignee
+        expect(inboxTexts('boss')).toHaveLength(1); // old assignee still told
+      });
+
+      it('does not notify the actor when they give the task away', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Giving it away', { assignee: 'boss' });
+        updateTask(paths, taskId, undefined, { assignee: 'dev', actor: 'boss' });
+
+        expect(inboxTexts('dev')).toHaveLength(1); // new assignee still told
+        expect(inboxTexts('boss')).toHaveLength(0); // actor === old assignee
+      });
+
+      it('sends nothing when the update does not touch assignee at all', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Status only', { assignee: 'boss' });
+        updateTask(paths, taskId, 'in_progress');
+
+        expect(inboxTexts('boss')).toHaveLength(0);
+      });
+
+      it('sends nothing when --assignee is a no-op (same as current)', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'No-op reassign', { assignee: 'boss' });
+        updateTask(paths, taskId, undefined, { assignee: 'boss', actor: 'paul' });
+
+        expect(inboxTexts('boss')).toHaveLength(0);
+      });
+
+      // CodeRabbit catch on #220: a single call carrying BOTH --assignee and
+      // --priority must report the task's FINAL priority in the
+      // notification, not whatever it was before this same call's own
+      // priority change applied.
+      it('reports the NEW priority when --assignee and --priority change in the same call', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Needs a new owner, urgently', {
+          assignee: 'boss', priority: 'normal',
+        });
+        updateTask(paths, taskId, undefined, { assignee: 'dev', priority: 'urgent', actor: 'paul' });
+
+        const texts = inboxTexts('dev');
+        expect(texts).toHaveLength(1);
+        expect(texts[0]).toContain('[urgent]');
+        expect(texts[0]).not.toContain('[normal]');
+      });
+    });
+
     it('changes priority without a status argument', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Test task');
       updateTask(paths, taskId, undefined, { priority: 'high' });

@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed — `update-task --assignee` reassignment wrote silently, with no signal to either party
+
+`task.ts` had zero notification calls (`createTask` notifies the assignee via the CLI layer;
+`updateTask` never did). A reassignment's `assigned_to` write was always correct on disk, but
+neither the new nor the old assignee had any trigger to re-check their own queue — reassignment
+also refreshes `updated_at`, so a stale-task sweep reads it as freshly-touched work rather than a
+silent handoff. First reported 2026-08-17 (task_1786940455590), re-verified live 4 times over 50
+days including a real incident (2026-09-09: an agent reassigned away from a task, the old assignee
+got no notification, kept working, and completed real work recorded under the wrong assignee).
+
+`updateTask` now sends a bus message to the new assignee ("Reassigned to you: …") and, separately,
+to the old assignee ("Reassigned away from you, to `<new>`: …") whenever `--assignee` actually
+changes `assigned_to` — mirroring `create-task`'s existing assignee notification. Skips notifying
+whichever side IS the acting agent (self-claim or giving a task away, same as `create-task`'s own
+`assignee !== env.agentName` guard), and both sends are independent and best-effort — a failure on
+one side never masks the other, and neither can block the write that already landed on disk.
+
 ### Added — Tier 2 cross-provider fallback (GLM-5.3 / Z.ai), shipped disabled
 
 New `src/daemon/glm-fallback.ts`, entered only from `rotation-manager.ts`'s existing "every Tier 1

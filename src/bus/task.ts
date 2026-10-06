@@ -5,6 +5,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
 import { validatePriority, validateTaskId } from '../utils/validate.js';
 import { logEvent } from './event.js';
+import { sendMessage } from './message.js';
 
 /**
  * Create a new task. Identical JSON format to bash create-task.sh.
@@ -462,6 +463,13 @@ export function updateTask(
   }
   let prevStatus: TaskStatus | undefined;
   const noteParts: string[] = [];
+  // Captured inside the try so a notification is only sent once the write
+  // actually succeeds (task_1786940455590_37884162: updateTask --assignee
+  // changed assigned_to on disk with zero signal to either party — the new
+  // owner only found out by luck, and the old owner kept working on a task
+  // that had already moved, completing real work under the wrong assignee
+  // in at least one live incident).
+  let reassignment: { from: string; to: string; title: string; priority: Priority } | undefined;
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
@@ -469,6 +477,11 @@ export function updateTask(
     if (status !== undefined) task.status = status;
     if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
       noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
+      // priority filled in below, after the priority branch — a single
+      // call can carry both --assignee and --priority, and the
+      // notification must report the task's FINAL priority, not whatever
+      // it was before this same call's own priority change applied.
+      reassignment = { from: task.assigned_to, to: opts.assignee, title: task.title, priority: task.priority };
       task.assigned_to = opts.assignee;
     }
     if (opts.project !== undefined && opts.project !== task.project) {
@@ -485,6 +498,7 @@ export function updateTask(
       task.description = (task.description ?? '') + marker;
       noteParts.push(`description: appended ${opts.appendDesc.length} chars`);
     }
+    if (reassignment) reassignment.priority = task.priority;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
@@ -497,6 +511,34 @@ export function updateTask(
     to: status ?? prevStatus,
     ...(noteParts.length ? { note: noteParts.join(', ') } : {}),
   });
+  if (reassignment) {
+    const actor = opts.actor || 'unknown';
+    // Skip notifying whichever side IS the actor — they already know they
+    // just gave up or picked up the task. Both notifications are
+    // independent and best-effort: a signing-key hiccup or similar on one
+    // must not suppress the other, and neither must block the update that
+    // already landed on disk.
+    if (reassignment.to !== actor) {
+      try {
+        sendMessage(paths, actor, reassignment.to, 'normal',
+          `Reassigned to you: [${reassignment.priority}] ${reassignment.title} (id: ${taskId})`);
+      } catch (err) {
+        // Never let a notification failure mask a write that already
+        // succeeded — but it must be visible SOMEWHERE, or this just
+        // trades one silent-notification gap for another. No message
+        // text/credentials in the log line, only the safe identifiers.
+        console.warn(`[bus/task] WARNING: reassignment notification to '${reassignment.to}' for task ${taskId} failed: ${err}`);
+      }
+    }
+    if (reassignment.from && reassignment.from !== actor && reassignment.from !== reassignment.to) {
+      try {
+        sendMessage(paths, actor, reassignment.from, 'normal',
+          `Reassigned away from you, to ${reassignment.to}: [${reassignment.priority}] ${reassignment.title} (id: ${taskId})`);
+      } catch (err) {
+        console.warn(`[bus/task] WARNING: reassignment notification to '${reassignment.from}' for task ${taskId} failed: ${err}`);
+      }
+    }
+  }
 }
 
 /**
