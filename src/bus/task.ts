@@ -48,19 +48,6 @@ export function createTask(
   const taskId = `task_${epoch}_${rand}`;
   const now = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 
-  // Dependency validation FIRST — a cycle must never be allowed to
-  // leave partial state on disk. Earlier iteration wrote the task
-  // JSON before detectCycleOrThrow ran, so a failed cycle check left
-  // a dangling task with a one-way edge and no symmetric peer update.
-  // Order is now: validate → write task → mutate peers → audit. The
-  // cycle walker gets a `virtual` description of the not-yet-written
-  // task so chains that pass through it are still detectable.
-  const virtualTask = { id: taskId, blocked_by: blockedBy };
-  if (blockedBy.length) detectCycleOrThrow(paths, taskId, blockedBy, virtualTask);
-  if (blocks.length) {
-    for (const downId of blocks) detectCycleOrThrow(paths, downId, [taskId], virtualTask);
-  }
-
   const task: Task = {
     id: taskId,
     title,
@@ -84,12 +71,30 @@ export function createTask(
   };
 
   ensureDir(paths.taskDir);
-  atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
 
-  // Cycle-safe now: validation already passed, so symmetric-edge
-  // maintenance is just mutating peer JSONs.
-  for (const depId of blockedBy) addSymmetricEdge(paths, depId, 'blocks', taskId);
-  for (const downId of blocks) addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+  // Dependency validation, write, and peer-edge mutation all happen inside
+  // the graph lock — see taskGraphLockDir's doc for why: detectCycleOrThrow
+  // reads peer files unlocked, so without this a concurrent createTask (or
+  // updateTask) could validate against a graph this call is about to change,
+  // and the two could jointly create a cycle neither saw alone. Order within
+  // the lock is unchanged — validate → write task → mutate peers → audit —
+  // so a rejected cycle still never leaves partial state on disk.
+  const graphLock = taskGraphLockDir(paths);
+  mkdirSync(graphLock, { recursive: true });
+  withFileLockSync(graphLock, () => {
+    const virtualTask = { id: taskId, blocked_by: blockedBy };
+    if (blockedBy.length) detectCycleOrThrow(paths, taskId, blockedBy, virtualTask);
+    if (blocks.length) {
+      for (const downId of blocks) detectCycleOrThrow(paths, downId, [taskId], virtualTask);
+    }
+
+    atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
+
+    // Cycle-safe now: validation already passed, so symmetric-edge
+    // maintenance is just mutating peer JSONs.
+    for (const depId of blockedBy) addSymmetricEdge(paths, depId, 'blocks', taskId);
+    for (const downId of blocks) addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+  });
 
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
 
@@ -100,6 +105,13 @@ export function createTask(
  * Mutate an existing task to add an edge to its blocks/blocked_by list.
  * No-op if the peer id is already present. Used to maintain symmetric
  * edges when a new task declares its dependencies.
+ *
+ * Locked per-peer-file (not best-effort) so two calls racing on the same
+ * peer — e.g. two different tasks both adding the same blocker — can't lose
+ * each other's edge between the read and the write. A genuinely missing
+ * peer still returns silently (a dangling reference is a valid state); an
+ * unreadable lookup or a failed read/write propagates instead of being
+ * swallowed, since a silently-dropped edge here has no error to surface it.
  */
 function addSymmetricEdge(
   paths: BusPaths,
@@ -107,16 +119,24 @@ function addSymmetricEdge(
   field: 'blocks' | 'blocked_by',
   peerId: string,
 ): void {
-  const filePath = findTaskFile(paths, taskId);
-  if (!filePath) return; // Peer task missing — surfaced at resolution time.
-  try {
+  const lookup = findTaskFileWithStatus(paths, taskId);
+  if (!lookup.path) {
+    if (lookup.unreadable) {
+      throw new Error(`Peer task ${taskId} could not be read while syncing a '${field}' edge`);
+    }
+    return; // Genuinely missing peer — surfaced at resolution time, not an error here.
+  }
+  const filePath = lookup.path;
+  const lockDir = taskLockDir(filePath);
+  mkdirSync(lockDir, { recursive: true });
+  withFileLockSync(lockDir, () => {
     const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
     const list = task[field] ?? [];
     if (!list.includes(peerId)) {
       task[field] = [...list, peerId];
       atomicWriteSync(filePath, JSON.stringify(task));
     }
-  } catch { /* best-effort */ }
+  });
 }
 
 /**
@@ -152,6 +172,21 @@ function resolveTaskId(paths: BusPaths, id: string): string {
  */
 function taskLockDir(filePath: string): string {
   return join(dirname(filePath), '.task-locks', basename(filePath));
+}
+
+/**
+ * Single lock shared by every call that validates-then-writes a
+ * `blocked_by`/`blocks` edge (createTask and updateTask). detectCycleOrThrow
+ * reads peer task files with no lock of its own, so two concurrent calls can
+ * each validate against a graph the other is about to change and both pass —
+ * individually cycle-free, jointly cyclic. Serializing the whole
+ * validate-then-write-then-mutate-peers sequence behind one lock removes the
+ * race instead of trying to catch it after the fact. Taken BEFORE any
+ * per-task lock (taskLockDir) a call also needs, never the reverse, so the
+ * two lock types never wait on each other.
+ */
+function taskGraphLockDir(paths: BusPaths): string {
+  return join(paths.taskDir, '.task-locks', '.graph');
 }
 
 /**
@@ -461,10 +496,17 @@ function findTaskFileByPrefix(
  * AFTER creation (that's why a task transitions to `blocked` at all), and
  * create-task already owns the initial full list. IDs already present in
  * blocked_by are silently deduped rather than re-validated or re-audited —
- * only genuinely new edges go through the cycle check and get a symmetric
- * `blocks` edge written on the peer, mirroring createTask's own
- * validate-before-write / mutate-peers-after-write ordering so a rejected
- * cycle never leaves partial state on disk.
+ * only genuinely new edges go through the cycle check, mirroring createTask's
+ * own validate-before-write / mutate-peers-after-write ordering so a rejected
+ * cycle never leaves partial state on disk. The reciprocal `blocks` edge is
+ * synced for every RESOLVED blocker, not just the new ones — a blocker whose
+ * primary edge already exists but whose peer `blocks` edge was lost (e.g. to
+ * an earlier unlocked write) gets repaired on the next call that names it,
+ * rather than staying silently missing forever because it's no longer "new".
+ *
+ * @returns `newBlockers` — the canonical ids actually added to `blocked_by`
+ * this call (already deduped/resolved), so a caller can report what changed
+ * instead of echoing back its own raw, pre-dedup input.
  */
 export function updateTask(
   paths: BusPaths,
@@ -488,7 +530,7 @@ export function updateTask(
      */
     actor?: string;
   } = {},
-): void {
+): { newBlockers: string[] } {
   const blockedByInput = opts.blockedBy ?? [];
   // `actor` is metadata about the update, not a field being updated — it
   // deliberately does not satisfy this guard.
@@ -514,68 +556,84 @@ export function updateTask(
   let prevStatus: TaskStatus | undefined;
   const noteParts: string[] = [];
   let newBlockers: string[] = [];
+  let blockersToSync: string[] = [];
+  let canonicalId = taskId;
   const lockDir = taskLockDir(filePath);
-  try {
-    mkdirSync(lockDir, { recursive: true });
-    withFileLockSync(lockDir, () => {
-      const content = readFileSync(filePath, 'utf-8');
-      const task: Task = JSON.parse(content);
-      prevStatus = task.status;
-      const selfId = task.id ?? taskId;
+  // Graph lock first, per-task lock second — see taskGraphLockDir's doc.
+  // Wraps validation, the primary write, AND the peer-edge sync below so a
+  // concurrent createTask/updateTask can never validate against (or mutate
+  // peers of) a graph this call is still in the middle of changing.
+  const graphLock = taskGraphLockDir(paths);
+  mkdirSync(graphLock, { recursive: true });
+  withFileLockSync(graphLock, () => {
+    try {
+      mkdirSync(lockDir, { recursive: true });
+      withFileLockSync(lockDir, () => {
+        const content = readFileSync(filePath, 'utf-8');
+        const task: Task = JSON.parse(content);
+        prevStatus = task.status;
+        const selfId = task.id ?? taskId;
+        canonicalId = selfId;
 
-      const currentBlockedBy = task.blocked_by ?? [];
-      // Resolve every input through its canonical id BEFORE dedup/cycle-check/
-      // storage (see resolveTaskId's own doc) and dedup the resolved set —
-      // two different spellings (or two literal repeats) of the same blocker
-      // must collapse to one stored edge. A self-reference (including via a
-      // prefix of this task's own id, once resolved to selfId) is deliberately
-      // NOT filtered out here — it must reach detectCycleOrThrow below, whose
-      // `cur === newTaskId` check is what turns it into the same "Dependency
-      // cycle: X ultimately blocks itself via X" error a longer cycle gets.
-      // Filtering it out here would silently drop it instead of rejecting it.
-      const resolvedInput = [...new Set(blockedByInput.map(id => resolveTaskId(paths, id)))];
-      newBlockers = resolvedInput.filter(depId => !currentBlockedBy.includes(depId));
-      if (newBlockers.length) {
-        // Cycle check BEFORE any field mutation, same ordering rule createTask
-        // enforces — a rejected cycle must never leave partial state on disk.
-        // The virtual task carries the FULL post-update blocked_by set (old +
-        // new), not just the new edges, so a cycle running back through an
-        // already-existing blocker is still caught.
-        const virtualTask = { id: selfId, blocked_by: [...currentBlockedBy, ...newBlockers] };
-        detectCycleOrThrow(paths, selfId, newBlockers, virtualTask);
-        task.blocked_by = [...currentBlockedBy, ...newBlockers];
-        noteParts.push(`blocked_by: +[${newBlockers.join(', ')}]`);
-      }
+        const currentBlockedBy = task.blocked_by ?? [];
+        // Resolve every input through its canonical id BEFORE dedup/cycle-check/
+        // storage (see resolveTaskId's own doc) and dedup the resolved set —
+        // two different spellings (or two literal repeats) of the same blocker
+        // must collapse to one stored edge. A self-reference (including via a
+        // prefix of this task's own id, once resolved to selfId) is deliberately
+        // NOT filtered out here — it must reach detectCycleOrThrow below, whose
+        // `cur === newTaskId` check is what turns it into the same "Dependency
+        // cycle: X ultimately blocks itself via X" error a longer cycle gets.
+        // Filtering it out here would silently drop it instead of rejecting it.
+        const resolvedInput = [...new Set(blockedByInput.map(id => resolveTaskId(paths, id)))];
+        blockersToSync = resolvedInput;
+        newBlockers = resolvedInput.filter(depId => !currentBlockedBy.includes(depId));
+        if (newBlockers.length) {
+          // Cycle check BEFORE any field mutation, same ordering rule createTask
+          // enforces — a rejected cycle must never leave partial state on disk.
+          // The virtual task carries the FULL post-update blocked_by set (old +
+          // new), not just the new edges, so a cycle running back through an
+          // already-existing blocker is still caught.
+          const virtualTask = { id: selfId, blocked_by: [...currentBlockedBy, ...newBlockers] };
+          detectCycleOrThrow(paths, selfId, newBlockers, virtualTask);
+          task.blocked_by = [...currentBlockedBy, ...newBlockers];
+          noteParts.push(`blocked_by: +[${newBlockers.join(', ')}]`);
+        }
 
-      if (status !== undefined) task.status = status;
-      if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
-        noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
-        task.assigned_to = opts.assignee;
-      }
-      if (opts.project !== undefined && opts.project !== task.project) {
-        noteParts.push(`project: '${task.project}' -> '${opts.project}'`);
-        task.project = opts.project;
-      }
-      if (opts.priority !== undefined && opts.priority !== task.priority) {
-        noteParts.push(`priority: ${task.priority} -> ${opts.priority}`);
-        task.priority = opts.priority;
-      }
-      if (opts.appendDesc !== undefined) {
-        const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-        const marker = `\n\n--- APPENDED ${stamp} ---\n${opts.appendDesc}`;
-        task.description = (task.description ?? '') + marker;
-        noteParts.push(`description: appended ${opts.appendDesc.length} chars`);
-      }
-      task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-      atomicWriteSync(filePath, JSON.stringify(task));
-    });
-  } catch (err) {
-    throw new Error(`Task ${taskId} update failed: ${err}`);
-  }
+        if (status !== undefined) task.status = status;
+        if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
+          noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
+          task.assigned_to = opts.assignee;
+        }
+        if (opts.project !== undefined && opts.project !== task.project) {
+          noteParts.push(`project: '${task.project}' -> '${opts.project}'`);
+          task.project = opts.project;
+        }
+        if (opts.priority !== undefined && opts.priority !== task.priority) {
+          noteParts.push(`priority: ${task.priority} -> ${opts.priority}`);
+          task.priority = opts.priority;
+        }
+        if (opts.appendDesc !== undefined) {
+          const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+          const marker = `\n\n--- APPENDED ${stamp} ---\n${opts.appendDesc}`;
+          task.description = (task.description ?? '') + marker;
+          noteParts.push(`description: appended ${opts.appendDesc.length} chars`);
+        }
+        task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+        atomicWriteSync(filePath, JSON.stringify(task));
+      });
+    } catch (err) {
+      throw new Error(`Task ${taskId} update failed: ${err}`);
+    }
 
-  // Symmetric edge maintenance — mirrors createTask's own post-write step.
-  // Cycle-safe now: validation already passed above.
-  for (const depId of newBlockers) addSymmetricEdge(paths, depId, 'blocks', taskId);
+    // Symmetric edge maintenance — mirrors createTask's own post-write step.
+    // Cycle-safe now: validation already passed above. Synced against EVERY
+    // resolved blocker (blockersToSync), not just newBlockers, so a call that
+    // repeats an already-stored blocker still repairs a missing reverse edge;
+    // keyed by canonicalId, not the caller's possibly-a-prefix taskId, so the
+    // peer's `blocks` list and this task's `blocked_by` list agree on spelling.
+    for (const depId of blockersToSync) addSymmetricEdge(paths, depId, 'blocks', canonicalId);
+  }); // end graphLock
 
   appendTaskAudit(paths, taskId, {
     event: 'update',
@@ -584,6 +642,8 @@ export function updateTask(
     to: status ?? prevStatus,
     ...(noteParts.length ? { note: noteParts.join(', ') } : {}),
   });
+
+  return { newBlockers };
 }
 
 /**

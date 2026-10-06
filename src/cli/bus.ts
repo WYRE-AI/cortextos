@@ -481,7 +481,7 @@ busCommand
     }
 
     try {
-      updateTask(paths, id, status as TaskStatus | undefined, {
+      const { newBlockers } = updateTask(paths, id, status as TaskStatus | undefined, {
         assignee: opts.assignee,
         project: opts.project,
         priority: opts.priority as Priority | undefined,
@@ -507,7 +507,11 @@ busCommand
           opts.project !== undefined ? `project -> ${opts.project}` : null,
           opts.priority !== undefined ? `priority -> ${opts.priority}` : null,
           opts.appendDesc !== undefined ? 'description appended' : null,
-          blockedBy.length > 0 ? `blocked_by +[${blockedBy.join(', ')}]` : null,
+          // Report the canonical ids updateTask actually added, not the raw
+          // --blocked-by input: a prefix resolves to a full id, and an
+          // already-present/duplicate blocker adds nothing — echoing the
+          // input back would misreport both cases as a successful addition.
+          newBlockers.length > 0 ? `blocked_by +[${newBlockers.join(', ')}]` : null,
         ].filter(Boolean);
         console.log(`Updated ${id}: ${changes.join(', ')}`);
       }
