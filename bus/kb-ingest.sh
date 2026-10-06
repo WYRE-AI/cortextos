@@ -113,15 +113,53 @@ for path in "${PATHS[@]}"; do
   echo "  Source: $path"
 done
 
-"$VENV_DIR/bin/python3" "$MMRAG_PY" ingest "${PATHS[@]}" \
-  --collection "$COLLECTION" \
-  ${FORCE}
+# mmrag.py's exit code is NOT reliable: cmd_ingest catches per-file
+# exceptions, tallies them into a printed "Errors: N" line, and always
+# returns 0 regardless of N. A 429 RESOURCE_EXHAUSTED (embedding quota,
+# not availability — clears within single-digit minutes, not a full 4h
+# cycle; see HEARTBEAT.md's KB-INGEST-429-RULE-v2) is the common case, but
+# the rc=0-with-Errors:N shape applies to any per-file failure. So this
+# script captures mmrag.py's output itself rather than trusting $?, and on
+# a 429/RESOURCE_EXHAUSTED retries once after a jittered delay — the same
+# 60-180s wait + single retry an agent would otherwise have to remember to
+# do by hand per that rule. Re-running is safe: mmrag.py dedups already-
+# ingested content, so a retry only re-attempts the file(s) that failed.
+OUT_FILE="$(mktemp)"
+trap 'rm -f "$OUT_FILE"' EXIT
 
+run_mmrag_ingest() {
+  set +e
+  "$VENV_DIR/bin/python3" "$MMRAG_PY" ingest "${PATHS[@]}" \
+    --collection "$COLLECTION" \
+    ${FORCE} 2>&1 | tee "$OUT_FILE"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  return "$rc"
+}
+
+run_mmrag_ingest
 exit_code=$?
-if [[ $exit_code -eq 0 ]]; then
+
+if grep -qE '429|RESOURCE_EXHAUSTED' "$OUT_FILE"; then
+  delay=$((60 + RANDOM % 121))
   echo ""
-  echo "Ingest complete → collection: $COLLECTION"
-else
+  echo "Detected a 429/RESOURCE_EXHAUSTED per-file error — waiting ${delay}s (jittered) and retrying once"
+  sleep "$delay"
+  run_mmrag_ingest
+  exit_code=$?
+fi
+
+error_count=$(grep -oE 'Errors: [0-9]+' "$OUT_FILE" | tail -1 | grep -oE '[0-9]+' || true)
+error_count="${error_count:-0}"
+
+if [[ $exit_code -ne 0 ]]; then
   echo "Ingest failed (exit $exit_code)"
   exit $exit_code
+elif [[ "$error_count" -gt 0 ]]; then
+  echo ""
+  echo "Ingest NOT clean → collection: $COLLECTION — ${error_count} per-file error(s) remain after retry, see output above. Skipping for now; retry at next heartbeat."
+  exit 1
+else
+  echo ""
+  echo "Ingest complete → collection: $COLLECTION"
 fi
