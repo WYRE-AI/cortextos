@@ -325,11 +325,11 @@ const PRECEDENT_CUE_WINDOW_AFTER = 40;
 // ORIGINAL mention, not later re-mentions appended by the checker's own
 // follow-up notes.
 //
-// "tool artifact" is deliberately the only cue here, not a broader set like
+// "tool artifact" is deliberately a narrow cue, not a broader set like
 // "already resolved" — that phrase is common enough in ordinary prose that
 // using it as a suppression trigger risks silently hiding a genuinely still-
 // open reference that happens to share the wording. "tool artifact" is the
-// specific, narrow phrase this org's own re-verify convention already
+// specific, narrow phrase this org's own re-verify convention first
 // converged on for exactly this dismissal (verified against the live task
 // corpus before adding: appears exactly twice across every task on disk,
 // both instances being this exact case) — same "narrow explicit cue over
@@ -340,7 +340,24 @@ const PRECEDENT_CUE_WINDOW_AFTER = 40;
 // a dismissal note appended much later (often hundreds of characters past
 // the original mention) is exactly the shape that needs catching, and a
 // windowed check anchored only to the first occurrence would miss it.
-const DISMISSAL_MARKER_CUE_REGEX = /\btool artifact\b/gi;
+//
+// task_1791304069371_33839624 (analyst, 2026-10-06): a SECOND dismissal
+// idiom has since converged independently — "resolved-ref (analyst): PR
+// #NNN = <repo>", used specifically to record that a bare "PR #NN"
+// mention's REPO has been determined (the exact ambiguity this sweep's
+// unverified_external_ref check exists to flag). Unlike "tool artifact"
+// (the mention was never a real blocker) this cue means something subtly
+// different (the mention IS real, but the one fact this check can't
+// derive — which repo — is now on record), yet the correct fleet action is
+// identical: stop re-flagging it. Confirmed before adding, same discipline
+// as the original: 23 occurrences across every task on disk, zero negated
+// ("not a resolved-ref" or similar) — same narrow-cue bar "tool artifact"
+// was held to. Deliberately NOT adding the sibling "re-verify" idiom seen
+// in the same corpus: that one re-confirms a PR's time-varying MERGE STATE,
+// which can genuinely change between cycles, so suppressing on it would
+// hide a real status change (e.g. a PR merging) rather than just silencing
+// noise about a fact (the repo) that cannot change.
+const DISMISSAL_MARKER_CUE_REGEX = /\b(tool artifact|resolved-ref)\b/gi;
 const DISMISSAL_CUE_WINDOW = 120;
 
 // task_1788276323687 (grower, non-author review of the PR that introduced
