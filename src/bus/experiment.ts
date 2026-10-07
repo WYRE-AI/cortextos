@@ -4,7 +4,26 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomString } from '../utils/random.js';
 import { discoverAllAgents, resolveAgentDir } from '../utils/agent-dir.js';
 import { getApproval } from './approval.js';
+import { withFileLockSync } from '../utils/lock.js';
 import type { BusPaths } from '../types/index.js';
+
+/**
+ * Lock scope for active.json read-modify-write sequences, shared by
+ * runExperiment's write and evaluateExperiment/closeExperiment's
+ * check-then-unlink. Without it, a concurrent runExperiment can write a new
+ * active.json for experiment Y between evaluateExperiment's id check on
+ * experiment X and its unlink call — the unlink then fires unconditionally
+ * on whatever is on disk at that instant and deletes Y's pointer, not X's.
+ * Scoped to the whole `experiments/` dir (one lock per agent), not a single
+ * file, since the race is between a WRITE to active.json and a separate
+ * READ+DELETE of it — the thing needing serialization is the directory
+ * entry, not any one file's own contents.
+ */
+function experimentsLockDir(agentDir: string): string {
+  const dir = join(agentDir, 'experiments');
+  ensureDir(dir);
+  return dir;
+}
 
 // --- Types ---
 
@@ -414,10 +433,11 @@ export function runExperiment(
 
   saveExperiment(agentDir, experiment);
 
-  // Write active.json
-  const activeDir = join(agentDir, 'experiments');
-  ensureDir(activeDir);
-  atomicWriteSync(join(activeDir, 'active.json'), JSON.stringify(experiment, null, 2));
+  // Write active.json — locked against evaluateExperiment/closeExperiment's
+  // check-then-unlink on the same agent (see experimentsLockDir's doc).
+  withFileLockSync(experimentsLockDir(agentDir), () => {
+    atomicWriteSync(join(agentDir, 'experiments', 'active.json'), JSON.stringify(experiment, null, 2));
+  });
 
   return experiment;
 }
@@ -609,15 +629,32 @@ export function evaluateExperiment(
     .join('\n');
   appendFileSync(learningsPath, learningEntry + '\n', 'utf-8');
 
-  // Remove active.json
-  const activePath = join(expDir, 'active.json');
-  if (existsSync(activePath)) {
+  // Remove active.json — only when it names THIS experiment (mirrors
+  // closeExperiment's identical guard below): relies on the one-running-
+  // experiment-per-agent invariant, but if that's ever violated by a stale
+  // orphaned running record predating the current active one, clearing
+  // unconditionally would wipe a different experiment's active pointer.
+  // Locked against runExperiment's write (see experimentsLockDir's doc) so a
+  // concurrent new experiment can't land its own active.json between the id
+  // check and the unlink below.
+  withFileLockSync(experimentsLockDir(agentDir), () => {
+    const activePath = join(expDir, 'active.json');
+    if (!existsSync(activePath)) return;
+    let active: Experiment;
     try {
-      unlinkSync(activePath);
+      active = JSON.parse(readFileSync(activePath, 'utf-8').trim()) as Experiment;
     } catch {
-      // ignore
+      // active.json corruption isn't this function's problem — leave it.
+      return;
     }
-  }
+    // Only the parse above is allowed to fail silently. A failing unlink
+    // (permissions, disk) must propagate — swallowing it would return a
+    // completed experiment while active.json still points to it, which
+    // reads as successful cleanup to every caller.
+    if (active.id === experimentId) {
+      unlinkSync(activePath);
+    }
+  });
 
   return experiment;
 }
@@ -741,18 +778,22 @@ export function closeExperiment(
   // active experiment must clear it too, or a stale entry keeps pointing at
   // a run that's now terminal. Only removes it when it names THIS
   // experiment — a proposed experiment being closed was never active, and a
-  // different experiment's active run must not be disturbed.
-  const activePath = join(agentDir, 'experiments', 'active.json');
-  if (existsSync(activePath)) {
+  // different experiment's active run must not be disturbed. Same lock and
+  // same parse-vs-unlink error split as evaluateExperiment — see its comment
+  // and experimentsLockDir's doc.
+  withFileLockSync(experimentsLockDir(agentDir), () => {
+    const activePath = join(agentDir, 'experiments', 'active.json');
+    if (!existsSync(activePath)) return;
+    let active: Experiment;
     try {
-      const active = JSON.parse(readFileSync(activePath, 'utf-8').trim()) as Experiment;
-      if (active.id === experimentId) {
-        unlinkSync(activePath);
-      }
+      active = JSON.parse(readFileSync(activePath, 'utf-8').trim()) as Experiment;
     } catch {
-      // active.json corruption isn't this function's problem — leave it.
+      return;
     }
-  }
+    if (active.id === experimentId) {
+      unlinkSync(activePath);
+    }
+  });
 
   return experiment;
 }
