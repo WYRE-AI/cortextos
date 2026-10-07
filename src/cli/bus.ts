@@ -513,7 +513,16 @@ busCommand
           // input back would misreport both cases as a successful addition.
           newBlockers.length > 0 ? `blocked_by +[${newBlockers.join(', ')}]` : null,
         ].filter(Boolean);
-        console.log(`Updated ${id}: ${changes.join(', ')}`);
+        // Reachable when --blocked-by was the only input and every id
+        // resolved to something already in blocked_by (dedup, not an
+        // addition) — changes ends up empty, and a bare "Updated id: "
+        // with nothing after the colon reads as broken rather than a
+        // deliberate no-op.
+        console.log(
+          changes.length > 0
+            ? `Updated ${id}: ${changes.join(', ')}`
+            : `Updated ${id}: no changes (blocker(s) already present)`,
+        );
       }
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));

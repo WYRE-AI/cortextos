@@ -246,6 +246,27 @@ describe.skipIf(!existsSync(DIST_CLI))(
       expect(stdout).toBe("");
     });
 
+    it("update-task --blocked-by on an already-present blocker reports a clean no-op, not a bare trailing colon (analyst's finding on #141)", async () => {
+      writeTask("task_real_blk_001", { blocked_by: ["task_real_blk_002"] });
+      writeTask("task_real_blk_002");
+
+      const { stdout, code } = await runCli([
+        "bus",
+        "update-task",
+        "task_real_blk_001",
+        "--blocked-by",
+        "task_real_blk_002",
+      ]);
+
+      expect(code).toBe(0);
+      // Pre-fix: the changes array ends up empty (nothing was newly added)
+      // and this printed "Updated task_real_blk_001: " with nothing after
+      // the colon.
+      expect(stdout.trim()).toBe(
+        "Updated task_real_blk_001: no changes (blocker(s) already present)",
+      );
+    });
+
     it("update-task --priority changes the priority without a status argument", async () => {
       writeTask("task_real_006");
       const { stdout, code } = await runCli([
