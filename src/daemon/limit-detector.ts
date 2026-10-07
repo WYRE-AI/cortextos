@@ -23,8 +23,11 @@ export function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, '');
 }
 
-const LIMIT_RE = /You'vehityour(weekly|session|usage)?limit/i;
+const LIMIT_RE = /You'vehityour(weekly|session|usage)?limit/gi;
 const DIALOG_RE = /Whatdoyouwanttodo\?|\/rate-limit-options/i;
+// Markers only the rate-limit dialog renders. "What do you want to do?" alone is
+// generic, so it cannot complete a banner that has already left the window.
+const RATE_LIMIT_DIALOG_RE = /\/rate-limit-options|Stopandwaitforlimittoreset/i;
 const MONTHS = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
 // "resetsJul20at6am(UTC)" | "resets3am(UTC)" | "resets3:30pm(UTC)" — normalized (no spaces)
 const RESET_DATE_RE = /resets([A-Za-z]{3})(\d{1,2})at(\d{1,2})(?::(\d{2}))?([ap])m\(UTC\)/i;
@@ -77,36 +80,103 @@ export function parseResetHint(normalized: string, now: number): number | null {
   return null;
 }
 
-export function scanForLimit(window: string, now: number): LimitEvent | null {
-  const normalized = window.replace(/\s+/g, '');
-  const limit = LIMIT_RE.exec(normalized);
-  if (!limit || !DIALOG_RE.test(normalized)) return null;
+// Uses the LAST banner in the window, with the reset hint that follows it, so a
+// newer banner is never reported with an older banner's kind/resetAt.
+function detectLimitPhrase(normalized: string, now: number): LimitEvent | null {
+  const matches = [...normalized.matchAll(LIMIT_RE)];
+  const limit = matches[matches.length - 1];
+  if (!limit) return null;
   const kind = (limit[1]?.toLowerCase() ?? 'unknown') as LimitEvent['kind'];
   return {
     kind,
-    resetAt: parseResetHint(normalized, now),
+    resetAt: parseResetHint(normalized.slice(limit.index), now),
     matchedText: limit[0],
   };
 }
 
+export function scanForLimit(window: string, now: number): LimitEvent | null {
+  const normalized = window.replace(/\s+/g, '');
+  const match = detectLimitPhrase(normalized, now);
+  if (!match || !DIALOG_RE.test(normalized)) return null;
+  return match;
+}
+
+// How long to keep waiting for the dialog marker after the limit phrase is
+// seen, once it has scrolled out of the WINDOW_BYTES rolling window. Bounds
+// the fix below: long enough to span realistic PTY redraw/buffering gaps,
+// short enough that an unrelated later "What do you want to do?" can't fire
+// a stale event off an old banner.
+const ARM_TTL_MS = 2 * 60_000;
+
 /**
  * Per-agent stateful wrapper: rolling window over stripped PTY chunks with
  * re-fire suppression (the TUI re-renders the same banner constantly).
+ *
+ * The limit banner and the dialog marker can arrive in separate push() calls
+ * with enough intervening PTY redraw noise between them that the rolling
+ * window evicts the banner text before the dialog marker is ever seen
+ * alongside it in the same window — `scanForLimit` alone would silently miss
+ * that case. Once the limit phrase is seen, remember it ("armed") outside
+ * the window so a later window can still complete the match on a
+ * rate-limit-specific dialog marker alone, bounded by ARM_TTL_MS.
  */
 export class LimitScanner {
   private window = '';
   private suppressedUntil = 0;
+  private armed: (LimitEvent & { armedAt: number }) | null = null;
+  // Total normalized length of everything pushed so far. The normalized window
+  // is always a suffix of the normalized stream, so this gives each banner match
+  // a stable stream offset for telling a fresh banner from one already seen.
+  private streamLen = 0;
+  private lastBannerEnd = -1;
   constructor(private readonly now: () => number = () => Date.now()) {}
 
   push(chunk: string): LimitEvent | null {
-    this.window = (this.window + stripAnsi(chunk)).slice(-WINDOW_BYTES);
+    const stripped = stripAnsi(chunk);
+    this.window = (this.window + stripped).slice(-WINDOW_BYTES);
+    this.streamLen += stripped.replace(/\s+/g, '').length;
     const t = this.now();
     if (t < this.suppressedUntil) return null;
-    const ev = scanForLimit(this.window, t);
-    if (ev) {
+
+    if (this.armed && t - this.armed.armedAt > ARM_TTL_MS) {
+      this.armed = null; // dialog never came within a plausible render gap
+    }
+
+    const normalized = this.window.replace(/\s+/g, '');
+    const inWindow = detectLimitPhrase(normalized, t);
+    if (inWindow) {
+      // A banner ending past the last one seen is a new occurrence (including a
+      // re-render of the same limit) and renews the arm; a banner still sitting
+      // in the window from an earlier push does not.
+      const bannerEnd = this.streamLen - normalized.length +
+        normalized.lastIndexOf(inWindow.matchedText) + inWindow.matchedText.length;
+      const isNewBanner = bannerEnd > this.lastBannerEnd;
+      this.lastBannerEnd = Math.max(this.lastBannerEnd, bannerEnd);
+      if (isNewBanner || !this.armed ||
+        inWindow.kind !== this.armed.kind ||
+        inWindow.resetAt !== this.armed.resetAt) {
+        this.armed = { ...inWindow, armedAt: t };
+      }
+    }
+    if (!this.armed) return null;
+
+    // Always require the STRICT dialog marker to complete an event, whether
+    // the banner is still in the window or already evicted (CodeRabbit PR
+    // #211 review). The loose DIALOG_RE's "What do you want to do?" is
+    // generic enough to appear in an agent's ordinary conversation —
+    // e.g. this very file's own quoted limit phrase, discussed in a reply
+    // that separately asks "what do you want to do about this PR?" within
+    // ARM_TTL_MS — which would otherwise arm-and-complete a false event
+    // purely from co-occurrence, with no real banner involved at all. A
+    // genuine rate-limit dialog always renders one of RATE_LIMIT_DIALOG_RE's
+    // markers too, so this loses no real detections.
+    if (RATE_LIMIT_DIALOG_RE.test(normalized)) {
+      const { armedAt, ...ev } = this.armed;
+      this.armed = null;
       this.suppressedUntil = t + REFIRE_SUPPRESS_MS;
       this.window = '';
+      return ev;
     }
-    return ev;
+    return null;
   }
 }
