@@ -1137,7 +1137,14 @@ busCommand
       if (report.status === 'error') {
         console.log(`ERROR: ${report.error}${report.hint ? ` (${report.hint})` : ''}`);
       } else if (report.status === 'clean') {
-        console.log(`Clean — local HEAD ${report.pull_drift!.local_head.slice(0, 8)} matches origin/main and dist/.`);
+        if (report.pull_drift!.ahead) {
+          console.log(
+            `Clean — local HEAD is ${report.pull_drift!.commits_ahead} commit(s) ahead of origin/main ` +
+            `(unmerged branch — routine); dist/ matches origin/main.`,
+          );
+        } else {
+          console.log(`Clean — local HEAD ${report.pull_drift!.local_head.slice(0, 8)} matches origin/main and dist/.`);
+        }
       } else {
         if (report.pull_drift!.behind) {
           console.log(
@@ -1146,6 +1153,14 @@ busCommand
           );
           for (const line of report.pull_drift!.commit_summaries) console.log(`  ${line}`);
           if (report.pull_drift!.truncated) console.log(`  ...(${report.pull_drift!.commits_behind - COMMIT_LOG_LIMIT} more)`);
+        }
+        if (report.pull_drift!.ahead) {
+          // Not part of `status` — informational. A build-drift reason below
+          // (e.g. a dirty tree) can co-occur with an otherwise-routine
+          // ahead-of-origin feature branch; this line just makes that visible.
+          console.log(
+            `(local is also ${report.pull_drift!.commits_ahead} commit(s) ahead of origin/main — unmerged branch, not itself a problem)`,
+          );
         }
         if (report.build_drift!.stale) {
           console.log(`BUILD DRIFT: ${report.build_drift!.reason}`);

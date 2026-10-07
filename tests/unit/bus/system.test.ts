@@ -839,7 +839,44 @@ describe('Bus System', () => {
       expect(report.pull_drift?.commits_behind).toBe(1);
       expect(report.pull_drift?.commit_summaries).toHaveLength(1);
       expect(report.pull_drift?.commit_summaries[0]).toContain('second');
-      // build_drift stays clean — dist/ still matches the (unchanged) local HEAD.
+      // build_drift is now ALSO stale: dist was built against local's old
+      // HEAD, and origin/main has since passed it — dist no longer matches
+      // what SHOULD be deployed (task_1790474589393_02140942's fix judges
+      // build staleness against origin/main, not local HEAD). drift_kind is
+      // 'both', not 'pull' — a genuinely more accurate signal than before,
+      // since dist really is behind the deploy target now, not just behind
+      // whatever happens to be checked out locally. The reason still says
+      // "behind" rather than warning about a discard, because builtSha (the
+      // old local HEAD) is an ancestor of the new origin/main.
+      expect(report.build_drift?.stale).toBe(true);
+      expect(report.build_drift?.reason).toMatch(/behind/i);
+      expect(report.build_drift?.reason).not.toMatch(/NOT an ancestor/);
+      expect(report.drift_kind).toBe('both');
+    });
+
+    // task_1790474589393_02140942: a shared checkout sitting on an unmerged
+    // feature branch, ahead of origin/main, with dist/ correctly built from
+    // origin/main's tip, previously reported false `build_drift.stale` with
+    // a "run npm run build" hint that would have rebuilt from the unmerged
+    // branch — because the old code compared against local HEAD instead of
+    // origin/main. This is the exact false positive analyst reproduced live.
+    it('reports clean when local checkout is ahead of origin/main on an unmerged branch and dist/ matches origin/main', () => {
+      const originHead = sh('git rev-parse HEAD', localDir);
+      // dist/ was built from origin/main's tip — the correctly-deployed state.
+      writeManifest(originHead);
+
+      sh('git checkout -q -b feature', localDir);
+      writeFileSync(join(localDir, 'feature.txt'), 'wip');
+      sh('git add feature.txt && git commit -q -m "feature commit 1"', localDir);
+      writeFileSync(join(localDir, 'feature2.txt'), 'wip2');
+      sh('git add feature2.txt && git commit -q -m "feature commit 2"', localDir);
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('clean');
+      expect(report.pull_drift?.behind).toBe(false);
+      expect(report.pull_drift?.ahead).toBe(true);
+      expect(report.pull_drift?.commits_ahead).toBe(2);
       expect(report.build_drift?.stale).toBe(false);
     });
 
