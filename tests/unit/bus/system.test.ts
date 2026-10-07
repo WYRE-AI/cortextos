@@ -529,6 +529,44 @@ describe('Bus System', () => {
       expect(report.entries).toHaveLength(0);
     });
 
+    // task_1791338859905 (theta-wave, 2026-10-07): a structured dismissal
+    // is authoritative on its own — no prose cue needed nearby at all.
+    it('does not flag a PR reference recorded in dismissed_refs, with no dismissal prose anywhere in the text', () => {
+      writeTask('myorg', {
+        id: 'task_structured_dismissal',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'Blocked on PR #67.',
+        dismissed_refs: [
+          { ref: 'PR #67', repo: 'WYRE-AI/conduit', reason: 'checked, merged', dismissed_by: 'analyst', dismissed_at: '2026-10-07T00:00:00Z' },
+        ],
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
+    // A structured dismissal on ONE ref must not suppress a different,
+    // genuinely still-open ref in the same task.
+    it('still flags a different PR reference when dismissed_refs names only one of two mentions', () => {
+      writeTask('myorg', {
+        id: 'task_partial_structured_dismissal',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'Blocked on PR #67 and PR #68.',
+        dismissed_refs: [
+          { ref: 'PR #67', reason: 'checked, merged', dismissed_by: 'analyst', dismissed_at: '2026-10-07T00:00:00Z' },
+        ],
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #68');
+      expect(report.entries[0].detail).not.toContain('PR #67');
+    });
+
     // task_1786902033624 (grower/analyst, 2026-08-20 then again 2026-08-22):
     // a check-stale-blockers sweep flagged the SAME task twice, two days
     // apart, both times a false positive — conduit PR #1424 is a real,

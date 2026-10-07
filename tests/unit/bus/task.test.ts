@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, checkTaskDependenciesWithStatus, compactTasks, listTasks, findTaskFile, findTaskFileWithStatus, archiveTasks } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, checkTaskDependenciesWithStatus, compactTasks, listTasks, findTaskFile, findTaskFileWithStatus, archiveTasks, dismissStaleBlockerRef } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -367,6 +367,85 @@ describe('Task Management', () => {
         const ids = result.map(t => t.id);
         expect(ids).toContain(liveCompletedId);
         expect(ids).toContain(archivedId);
+      });
+    });
+
+    // task_1791338859905 (theta-wave, 2026-10-07): a structured alternative
+    // to check-stale-blockers' free-text dismissal recognition, which had
+    // been patched 3 times as the fleet's own phrasing drifted.
+    describe('dismissStaleBlockerRef', () => {
+      function readTaskRecord(id: string) {
+        return JSON.parse(readFileSync(findTaskFile(paths, id)!, 'utf-8'));
+      }
+
+      it('records a dismissal with reason, repo, dismissed_by, and a timestamp', () => {
+        const id = createTask(paths, 'paul', 'acme', 'Investigate PR #67');
+        dismissStaleBlockerRef(paths, id, 'PR #67', { reason: 'precedent citation only', dismissedBy: 'analyst' });
+
+        const entries = readTaskRecord(id).dismissed_refs;
+        expect(entries).toHaveLength(1);
+        expect(entries[0]).toMatchObject({
+          ref: 'PR #67',
+          reason: 'precedent citation only',
+          dismissed_by: 'analyst',
+        });
+        expect(entries[0].dismissed_at).toBeTruthy();
+        expect(entries[0].repo).toBeUndefined();
+      });
+
+      it('records the repo when given', () => {
+        const id = createTask(paths, 'paul', 'acme', 'Investigate PR #67');
+        dismissStaleBlockerRef(paths, id, 'PR #67', {
+          reason: 'repo now known',
+          repo: 'WYRE-AI/conduit',
+          dismissedBy: 'analyst',
+        });
+
+        expect(readTaskRecord(id).dismissed_refs[0].repo).toBe('WYRE-AI/conduit');
+      });
+
+      it('is idempotent on ref: re-dismissing overwrites the earlier entry rather than accumulating duplicates', () => {
+        const id = createTask(paths, 'paul', 'acme', 'Investigate PR #67');
+        dismissStaleBlockerRef(paths, id, 'PR #67', { reason: 'first pass', dismissedBy: 'analyst' });
+        dismissStaleBlockerRef(paths, id, 'PR #67', { reason: 'corrected reason', dismissedBy: 'infra' });
+
+        const entries = readTaskRecord(id).dismissed_refs;
+        expect(entries).toHaveLength(1);
+        expect(entries[0].reason).toBe('corrected reason');
+        expect(entries[0].dismissed_by).toBe('infra');
+      });
+
+      it('a dismissal on one ref does not disturb a dismissal already recorded for a different ref', () => {
+        const id = createTask(paths, 'paul', 'acme', 'PR #67 and PR #68');
+        dismissStaleBlockerRef(paths, id, 'PR #67', { reason: 'reason A', dismissedBy: 'analyst' });
+        dismissStaleBlockerRef(paths, id, 'PR #68', { reason: 'reason B', dismissedBy: 'analyst' });
+
+        const refs = readTaskRecord(id).dismissed_refs.map((d: { ref: string }) => d.ref);
+        expect(refs.sort()).toEqual(['PR #67', 'PR #68']);
+      });
+
+      it('refuses an empty reason', () => {
+        const id = createTask(paths, 'paul', 'acme', 'Investigate PR #67');
+        expect(() =>
+          dismissStaleBlockerRef(paths, id, 'PR #67', { reason: '   ', dismissedBy: 'analyst' }),
+        ).toThrow(/reason cannot be empty/);
+      });
+
+      it('throws on a task that does not exist', () => {
+        expect(() =>
+          dismissStaleBlockerRef(paths, 'task_nonexistent_000', 'PR #67', { reason: 'x', dismissedBy: 'analyst' }),
+        ).toThrow(/not found/);
+      });
+
+      it('writes an audit entry naming the ref', () => {
+        const id = createTask(paths, 'paul', 'acme', 'Investigate PR #67');
+        dismissStaleBlockerRef(paths, id, 'PR #67', { reason: 'precedent only', repo: 'WYRE-AI/conduit', dismissedBy: 'analyst' });
+
+        const log = readTaskAudit(paths, id);
+        const entry = log[log.length - 1];
+        expect(entry.note).toContain('PR #67');
+        expect(entry.note).toContain('WYRE-AI/conduit');
+        expect(entry.agent).toBe('analyst');
       });
     });
   });

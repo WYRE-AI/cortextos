@@ -83,6 +83,31 @@ export interface Task {
    */
   blocks?: string[];
   blocked_by?: string[];
+  /**
+   * Structured record of PR references in this task's title/description
+   * that have been manually checked and dismissed as not a real blocker —
+   * the fact itself (e.g. which repo a bare "PR #NN" belongs to, or that a
+   * mention is a stale text artifact) lives here instead of in free prose.
+   *
+   * check-stale-blockers' unverified_external_ref check prefers this field
+   * when present; the regex-based prose recognition (the "tool artifact" /
+   * "resolved-ref" dismissal cues) is a permanent fallback for tasks
+   * dismissed before this field existed, not a transitional shim to be
+   * removed later — see dismiss-stale-blocker-ref's own doc comment in
+   * task.ts for why a migration was deliberately not attempted.
+   */
+  dismissed_refs?: DismissedRef[];
+}
+
+/** One entry in {@link Task.dismissed_refs}. */
+export interface DismissedRef {
+  /** The reference as it appears in the task text, e.g. "PR #67". */
+  ref: string;
+  /** Repo the PR belongs to, if known (e.g. "WYRE-AI/conduit"). */
+  repo?: string;
+  reason: string;
+  dismissed_by: string;
+  dismissed_at: string; // ISO 8601
 }
 
 // Event Types

@@ -526,7 +526,18 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
         }
         previousMatchEnd = matchIndex + m[0].length;
       }
-      const refs = [...new Set(keptRefs)].filter(ref => !isDismissedElsewhere(text, ref));
+      // Structured dismissals (task_1791338859905, 2026-10-07) are checked
+      // FIRST and are authoritative on their own — a ref recorded here was
+      // manually verified, not pattern-matched, so it never needs the
+      // prose-recognition fallback below to also agree. The regex-based
+      // checks (isPrecedentCitation above, isDismissedElsewhere here) stay
+      // in place permanently for every task dismissed before this field
+      // existed — see dismissStaleBlockerRef's doc comment in task.ts for
+      // why a migration off them was deliberately not attempted.
+      const structurallyDismissed = new Set((task.dismissed_refs ?? []).map(d => d.ref));
+      const refs = [...new Set(keptRefs)].filter(
+        ref => !structurallyDismissed.has(ref) && !isDismissedElsewhere(text, ref),
+      );
       if (refs.length > 0) {
         entries.push({
           task_id: task.id,

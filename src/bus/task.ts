@@ -1,9 +1,10 @@
-import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync } from 'fs';
-import { join } from 'path';
-import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport, BatchStalenessReport } from '../types/index.js';
+import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync, mkdirSync } from 'fs';
+import { join, dirname, basename } from 'path';
+import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport, BatchStalenessReport, DismissedRef } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
 import { validatePriority, validateTaskId } from '../utils/validate.js';
+import { withFileLockSync } from '../utils/lock.js';
 import { logEvent } from './event.js';
 
 /**
@@ -496,6 +497,85 @@ export function updateTask(
     from: prevStatus,
     to: status ?? prevStatus,
     ...(noteParts.length ? { note: noteParts.join(', ') } : {}),
+  });
+}
+
+/**
+ * Lock directory for a per-task read-modify-write, scoped to one task
+ * file so unrelated tasks never contend with each other. Mirrors the
+ * shape `createTask`/`addSymmetricEdge` will need once #141 lands —
+ * written independently here since `dismissStaleBlockerRef` needs its
+ * own race protection regardless of whether that PR has merged yet.
+ */
+function dismissLockDir(filePath: string): string {
+  return join(dirname(filePath), '.task-locks', basename(filePath));
+}
+
+/**
+ * Record that a bare "PR #NN" (or similar) reference in a task's title/
+ * description has been manually checked and dismissed — not a real
+ * blocker, or its repo is now known — so `checkStaleBlockers`' free-text
+ * recognition (task_1791304069371_33839624's "resolved-ref"/"tool
+ * artifact" cues) no longer has to be the only way to record this fact.
+ *
+ * task_1791338859905 (theta-wave, 2026-10-07): that free-text recognition
+ * has now been patched 3 times as the fleet's own dismissal phrasing
+ * drifted (tool-artifact marker, then a GITHUB_PR_URL_REGEX resolution,
+ * then "resolved-ref" today) — a structured field removes the whole
+ * class of future drift instead of chasing the next phrase after it
+ * appears. Deliberately NOT a replacement for the regex-based recognition:
+ * that stays as a PERMANENT fallback for every task dismissed before this
+ * field existed. A one-time migration converting old prose dismissals
+ * into this field was considered and rejected — the existing phrases carry
+ * genuinely different shapes of information (a resolved-ref line names a
+ * repo; a tool-artifact line does not), and a lossy automated conversion
+ * risks silently dropping exactly the fact the dismissal was recording.
+ * The fallback costs one extra branch in checkStaleBlockers, forever —
+ * cheaper than getting a migration wrong on records nobody will re-check.
+ *
+ * Idempotent on `ref`: re-dismissing the same ref overwrites the earlier
+ * entry (new reason/repo/timestamp) rather than accumulating duplicates.
+ */
+export function dismissStaleBlockerRef(
+  paths: BusPaths,
+  taskId: string,
+  ref: string,
+  opts: { reason: string; repo?: string; dismissedBy: string },
+): void {
+  if (!opts.reason.trim()) {
+    throw new Error(
+      'dismissStaleBlockerRef refused: --reason cannot be empty — this is the only durable ' +
+      'record of why this reference is not a real blocker (or what repo it belongs to).',
+    );
+  }
+  const filePath = findTaskFile(paths, taskId);
+  if (!filePath) {
+    throw new Error(`Task ${taskId} not found in any org under ${paths.ctxRoot}/orgs/`);
+  }
+  const lockDir = dismissLockDir(filePath);
+  mkdirSync(lockDir, { recursive: true });
+  try {
+    withFileLockSync(lockDir, () => {
+      const task: Task = JSON.parse(readFileSync(filePath, 'utf-8'));
+      const existing = (task.dismissed_refs ?? []).filter(d => d.ref !== ref);
+      const entry: DismissedRef = {
+        ref,
+        ...(opts.repo ? { repo: opts.repo } : {}),
+        reason: opts.reason.trim(),
+        dismissed_by: opts.dismissedBy,
+        dismissed_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      };
+      task.dismissed_refs = [...existing, entry];
+      task.updated_at = entry.dismissed_at;
+      atomicWriteSync(filePath, JSON.stringify(task));
+    });
+  } catch (err) {
+    throw new Error(`Task ${taskId} dismiss-ref failed: ${err}`);
+  }
+  appendTaskAudit(paths, taskId, {
+    event: 'update',
+    agent: opts.dismissedBy,
+    note: `dismissed_refs: ${ref}${opts.repo ? ` = ${opts.repo}` : ''}`,
   });
 }
 
