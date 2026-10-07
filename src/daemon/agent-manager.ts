@@ -49,6 +49,14 @@ export class AgentManager {
   // the exact kill window that strands inbox .lock.d mutexes.
   private stoppingAll = false;
   private instanceId: string;
+  // a2a-inbox owner enforcement (task_1788132068761_23739797, CodeRabbit
+  // PR #179 review): exactly one agent per instance may set
+  // AgentConfig.a2a_inbox_owner. Tracks the currently-granted owner name so
+  // a second agent claiming the flag is refused (loudly, not silently) at
+  // the one chokepoint both boot-time discovery and a later individual
+  // startAgent (IPC enable, dashboard restart) both pass through — rather
+  // than only checked in a one-time pass over the initial config set.
+  private a2aInboxOwner: string | null = null;
   // Public+readonly: ipc-server.ts's cron-mutation audit logging needs this
   // to build a CTX_ROOT-aware BusPaths via resolvePaths() — see
   // resolveAgentOrg's own visibility change below for the same reason.
@@ -531,6 +539,11 @@ export class AgentManager {
       // FastChecker only needs the first ID for its single-recipient typing
       // indicator / quick-checks. Multi-user is enforced by the gates above.
       allowedUserId: allowedUserId ? parseInt(allowedUserId.split(',')[0].trim(), 10) : undefined,
+      // Fail-quiet default (task_1788132068761_23739797): absent/false on
+      // every agent except the one instance owner that opts in. Enforced
+      // exactly-one-per-instance in claimA2AInboxOwner (CodeRabbit PR #179
+      // review) rather than trusting config.a2a_inbox_owner directly.
+      a2aInboxOwner: this.claimA2AInboxOwner(name, config.a2a_inbox_owner === true, log),
     });
 
     // Send Telegram notification on crashes and session refreshes
@@ -555,6 +568,17 @@ export class AgentManager {
 
     // Start agent
     await agentProcess.start();
+
+    // start() catches PTY spawn failures internally and settles into
+    // 'crashed' rather than throwing (CodeRabbit PR #179 review) — without
+    // this check, a failed startup still leaves claimA2AInboxOwner's claim
+    // assigned above, permanently refusing every subsequent legitimate
+    // owner for the rest of the daemon's life. stopAgent() both tears down
+    // the registry entry just set above and releases that claim.
+    if (agentProcess.getStatus().status !== 'running') {
+      await this.stopAgent(name);
+      return;
+    }
 
     // The PTY pid is persisted by AgentProcess.start() itself. It used to be
     // written here, but this is only ONE of five callers of start() — the
@@ -1076,6 +1100,29 @@ export class AgentManager {
    * Stop a specific agent.
    */
   /**
+   * a2a-inbox owner enforcement (task_1788132068761_23739797, CodeRabbit
+   * PR #179 review): config.a2a_inbox_owner is a per-agent opt-in with no
+   * central validator (matches every other AgentConfig field), so nothing
+   * upstream stops two agents both setting it. Refuse the second claim
+   * here — the one chokepoint both boot-time discovery and a later
+   * individual startAgent (IPC enable, dashboard restart) pass through —
+   * rather than silently letting both poll the same instance-level
+   * a2a-inbox and both inject duplicate notifications. Restarting the
+   * CURRENT owner is not a conflict (stopAgent releases the claim first);
+   * moving ownership to a different agent requires the old owner's config
+   * to be flipped off (or the agent stopped) before the new one restarts.
+   */
+  private claimA2AInboxOwner(name: string, requested: boolean, log: (msg: string) => void): boolean {
+    if (!requested) return false;
+    if (this.a2aInboxOwner !== null && this.a2aInboxOwner !== name) {
+      log(`SECURITY/CONFIG: ${name} has a2a_inbox_owner:true but '${this.a2aInboxOwner}' already holds it for this instance. Refusing the second claim — ${name} will NOT poll a2a-inbox. Exactly one agent per instance may own it; fix config.json.`);
+      return false;
+    }
+    this.a2aInboxOwner = name;
+    return true;
+  }
+
+  /**
    * Drop a registry entry whose PTY is already DEAD, WITHOUT awaiting
    * process.stop() — its onExit may never fire (the exact divergence we fix),
    * so awaiting could hang. Best-effort teardown of the side channels, then
@@ -1105,6 +1152,12 @@ export class AgentManager {
       this.reminderSchedulers.delete(name);
     }
     clearAgentPid(join(this.ctxRoot, 'state', name));
+    // Same release as stopAgent's (CodeRabbit PR #179 review): without it, a
+    // dead owner evicted and reloaded with a2a_inbox_owner:false leaves its
+    // stale claim in place, permanently refusing a different configured
+    // owner until the (now-gone) former owner is stopped through the other
+    // path.
+    if (this.a2aInboxOwner === name) this.a2aInboxOwner = null;
   }
 
   async stopAgent(name: string): Promise<void> {
@@ -1137,6 +1190,10 @@ export class AgentManager {
     await entry.process.stop();
     this.agents.delete(name);
     clearAgentPid(join(this.ctxRoot, 'state', name));
+    // Release the a2a-inbox owner claim so a legitimate restart (or moving
+    // ownership to a different agent's config) doesn't get permanently
+    // refused by the stale name still held from before this stop.
+    if (this.a2aInboxOwner === name) this.a2aInboxOwner = null;
 
     // Stop and remove the agent's cron scheduler (if one was wired)
     const scheduler = this.cronSchedulers.get(name);

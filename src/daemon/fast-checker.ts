@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync } from 'fs';
 import { execFile } from 'child_process';
-import { join } from 'path';
+import { join, basename } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import { readCrons } from '../bus/crons.js';
@@ -16,6 +16,16 @@ import { evaluateHang, evaluateBootstrapHang, mostRecentAnswerableFireMs, hasBea
  * was extracted to close.
  */
 const HANG_GRACE_MS = 15 * 60_000;
+
+/**
+ * Bounds for checkA2AInbox's per-poll work (CodeRabbit PR #179 review): a
+ * backlog accumulated while the owner agent was offline must not stall the
+ * daemon's synchronous poll tick reading/formatting an unbounded number of
+ * files in one pass. Excess files (by count or an individual oversized
+ * file) are left unprocessed for a later poll rather than skipped forever.
+ */
+const A2A_MAX_FILES_PER_POLL = 20;
+const A2A_MAX_FILE_BYTES = 256 * 1024;
 import { isLimitBlocked } from './rotation-manager.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
@@ -126,11 +136,25 @@ export class FastChecker {
   private hangHaltedAt: number | null = null; // when the hang auto-heal halted (null = healthy)
   private hangCircuitFile: string = '';
 
+  // a2a-inbox arrival watch (task_1788132068761_23739797). Fail-quiet by
+  // construction: a2aInboxOwner defaults false, so checkA2AInbox() below is a
+  // no-op for every agent except the one instance owner that opts in via
+  // AgentConfig.a2a_inbox_owner.
+  private a2aInboxOwner: boolean;
+  private a2aNotifiedPath: string = '';
+  private a2aNotified: Set<string> = new Set();
+  // Set when saveA2ANotified() fails to persist — a crash/restart before the
+  // next successful save would reload the OLD on-disk set and re-notify
+  // everything added to a2aNotified since (CodeRabbit PR #179 review). Each
+  // poll retries the save while this is true, independent of whether that
+  // poll found any new arrivals of its own.
+  private a2aNotifiedDirty = false;
+
   constructor(
     agent: AgentProcess,
     paths: BusPaths,
     frameworkRoot: string,
-    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number } = {},
+    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number; a2aInboxOwner?: boolean } = {},
   ) {
     this.agent = agent;
     this.paths = paths;
@@ -140,6 +164,7 @@ export class FastChecker {
     this.telegramApi = options.telegramApi;
     this.chatId = options.chatId;
     this.allowedUserId = options.allowedUserId;
+    this.a2aInboxOwner = options.a2aInboxOwner ?? false;
 
     // Initialize persistent dedup
     this.dedupFilePath = join(paths.stateDir, '.message-dedup-hashes');
@@ -150,6 +175,11 @@ export class FastChecker {
     this.loadCtxCircuit();
     this.hangCircuitFile = join(paths.stateDir, '.hang-circuit.json');
     this.loadHangCircuit();
+
+    if (this.a2aInboxOwner) {
+      this.a2aNotifiedPath = join(paths.stateDir, '.a2a-notified.json');
+      this.loadA2ANotified();
+    }
   }
 
   /**
@@ -290,6 +320,19 @@ export class FastChecker {
       ackIds.push(msg.id);
     }
 
+    // Check a2a-inbox arrivals (no-op unless this agent is the instance's
+    // configured owner — see a2aInboxOwner above).
+    let newlyNotified: string[] = [];
+    if (this.a2aInboxOwner) {
+      // Retry a previously failed persist regardless of whether THIS poll
+      // finds any new arrivals — the in-memory set may already be ahead of
+      // disk from an earlier cycle (see a2aNotifiedDirty's doc).
+      if (this.a2aNotifiedDirty) this.saveA2ANotified();
+      const { formatted, filenames } = this.checkA2AInbox();
+      messageBlock += formatted;
+      newlyNotified = filenames;
+    }
+
     // Inject if there's anything
     if (messageBlock) {
       const injected = this.agent.injectMessage(messageBlock);
@@ -297,6 +340,13 @@ export class FastChecker {
         // ACK inbox messages
         for (const id of ackIds) {
           ackInbox(this.paths, id);
+        }
+        // Persist a2a-notified state only after a confirmed injection —
+        // mirrors the ackIds pattern above so a failed injection retries
+        // the same arrivals next poll instead of silently dropping them.
+        if (newlyNotified.length > 0) {
+          for (const f of newlyNotified) this.a2aNotified.add(f);
+          this.saveA2ANotified();
         }
         this.log(`Injected ${messageBlock.length} bytes`);
         // Only update typing timestamp for Telegram messages, not inbox/cron.
@@ -339,6 +389,128 @@ export class FastChecker {
     return `=== AGENT MESSAGE from ${safeFrom}${replyNote} [msg_id: ${msg.id}] ===
 ${wrapFenceSafe(msg.text)}
 Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.id}
+
+`;
+  }
+
+  /**
+   * Load the persisted a2a-inbox "already notified" filename set. Only
+   * forward-tracking by design (task_1788132068761_23739797 design doc,
+   * "not yet resolved" section, resolved: don't scan/notify pre-existing
+   * processed/ backlog on first boot) — a missing or corrupt file just
+   * starts the set empty rather than failing the daemon.
+   */
+  private loadA2ANotified(): void {
+    try {
+      if (existsSync(this.a2aNotifiedPath)) {
+        const data = JSON.parse(readFileSync(this.a2aNotifiedPath, 'utf-8'));
+        if (Array.isArray(data)) this.a2aNotified = new Set(data);
+      }
+    } catch {
+      // Corrupt state file: start empty. Worst case is one re-notification
+      // per stale entry, not silent data loss.
+      this.a2aNotified = new Set();
+    }
+  }
+
+  private saveA2ANotified(): void {
+    try {
+      writeFileSync(this.a2aNotifiedPath, JSON.stringify([...this.a2aNotified]));
+      this.a2aNotifiedDirty = false;
+    } catch (err) {
+      this.a2aNotifiedDirty = true;
+      this.log(`Failed to persist a2a-notified state: ${err}`);
+    }
+  }
+
+  /**
+   * Poll a2a-inbox for arrivals not yet notified. Arrival-only per design:
+   * never moves, renames, or deletes files — that stays the agent's own
+   * HEARTBEAT.md Step 7.5d processing, unchanged. Returns filenames that
+   * were formatted this cycle so the caller can persist them to the
+   * notified-set ONLY after a confirmed PTY injection (see pollCycle).
+   *
+   * Fail-quiet is enforced HERE, not just at the pollCycle call site — this
+   * method is a safe no-op for every agent that isn't the configured
+   * instance owner, regardless of how it's invoked.
+   */
+  private checkA2AInbox(): { formatted: string; filenames: string[] } {
+    if (!this.a2aInboxOwner) return { formatted: '', filenames: [] };
+    const dir = this.paths.a2aInboxDir;
+    if (!dir || !existsSync(dir)) return { formatted: '', filenames: [] };
+
+    let entries: string[];
+    try {
+      entries = readdirSync(dir).filter((f) => f.endsWith('.json'));
+    } catch {
+      return { formatted: '', filenames: [] };
+    }
+
+    let formatted = '';
+    const filenames: string[] = [];
+    let processed = 0;
+    for (const filename of entries) {
+      if (this.a2aNotified.has(filename)) continue;
+      // Bound total work per poll cycle (CodeRabbit PR #179 review): a
+      // backlog that accumulated while the owner was offline must not block
+      // this synchronous tick on every outstanding file at once — stop and
+      // leave the rest for later polls instead. Excess files are NOT marked
+      // notified, so they're picked up (and counted again against this cap)
+      // next cycle.
+      if (processed >= A2A_MAX_FILES_PER_POLL) break;
+      const filePath = join(dir, filename);
+      try {
+        const size = statSync(filePath).size;
+        if (size > A2A_MAX_FILE_BYTES) {
+          // Pathologically large for a single arrival — skip without
+          // marking notified so a human can investigate, same posture as a
+          // malformed file below, rather than reading it all into memory.
+          this.log(`Skipping oversized a2a-inbox file ${filename} (${size} bytes > ${A2A_MAX_FILE_BYTES} cap)`);
+          processed++;
+          continue;
+        }
+        const raw = readFileSync(filePath, 'utf-8');
+        const msg = JSON.parse(raw);
+        formatted += this.formatA2AMessage(msg);
+        filenames.push(filename);
+      } catch (err) {
+        // Malformed a2a message file: skip it (don't let one bad file block
+        // every other arrival) but don't mark it notified either, so a fix
+        // upstream (or a manual repair) can be picked up next poll.
+        this.log(`Failed to parse a2a-inbox file ${filename}: ${err}`);
+      }
+      processed++;
+    }
+    return { formatted, filenames };
+  }
+
+  /**
+   * Format an a2a-inbox arrival for injection. Mirrors formatInboxMessage's
+   * sanitization posture — sender.name and the payload preview are
+   * externally influenced (a2a-server relays another instance's content).
+   */
+  private formatA2AMessage(msg: {
+    sender?: { name?: string };
+    kind?: string;
+    payload?: { text?: string } & Record<string, unknown>;
+  }): string {
+    // sanitizeForPtyInjection alone is not enough for a HEADER field (as
+    // opposed to a fenced body): it neutralizes known header strings
+    // (=== AGENT MESSAGE / TELEGRAM) but has no entry for the new "A2A
+    // MESSAGE" header this function introduces, so an embedded newline in
+    // sender.name/kind followed by a forged header would pass through
+    // unrecognized (CodeRabbit PR #179 review). Force both to a single line
+    // — the header has no legitimate use for multi-line values — which
+    // closes the whole class regardless of what string is forged after the
+    // newline, rather than only the specific strings the shared sanitizer
+    // happens to enumerate.
+    const toSingleLine = (s: string) => s.replace(/[\r\n]+/g, ' ');
+    const safeName = toSingleLine(sanitizeForPtyInjection(msg.sender?.name || 'unknown'));
+    const safeKind = toSingleLine(sanitizeForPtyInjection(msg.kind || 'unknown'));
+    const preview = typeof msg.payload?.text === 'string' ? msg.payload.text : JSON.stringify(msg.payload ?? {});
+    return `=== A2A MESSAGE from ${safeName} (kind:${safeKind}, instance:${basename(this.paths.ctxRoot)}) ===
+${wrapFenceSafe(preview)}
+Process per HEARTBEAT.md Step 7.5d ("Process A2A inbox") -- do not wait for the next heartbeat.
 
 `;
   }
