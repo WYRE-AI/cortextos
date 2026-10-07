@@ -9,7 +9,7 @@ import { sendToCapability } from '../bus/agents.js';
 import { validateAgentName, validateTaskId, validatePriority, validateCapability, validateKBScope, validateKBQueryScope, validateOrgName } from '../utils/validate.js';
 import { randomDigits } from '../utils/random.js';
 import { resolveMessageBody, resolveOptionalTextField, UnsafeInlineBodyError } from '../utils/resolve-message-body.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, checkBatchStaleness, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependenciesWithStatus, compactTasks, listTasks, checkStaleTasks, checkBatchStaleness, archiveTasks, checkHumanTasks, dismissStaleBlockerRef } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats, readAllHeartbeatRows } from '../bus/heartbeat.js';
@@ -505,6 +505,35 @@ busCommand
         ].filter(Boolean);
         console.log(`Updated ${id}: ${changes.join(', ')}`);
       }
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('dismiss-stale-blocker-ref')
+  .description('Record that a "PR #NN" reference in a task is not a real blocker (or that its repo is now known), so check-stale-blockers stops flagging it — writes a structured dismissed_refs entry instead of relying on free-text prose conventions')
+  .argument('<id>', 'Task ID')
+  .argument('<ref>', 'The reference exactly as it appears in the task text, e.g. "PR #67"')
+  .option('--reason <text>', 'Why this reference is not a real blocker, or what was determined about it (required)')
+  .option('--repo <org/repo>', 'The repo this PR belongs to, if known')
+  .option('--agent <name>', 'Agent performing the dismissal, recorded on the entry (defaults to CTX_AGENT_NAME)')
+  .action((id: string, ref: string, opts: { reason?: string; repo?: string; agent?: string }) => {
+    if (!opts.reason) {
+      console.error('--reason is required — this is the only durable record of why this reference is not a real blocker');
+      process.exit(1);
+    }
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org, env.ctxRoot);
+    const dismissedBy = opts.agent || env.agentName;
+    if (!dismissedBy) {
+      console.error('ERROR: --agent or CTX_AGENT_NAME required');
+      process.exit(1);
+    }
+    try {
+      dismissStaleBlockerRef(paths, id, ref, { reason: opts.reason, repo: opts.repo, dismissedBy });
+      console.log(`Dismissed ${ref} on ${id}${opts.repo ? ` (repo: ${opts.repo})` : ''}`);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
