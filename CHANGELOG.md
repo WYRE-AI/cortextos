@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed — `create-task`/`update-task` didn't validate `--assignee` against the enabled-agents roster
+
+Boss follow-up 2026-08-14 (task_1786739337901_81484880): neither command validated that
+`--assignee` named a real agent, so a typo silently routed a task into the void with no error.
+`validateAssigneeArg` (`src/cli/bus.ts`) now checks the roster via `listAgents`, bypasses on the
+`human`/`user` sentinels, and fails open on an empty roster so CLI-driven integration tests
+against synthetic orgs don't break. Checking at the CLI boundary rather than inside
+`createTask`/`updateTask` keeps library-level callers (tests, scripts) unaffected.
+
+4 integration tests in `tests/integration/bus-task-error-handling-cli.test.ts` cover the actual
+rejection path against a populated roster (every other test in the file runs with an empty roster
+and only exercises the fail-open branch): a typo'd `--assignee` is rejected on both `create-task`
+(no task file written) and `update-task` (`assigned_to` on disk unchanged), a real roster name is
+accepted, and `human`/`user` still bypass the check with a populated roster present.
+
 ### Added — Tier 2 cross-provider fallback (GLM-5.3 / Z.ai), shipped disabled
 
 New `src/daemon/glm-fallback.ts`, entered only from `rotation-manager.ts`'s existing "every Tier 1
