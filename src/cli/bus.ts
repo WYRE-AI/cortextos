@@ -428,15 +428,18 @@ busCommand
 busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
-  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project/--priority/--append-desc is given')
+  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled) — optional when --assignee/--project/--priority/--append-desc/--blocked-by is given')
   .option('--assignee <name>', 'Reroute the task to a different agent')
   .option('--project <name>', 'Change the task\'s project')
   .option('--priority <level>', 'Change the task\'s priority (urgent, high, normal, low)')
   .option('--append-desc <text>', 'Append text to the description with a timestamp — does NOT overwrite the original (a description cannot be edited in place; this keeps a correction visible next to the claim it corrects)')
+  .option('--blocked-by <ids>', 'Add one or more blocker task IDs (comma-separated) — ADDS to the existing blocked_by list, never replaces it; cycle-checked the same way create-task is')
   .option('--agent <name>', 'Agent performing the update, recorded in the audit log (defaults to CTX_AGENT_NAME)')
-  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string; priority?: string; appendDesc?: string; agent?: string }) => {
-    if (status === undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined && opts.appendDesc === undefined) {
-      console.error('Nothing to update — pass a status, --assignee, --project, --priority, and/or --append-desc');
+  .action((id: string, status: string | undefined, opts: { assignee?: string; project?: string; priority?: string; appendDesc?: string; blockedBy?: string; agent?: string }) => {
+    const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
+    const blockedBy = parseList(opts.blockedBy);
+    if (status === undefined && opts.assignee === undefined && opts.project === undefined && opts.priority === undefined && opts.appendDesc === undefined && blockedBy.length === 0) {
+      console.error('Nothing to update — pass a status, --assignee, --project, --priority, --append-desc, and/or --blocked-by');
       process.exit(1);
     }
     if (status !== undefined) {
@@ -478,11 +481,12 @@ busCommand
     }
 
     try {
-      updateTask(paths, id, status as TaskStatus | undefined, {
+      const { newBlockers } = updateTask(paths, id, status as TaskStatus | undefined, {
         assignee: opts.assignee,
         project: opts.project,
         priority: opts.priority as Priority | undefined,
         appendDesc: opts.appendDesc,
+        blockedBy,
         actor,
       });
       if (
@@ -490,7 +494,8 @@ busCommand
         opts.assignee === undefined &&
         opts.project === undefined &&
         opts.priority === undefined &&
-        opts.appendDesc === undefined
+        opts.appendDesc === undefined &&
+        blockedBy.length === 0
       ) {
         // Preserve the original status-only message verbatim — scripts/
         // dashboards may already parse it.
@@ -502,8 +507,22 @@ busCommand
           opts.project !== undefined ? `project -> ${opts.project}` : null,
           opts.priority !== undefined ? `priority -> ${opts.priority}` : null,
           opts.appendDesc !== undefined ? 'description appended' : null,
+          // Report the canonical ids updateTask actually added, not the raw
+          // --blocked-by input: a prefix resolves to a full id, and an
+          // already-present/duplicate blocker adds nothing — echoing the
+          // input back would misreport both cases as a successful addition.
+          newBlockers.length > 0 ? `blocked_by +[${newBlockers.join(', ')}]` : null,
         ].filter(Boolean);
-        console.log(`Updated ${id}: ${changes.join(', ')}`);
+        // Reachable when --blocked-by was the only input and every id
+        // resolved to something already in blocked_by (dedup, not an
+        // addition) — changes ends up empty, and a bare "Updated id: "
+        // with nothing after the colon reads as broken rather than a
+        // deliberate no-op.
+        console.log(
+          changes.length > 0
+            ? `Updated ${id}: ${changes.join(', ')}`
+            : `Updated ${id}: no changes (blocker(s) already present)`,
+        );
       }
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));

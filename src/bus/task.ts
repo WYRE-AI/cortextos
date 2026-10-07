@@ -1,9 +1,10 @@
-import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync } from 'fs';
-import { join } from 'path';
+import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync, mkdirSync } from 'fs';
+import { join, dirname, basename } from 'path';
 import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport, BatchStalenessReport } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
 import { validatePriority, validateTaskId } from '../utils/validate.js';
+import { withFileLockSync } from '../utils/lock.js';
 import { logEvent } from './event.js';
 
 /**
@@ -47,19 +48,6 @@ export function createTask(
   const taskId = `task_${epoch}_${rand}`;
   const now = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 
-  // Dependency validation FIRST — a cycle must never be allowed to
-  // leave partial state on disk. Earlier iteration wrote the task
-  // JSON before detectCycleOrThrow ran, so a failed cycle check left
-  // a dangling task with a one-way edge and no symmetric peer update.
-  // Order is now: validate → write task → mutate peers → audit. The
-  // cycle walker gets a `virtual` description of the not-yet-written
-  // task so chains that pass through it are still detectable.
-  const virtualTask = { id: taskId, blocked_by: blockedBy };
-  if (blockedBy.length) detectCycleOrThrow(paths, taskId, blockedBy, virtualTask);
-  if (blocks.length) {
-    for (const downId of blocks) detectCycleOrThrow(paths, downId, [taskId], virtualTask);
-  }
-
   const task: Task = {
     id: taskId,
     title,
@@ -83,12 +71,41 @@ export function createTask(
   };
 
   ensureDir(paths.taskDir);
-  atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
 
-  // Cycle-safe now: validation already passed, so symmetric-edge
-  // maintenance is just mutating peer JSONs.
-  for (const depId of blockedBy) addSymmetricEdge(paths, depId, 'blocks', taskId);
-  for (const downId of blocks) addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+  // Dependency validation, write, and peer-edge mutation all happen inside
+  // the graph lock — see taskGraphLockDir's doc for why: detectCycleOrThrow
+  // reads peer files unlocked, so without this a concurrent createTask (or
+  // updateTask) could validate against a graph this call is about to change,
+  // and the two could jointly create a cycle neither saw alone. Order within
+  // the lock is unchanged — validate → write task → mutate peers → audit —
+  // so a rejected cycle still never leaves partial state on disk.
+  //
+  // Only taken when blockedBy/blocks is non-empty: a dependency-free create
+  // (the common case) writes a brand-new, uniquely-id'd file nothing else
+  // can be racing to read yet, so there is no graph to protect and no
+  // reason to serialize it against every other create/update fleet-wide.
+  const writeTask = () => {
+    atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
+    // Cycle-safe now: validation already passed, so symmetric-edge
+    // maintenance is just mutating peer JSONs.
+    for (const depId of blockedBy) addSymmetricEdge(paths, depId, 'blocks', taskId);
+    for (const downId of blocks) addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+  };
+
+  if (blockedBy.length || blocks.length) {
+    const graphLock = taskGraphLockDir(paths);
+    mkdirSync(graphLock, { recursive: true });
+    withFileLockSync(graphLock, () => {
+      const virtualTask = { id: taskId, blocked_by: blockedBy };
+      if (blockedBy.length) detectCycleOrThrow(paths, taskId, blockedBy, virtualTask);
+      if (blocks.length) {
+        for (const downId of blocks) detectCycleOrThrow(paths, downId, [taskId], virtualTask);
+      }
+      writeTask();
+    });
+  } else {
+    writeTask();
+  }
 
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
 
@@ -99,6 +116,13 @@ export function createTask(
  * Mutate an existing task to add an edge to its blocks/blocked_by list.
  * No-op if the peer id is already present. Used to maintain symmetric
  * edges when a new task declares its dependencies.
+ *
+ * Locked per-peer-file (not best-effort) so two calls racing on the same
+ * peer — e.g. two different tasks both adding the same blocker — can't lose
+ * each other's edge between the read and the write. A genuinely missing
+ * peer still returns silently (a dangling reference is a valid state); an
+ * unreadable lookup or a failed read/write propagates instead of being
+ * swallowed, since a silently-dropped edge here has no error to surface it.
  */
 function addSymmetricEdge(
   paths: BusPaths,
@@ -106,16 +130,74 @@ function addSymmetricEdge(
   field: 'blocks' | 'blocked_by',
   peerId: string,
 ): void {
-  const filePath = findTaskFile(paths, taskId);
-  if (!filePath) return; // Peer task missing — surfaced at resolution time.
-  try {
+  const lookup = findTaskFileWithStatus(paths, taskId);
+  if (!lookup.path) {
+    if (lookup.unreadable) {
+      throw new Error(`Peer task ${taskId} could not be read while syncing a '${field}' edge`);
+    }
+    return; // Genuinely missing peer — surfaced at resolution time, not an error here.
+  }
+  const filePath = lookup.path;
+  const lockDir = taskLockDir(filePath);
+  mkdirSync(lockDir, { recursive: true });
+  withFileLockSync(lockDir, () => {
     const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
     const list = task[field] ?? [];
     if (!list.includes(peerId)) {
       task[field] = [...list, peerId];
       atomicWriteSync(filePath, JSON.stringify(task));
     }
-  } catch { /* best-effort */ }
+  });
+}
+
+/**
+ * Resolve `id` (which may be a unique prefix — see {@link findTaskFileByPrefix})
+ * to the canonical full id stored in that task's own JSON. Falls back to the
+ * raw `id` unchanged if the task can't be found or read, so a genuinely
+ * dangling/missing reference is still recorded faithfully as typed rather
+ * than silently dropped.
+ *
+ * Callers that store or compare blocker ids MUST resolve through this first —
+ * otherwise a prefix and the full id it resolves to are different strings for
+ * `===`/`includes()` purposes, which breaks both deduplication (the same task
+ * can be "added" twice under two spellings) and cycle detection (a cycle
+ * routed through a prefix form of the id it passes through is never equal to
+ * the canonical form being walked, so the walk never trips).
+ */
+function resolveTaskId(paths: BusPaths, id: string): string {
+  const filePath = findTaskFile(paths, id);
+  if (!filePath) return id;
+  try {
+    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+    return task.id ?? id;
+  } catch {
+    return id;
+  }
+}
+
+/**
+ * Lock directory for serializing concurrent read-modify-write updates to one
+ * task file. Scoped per-task (not per-tasks-directory) so unrelated tasks in
+ * the same org never contend with each other — only two updates racing on
+ * the SAME task actually serialize.
+ */
+function taskLockDir(filePath: string): string {
+  return join(dirname(filePath), '.task-locks', basename(filePath));
+}
+
+/**
+ * Single lock shared by every call that validates-then-writes a
+ * `blocked_by`/`blocks` edge (createTask and updateTask). detectCycleOrThrow
+ * reads peer task files with no lock of its own, so two concurrent calls can
+ * each validate against a graph the other is about to change and both pass —
+ * individually cycle-free, jointly cyclic. Serializing the whole
+ * validate-then-write-then-mutate-peers sequence behind one lock removes the
+ * race instead of trying to catch it after the fact. Taken BEFORE any
+ * per-task lock (taskLockDir) a call also needs, never the reverse, so the
+ * two lock types never wait on each other.
+ */
+function taskGraphLockDir(paths: BusPaths): string {
+  return join(paths.taskDir, '.task-locks', '.graph');
 }
 
 /**
@@ -399,7 +481,9 @@ function findTaskFileByPrefix(
 }
 
 /**
- * Update a task's status, and/or reroute it to a new assignee/project/priority.
+ * Update a task's status, and/or reroute it to a new
+ * assignee/project/priority, and/or append to its description, and/or append
+ * blocker edges.
  * Matches bash update-task.sh behavior for the status-only case, with the
  * cross-org fallback from findTaskFile so an assignee in one org can drive
  * the lifecycle of a task filed by an orchestrator in a sibling org.
@@ -407,7 +491,8 @@ function findTaskFileByPrefix(
  * `status` is optional so a caller can reassign/re-project/re-prioritize a task
  * without restating (and risking accidentally churning) its current status —
  * create-task is the only place assignee/project/priority are otherwise settable.
- * At least one of status/assignee/project/priority/appendDesc must be given.
+ * At least one of status/assignee/project/priority/appendDesc/blockedBy must
+ * be given.
  *
  * `appendDesc` deliberately APPENDS rather than replaces: a task description
  * cannot otherwise be corrected after creation, which twice in one hour drove
@@ -417,6 +502,22 @@ function findTaskFileByPrefix(
  * alongside the addition matters specifically when the addition is a
  * correction: a retraction next to the false claim it retracts is legible in
  * a way that a silent overwrite is not.
+ *
+ * `opts.blockedBy` is ADDITIVE, never a replace: a gate normally emerges
+ * AFTER creation (that's why a task transitions to `blocked` at all), and
+ * create-task already owns the initial full list. IDs already present in
+ * blocked_by are silently deduped rather than re-validated or re-audited —
+ * only genuinely new edges go through the cycle check, mirroring createTask's
+ * own validate-before-write / mutate-peers-after-write ordering so a rejected
+ * cycle never leaves partial state on disk. The reciprocal `blocks` edge is
+ * synced for every RESOLVED blocker, not just the new ones — a blocker whose
+ * primary edge already exists but whose peer `blocks` edge was lost (e.g. to
+ * an earlier unlocked write) gets repaired on the next call that names it,
+ * rather than staying silently missing forever because it's no longer "new".
+ *
+ * @returns `newBlockers` — the canonical ids actually added to `blocked_by`
+ * this call (already deduped/resolved), so a caller can report what changed
+ * instead of echoing back its own raw, pre-dedup input.
  */
 export function updateTask(
   paths: BusPaths,
@@ -427,6 +528,7 @@ export function updateTask(
     project?: string;
     priority?: Priority;
     appendDesc?: string;
+    blockedBy?: string[];
     /**
      * Who is performing this update. Recorded as the audit entry's `agent`.
      *
@@ -439,7 +541,8 @@ export function updateTask(
      */
     actor?: string;
   } = {},
-): void {
+): { newBlockers: string[] } {
+  const blockedByInput = opts.blockedBy ?? [];
   // `actor` is metadata about the update, not a field being updated — it
   // deliberately does not satisfy this guard.
   if (
@@ -447,10 +550,11 @@ export function updateTask(
     opts.assignee === undefined &&
     opts.project === undefined &&
     opts.priority === undefined &&
-    opts.appendDesc === undefined
+    opts.appendDesc === undefined &&
+    blockedByInput.length === 0
   ) {
     throw new Error(
-      'updateTask requires at least one of: status, assignee, project, priority, appendDesc',
+      'updateTask requires at least one of: status, assignee, project, priority, appendDesc, blockedBy',
     );
   }
   if (opts.priority !== undefined) validatePriority(opts.priority);
@@ -462,34 +566,98 @@ export function updateTask(
   }
   let prevStatus: TaskStatus | undefined;
   const noteParts: string[] = [];
-  try {
-    const content = readFileSync(filePath, 'utf-8');
-    const task: Task = JSON.parse(content);
-    prevStatus = task.status;
-    if (status !== undefined) task.status = status;
-    if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
-      noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
-      task.assigned_to = opts.assignee;
+  let newBlockers: string[] = [];
+  let blockersToSync: string[] = [];
+  let canonicalId = taskId;
+  const lockDir = taskLockDir(filePath);
+
+  // Graph lock first, per-task lock second — see taskGraphLockDir's doc.
+  // Only needed when this call actually touches blocked_by: a status/
+  // assignee/project/priority/appendDesc-only update never reads or writes
+  // the dependency graph, so forcing it through the single global lock would
+  // serialize every update against every other update fleet-wide for no
+  // reason. Gated on the caller's raw input, not the later-computed
+  // newBlockers/blockersToSync — an empty graph lock around an all-dedup
+  // call is harmless, but skipping it entirely when nothing was asked for
+  // keeps the common no-blockedBy case lock-free.
+  const runUpdate = () => {
+    try {
+      mkdirSync(lockDir, { recursive: true });
+      withFileLockSync(lockDir, () => {
+        const content = readFileSync(filePath, 'utf-8');
+        const task: Task = JSON.parse(content);
+        prevStatus = task.status;
+        const selfId = task.id ?? taskId;
+        canonicalId = selfId;
+
+        const currentBlockedBy = task.blocked_by ?? [];
+        // Resolve every input through its canonical id BEFORE dedup/cycle-check/
+        // storage (see resolveTaskId's own doc) and dedup the resolved set —
+        // two different spellings (or two literal repeats) of the same blocker
+        // must collapse to one stored edge. A self-reference (including via a
+        // prefix of this task's own id, once resolved to selfId) is deliberately
+        // NOT filtered out here — it must reach detectCycleOrThrow below, whose
+        // `cur === newTaskId` check is what turns it into the same "Dependency
+        // cycle: X ultimately blocks itself via X" error a longer cycle gets.
+        // Filtering it out here would silently drop it instead of rejecting it.
+        const resolvedInput = [...new Set(blockedByInput.map(id => resolveTaskId(paths, id)))];
+        blockersToSync = resolvedInput;
+        newBlockers = resolvedInput.filter(depId => !currentBlockedBy.includes(depId));
+        if (newBlockers.length) {
+          // Cycle check BEFORE any field mutation, same ordering rule createTask
+          // enforces — a rejected cycle must never leave partial state on disk.
+          // The virtual task carries the FULL post-update blocked_by set (old +
+          // new), not just the new edges, so a cycle running back through an
+          // already-existing blocker is still caught.
+          const virtualTask = { id: selfId, blocked_by: [...currentBlockedBy, ...newBlockers] };
+          detectCycleOrThrow(paths, selfId, newBlockers, virtualTask);
+          task.blocked_by = [...currentBlockedBy, ...newBlockers];
+          noteParts.push(`blocked_by: +[${newBlockers.join(', ')}]`);
+        }
+
+        if (status !== undefined) task.status = status;
+        if (opts.assignee !== undefined && opts.assignee !== task.assigned_to) {
+          noteParts.push(`assignee: ${task.assigned_to} -> ${opts.assignee}`);
+          task.assigned_to = opts.assignee;
+        }
+        if (opts.project !== undefined && opts.project !== task.project) {
+          noteParts.push(`project: '${task.project}' -> '${opts.project}'`);
+          task.project = opts.project;
+        }
+        if (opts.priority !== undefined && opts.priority !== task.priority) {
+          noteParts.push(`priority: ${task.priority} -> ${opts.priority}`);
+          task.priority = opts.priority;
+        }
+        if (opts.appendDesc !== undefined) {
+          const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+          const marker = `\n\n--- APPENDED ${stamp} ---\n${opts.appendDesc}`;
+          task.description = (task.description ?? '') + marker;
+          noteParts.push(`description: appended ${opts.appendDesc.length} chars`);
+        }
+        task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+        atomicWriteSync(filePath, JSON.stringify(task));
+      });
+    } catch (err) {
+      throw new Error(`Task ${taskId} update failed: ${err}`);
     }
-    if (opts.project !== undefined && opts.project !== task.project) {
-      noteParts.push(`project: '${task.project}' -> '${opts.project}'`);
-      task.project = opts.project;
-    }
-    if (opts.priority !== undefined && opts.priority !== task.priority) {
-      noteParts.push(`priority: ${task.priority} -> ${opts.priority}`);
-      task.priority = opts.priority;
-    }
-    if (opts.appendDesc !== undefined) {
-      const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-      const marker = `\n\n--- APPENDED ${stamp} ---\n${opts.appendDesc}`;
-      task.description = (task.description ?? '') + marker;
-      noteParts.push(`description: appended ${opts.appendDesc.length} chars`);
-    }
-    task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-    atomicWriteSync(filePath, JSON.stringify(task));
-  } catch (err) {
-    throw new Error(`Task ${taskId} update failed: ${err}`);
+
+    // Symmetric edge maintenance — mirrors createTask's own post-write step.
+    // Cycle-safe now: validation already passed above. Synced against EVERY
+    // resolved blocker (blockersToSync), not just newBlockers, so a call that
+    // repeats an already-stored blocker still repairs a missing reverse edge;
+    // keyed by canonicalId, not the caller's possibly-a-prefix taskId, so the
+    // peer's `blocks` list and this task's `blocked_by` list agree on spelling.
+    for (const depId of blockersToSync) addSymmetricEdge(paths, depId, 'blocks', canonicalId);
+  };
+
+  if (blockedByInput.length > 0) {
+    const graphLock = taskGraphLockDir(paths);
+    mkdirSync(graphLock, { recursive: true });
+    withFileLockSync(graphLock, runUpdate);
+  } else {
+    runUpdate();
   }
+
   appendTaskAudit(paths, taskId, {
     event: 'update',
     agent: opts.actor || 'unknown',
@@ -497,6 +665,8 @@ export function updateTask(
     to: status ?? prevStatus,
     ...(noteParts.length ? { note: noteParts.join(', ') } : {}),
   });
+
+  return { newBlockers };
 }
 
 /**

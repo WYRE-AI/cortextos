@@ -128,10 +128,10 @@ describe('Task Management', () => {
       expect(after >= before).toBe(true);
     });
 
-    it('throws when neither status, assignee, project, priority, nor appendDesc is given', () => {
+    it('throws when neither status, assignee, project, priority, appendDesc, nor blockedBy is given', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Test task');
       expect(() => updateTask(paths, taskId)).toThrow(
-        'updateTask requires at least one of: status, assignee, project, priority, appendDesc',
+        'updateTask requires at least one of: status, assignee, project, priority, appendDesc, blockedBy',
       );
     });
 
@@ -888,6 +888,144 @@ describe('Task dependency DAG (blocks / blocked_by)', () => {
     expect(blockedTask.status).toBe('pending');
     // Specifically: blocked should no longer be forced after 'free'
     // (both unblocked now, fall back to created_at ordering).
+  });
+
+  describe('updateTask --blocked-by (task_1786923653812_76952898 / task_1786773702893_68177835)', () => {
+    it('adds a post-creation blocker edge + symmetric blocks edge on the peer', () => {
+      const blocker = createTask(paths, 'alice', 'acme', 'Discovered blocker');
+      const taskId = createTask(paths, 'alice', 'acme', 'Blocked after the fact');
+
+      updateTask(paths, taskId, 'blocked', { blockedBy: [blocker] });
+
+      expect(readTask(taskId).blocked_by).toEqual([blocker]);
+      expect(readTask(blocker).blocks).toEqual([taskId]);
+    });
+
+    it('is additive: a second call appends rather than replacing the existing list', () => {
+      const a = createTask(paths, 'alice', 'acme', 'A');
+      const b = createTask(paths, 'alice', 'acme', 'B');
+      const taskId = createTask(paths, 'alice', 'acme', 'Task', { blockedBy: [a] });
+
+      updateTask(paths, taskId, undefined, { blockedBy: [b] });
+
+      expect(readTask(taskId).blocked_by).toEqual([a, b]);
+      expect(readTask(a).blocks).toEqual([taskId]);
+      expect(readTask(b).blocks).toEqual([taskId]);
+    });
+
+    it('dedupes an id already present in blocked_by rather than erroring or duplicating', () => {
+      const a = createTask(paths, 'alice', 'acme', 'A');
+      const taskId = createTask(paths, 'alice', 'acme', 'Task', { blockedBy: [a] });
+
+      updateTask(paths, taskId, undefined, { blockedBy: [a] });
+
+      expect(readTask(taskId).blocked_by).toEqual([a]);
+      expect(readTask(a).blocks).toEqual([taskId]);
+    });
+
+    it('cycle detection: rejects a post-creation edge that would close a loop', () => {
+      const a = createTask(paths, 'alice', 'acme', 'A');
+      // B is blocked_by A. Adding "A blocked_by B" would close the loop A -> B -> A.
+      const b = createTask(paths, 'alice', 'acme', 'B', { blockedBy: [a] });
+      expect(() => updateTask(paths, a, undefined, { blockedBy: [b] })).toThrow(/cycle/i);
+    });
+
+    it('rejects a task declaring itself as its own blocker', () => {
+      const taskId = createTask(paths, 'alice', 'acme', 'Self-referential');
+      expect(() => updateTask(paths, taskId, undefined, { blockedBy: [taskId] })).toThrow(/cycle/i);
+    });
+
+    it('REGRESSION: a rejected cycle leaves blocked_by and the peer\'s blocks list untouched', () => {
+      const a = createTask(paths, 'alice', 'acme', 'A');
+      const b = createTask(paths, 'alice', 'acme', 'B', { blockedBy: [a] });
+      const aBlocksBefore = readTask(a).blocks ?? [];
+      const bBlockedByBefore = readTask(b).blocked_by ?? [];
+
+      expect(() => updateTask(paths, a, undefined, { blockedBy: [b] })).toThrow(/cycle/i);
+
+      expect(readTask(a).blocked_by ?? []).toEqual([]);
+      expect(readTask(a).blocks ?? []).toEqual(aBlocksBefore);
+      expect(readTask(b).blocked_by ?? []).toEqual(bBlockedByBefore);
+    });
+
+    it('records the new edge in the task audit log', () => {
+      const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+      const taskId = createTask(paths, 'alice', 'acme', 'Task');
+
+      updateTask(paths, taskId, 'blocked', { blockedBy: [blocker] });
+
+      const log = readTaskAudit(paths, taskId);
+      const entry = log[log.length - 1];
+      expect(entry.note).toContain(`blocked_by: +[${blocker}]`);
+    });
+
+    it('the exact motivating scenario: a blocked task with no blocked_by is now recordable, and check-stale-blockers can then evaluate it', () => {
+      const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+      const taskId = createTask(paths, 'alice', 'acme', 'Orphaned block');
+      updateTask(paths, taskId, 'blocked');
+      expect(readTask(taskId).blocked_by).toBeUndefined();
+
+      // The gap this feature closes: attach the blocker after the fact.
+      updateTask(paths, taskId, undefined, { blockedBy: [blocker] });
+      expect(readTask(taskId).blocked_by).toEqual([blocker]);
+
+      const open = checkTaskDependencies(paths, taskId);
+      expect(open).toEqual([{ id: blocker, status: 'pending' }]);
+    });
+
+    it('returns the canonical ids actually added, not the raw input', () => {
+      const a = createTask(paths, 'alice', 'acme', 'A');
+      const taskId = createTask(paths, 'alice', 'acme', 'Task', { blockedBy: [a] });
+      const b = createTask(paths, 'alice', 'acme', 'B');
+
+      // a is already present (dedup, adds nothing); b is genuinely new.
+      const { newBlockers } = updateTask(paths, taskId, undefined, { blockedBy: [a, b] });
+
+      expect(newBlockers).toEqual([b]);
+    });
+
+    it('a call that adds nothing new returns an empty newBlockers list', () => {
+      const a = createTask(paths, 'alice', 'acme', 'A');
+      const taskId = createTask(paths, 'alice', 'acme', 'Task', { blockedBy: [a] });
+
+      const { newBlockers } = updateTask(paths, taskId, undefined, { blockedBy: [a] });
+
+      expect(newBlockers).toEqual([]);
+    });
+
+    it('stores the reciprocal blocks edge under the canonical id, not a caller-supplied prefix', () => {
+      const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+      const taskId = createTask(paths, 'alice', 'acme', 'Task');
+      const prefix = taskId.slice(0, taskId.length - 4); // unique prefix of this task's own id
+
+      updateTask(paths, prefix, undefined, { blockedBy: [blocker] });
+
+      // The peer's reverse edge must key off the full id, not the prefix the
+      // caller happened to pass — otherwise blocked_by and blocks disagree.
+      expect(readTask(blocker).blocks).toEqual([taskId]);
+    });
+
+    it('repairs a missing reciprocal edge on a repeated call, even though the blocker is no longer "new"', () => {
+      const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+      const taskId = createTask(paths, 'alice', 'acme', 'Task');
+      updateTask(paths, taskId, undefined, { blockedBy: [blocker] });
+      expect(readTask(blocker).blocks).toEqual([taskId]);
+
+      // Simulate the peer edge having been lost (e.g. an earlier unlocked
+      // write stomping it) without touching this task's own blocked_by.
+      const blockerTask = readTask(blocker);
+      blockerTask.blocks = [];
+      writeFileSync(
+        findTaskFile(paths, blocker)!,
+        JSON.stringify(blockerTask),
+      );
+      expect(readTask(blocker).blocks).toEqual([]);
+
+      // Repeating the same --blocked-by input repairs the reverse edge even
+      // though `blocker` is already in blocked_by and so isn't "new".
+      updateTask(paths, taskId, undefined, { blockedBy: [blocker] });
+      expect(readTask(blocker).blocks).toEqual([taskId]);
+    });
   });
 });
 
