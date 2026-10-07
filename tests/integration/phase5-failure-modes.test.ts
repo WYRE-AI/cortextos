@@ -840,69 +840,93 @@ describe('FM-7: Log rotation under concurrent write pressure', () => {
 // FM-8: Cron-expression local-time behavior
 // ---------------------------------------------------------------------------
 
-describe('FM-8: Cron-expression local-time behavior — consistent with Date.getHours()', () => {
-  it('fixed-hour cron expression fires at the correct local hour', async () => {
-    // DOCUMENTED BEHAVIOR: The scheduler uses Date.getHours() (local wall clock).
-    // Cron expression `0 H * * *` fires at H:00 LOCAL time, not H:00 UTC.
-    // This is consistent with the standard cron behavior on most systems.
-    //
-    // We test this by setting a known start time, computing the expected local-hour
-    // fire time, and verifying the scheduler fires at that moment.
+describe('FM-8: Cron-expression timezone behavior — UTC by default, declared TZ honored', () => {
+  // These tests previously asserted LOCAL wall-clock semantics ("the scheduler
+  // uses Date.getHours()"). PR #21 (1e24108d) deliberately changed that: a cron
+  // expression is now evaluated in its `timezone` field, defaulting to UTC and
+  // explicitly NOT the daemon's ambient timezone — the old behavior silently
+  // fired every cron-expr at Eastern time on the fleet host. That PR updated the
+  // nextFireFromCron unit tests but missed this integration block, which kept
+  // asserting the superseded contract and failed on any host where local != UTC.
+  //
+  // Rewritten against pinned ABSOLUTE UTC instants (Date.UTC), so these now
+  // assert the real contract and pass identically on any host timezone. The
+  // previous versions leaned on the runner's ambient offset: the weekday case
+  // happened to pass under EDT while failing at, say, UTC+10.
 
-    const agent = 'fm-localtime';
+  // 2026-07-15 is a Wednesday; New York is on EDT (UTC-4) that date.
+  const WED_MIDNIGHT_UTC = Date.UTC(2026, 6, 15, 0, 0, 0);
+  // 2026-07-12 is a Sunday (UTC), 2026-07-13 the following Monday.
+  const SUN_MIDNIGHT_UTC = Date.UTC(2026, 6, 12, 0, 0, 0);
+
+  it('fixed-hour cron expression fires at the stated hour in UTC (the default timezone)', async () => {
+    const agent = 'fm-utc-default';
     ensureAgentDir(agent);
 
     const fired: number[] = [];
+    vi.setSystemTime(WED_MIDNIGHT_UTC);
 
-    // Set start to midnight local time on a known day
-    // Use fake timers to set a concrete start — midnight local (getHours() = 0)
-    const now = Date.now();
-    // Find midnight local time: floor to day boundary
-    const d = new Date(now);
-    d.setHours(0, 0, 0, 0); // midnight local
-    const midnightLocal = d.getTime();
-    vi.setSystemTime(midnightLocal);
-
-    // Schedule cron for 3am local (avoids DST ambiguity in spring/fall transitions)
-    addCron(agent, makeCronDef('local-3am', '0 3 * * *'));
+    // No `timezone` field → must be evaluated as 03:00 UTC.
+    addCron(agent, makeCronDef('utc-3am', '0 3 * * *'));
 
     const scheduler = buildScheduler(agent, () => {
       fired.push(Date.now());
     });
     scheduler.start();
 
-    // Advance 4 hours (past the 3:00am window)
     await advanceSim(4 * ONE_HOUR);
 
-    // Exactly 1 fire in 4 hours
     expect(fired.length).toBe(1);
-
-    // The fire time should be at or after 3:00am local
-    const expectedFireMs = midnightLocal + 3 * ONE_HOUR;
+    const expectedFireMs = WED_MIDNIGHT_UTC + 3 * ONE_HOUR;
     expect(fired[0]).toBeGreaterThanOrEqual(expectedFireMs);
     expect(fired[0]).toBeLessThan(expectedFireMs + 2 * TICK_MS); // within 1 tick
 
     scheduler.stop();
   });
 
+  it('honors an explicit IANA timezone — 0 3 * * * in America/New_York fires at 07:00 UTC (EDT)', async () => {
+    // The other half of PR #21's contract, and the reason the default matters:
+    // the same expression as the test above must fire 4h later when the cron
+    // declares Eastern. This is what proves `timezone` threads all the way
+    // through CronScheduler rather than only through nextFireFromCron.
+    const agent = 'fm-declared-tz';
+    ensureAgentDir(agent);
+
+    const fired: number[] = [];
+    vi.setSystemTime(WED_MIDNIGHT_UTC);
+
+    addCron(agent, makeCronDef('ny-3am', '0 3 * * *', { timezone: 'America/New_York' }));
+
+    const scheduler = buildScheduler(agent, () => {
+      fired.push(Date.now());
+    });
+    scheduler.start();
+
+    // Through 04:00 UTC — past 03:00 UTC, so a UTC-evaluated cron would have
+    // fired by now. A New-York-evaluated one must not have.
+    await advanceSim(4 * ONE_HOUR);
+    expect(fired.length).toBe(0);
+
+    // Through 08:00 UTC — now past 03:00 EDT (= 07:00 UTC).
+    await advanceSim(4 * ONE_HOUR);
+    expect(fired.length).toBe(1);
+
+    const expectedFireMs = WED_MIDNIGHT_UTC + 7 * ONE_HOUR;
+    expect(fired[0]).toBeGreaterThanOrEqual(expectedFireMs);
+    expect(fired[0]).toBeLessThan(expectedFireMs + 2 * TICK_MS);
+
+    scheduler.stop();
+  });
+
   it('weekday-only cron (0 9 * * 1-5) does not fire on Sunday — fires on next Monday', async () => {
-    // Find a known Sunday: compute the next Sunday from now.
     const agent = 'fm-weekday-sunday';
     ensureAgentDir(agent);
 
     const fired: string[] = [];
-
-    // Set time to a Sunday at midnight local
-    // Find next Sunday
-    const now = Date.now();
-    const d = new Date(now);
-    d.setHours(0, 0, 0, 0);
-    // Advance to Sunday (getDay() = 0)
-    while (d.getDay() !== 0) {
-      d.setDate(d.getDate() + 1);
-    }
-    const sundayMidnightLocal = d.getTime();
-    vi.setSystemTime(sundayMidnightLocal);
+    // Pinned to a real Sunday in UTC, since the expression's day-of-week field
+    // is evaluated in UTC — deriving "Sunday" from the host's local calendar
+    // is what made this fragile.
+    vi.setSystemTime(SUN_MIDNIGHT_UTC);
 
     addCron(agent, makeCronDef('weekday-9am', '0 9 * * 1-5'));
 
@@ -911,17 +935,14 @@ describe('FM-8: Cron-expression local-time behavior — consistent with Date.get
     });
     scheduler.start();
 
-    // Advance 24h (through Sunday only)
+    // Through Sunday 24:00 UTC — day 0 is excluded by 1-5, so nothing fires.
     await advanceSim(24 * ONE_HOUR);
-
-    // No fire on Sunday (day 0)
     expect(fired.length).toBe(0);
 
-    // Advance into Monday (another 9h+)
+    // Into Monday, past 09:00 UTC.
     await advanceSim(10 * ONE_HOUR);
-
-    // Should fire on Monday at 9am local
     expect(fired.length).toBe(1);
+    expect(fired[0]).toBe(new Date(SUN_MIDNIGHT_UTC + 33 * ONE_HOUR).toISOString());
 
     scheduler.stop();
   });
