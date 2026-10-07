@@ -119,6 +119,19 @@ export interface ExperimentEvaluateOptions {
    * `decision` and drives `next_baseline_value`. Requires a non-empty
    * `justification` — evaluateExperiment refuses otherwise. */
   decision?: 'keep' | 'discard';
+  /** Run every validation and compute the full would-be result (decision,
+   * next_baseline_value, etc.) WITHOUT writing anything — no saveExperiment,
+   * no results.tsv/learnings.md append, no active.json removal. The returned
+   * Experiment is a preview only; its in-memory status is still flipped to
+   * 'completed' so a caller can inspect what WOULD land, but nothing on disk
+   * changes and the real experiment stays 'running' and re-evaluable.
+   * task_1788966052299_44596234 (dev, 2026-09-09): evaluateExperiment has no
+   * preview path, so a throwaway probe call to check argument-parsing or
+   * command shape commits a real (often placeholder) result and locks the
+   * experiment — evaluateExperiment only accepts status='running', so a
+   * mistaken real call has no CLI undo and requires hand-editing 3 files to
+   * correct. */
+  dryRun?: boolean;
 }
 
 export interface ExperimentFilters {
@@ -528,6 +541,16 @@ export function evaluateExperiment(
   // completed experiment sees real history instead of a clobbered value that
   // happens to equal its own result (cortextos analyst spec, 2026-08-27).
   experiment.next_baseline_value = decision === 'keep' ? effectiveValue : baseline;
+
+  // Everything above this point is pure computation + validation (guards
+  // can still throw in dry-run mode — that's the point, previewing argument
+  // shape without committing). Everything below is a write; --dry-run skips
+  // all of it and returns the computed-but-unpersisted preview as-is. The
+  // real on-disk experiment is untouched: still 'running', still
+  // re-evaluable for real afterward.
+  if (options?.dryRun) {
+    return experiment;
+  }
 
   saveExperiment(agentDir, experiment);
 
