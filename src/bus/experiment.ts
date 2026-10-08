@@ -18,9 +18,11 @@ export interface Experiment {
   window: string;
   measurement: string;
   status: 'proposed' | 'running' | 'completed' | 'closed';
-  /** The baseline this experiment was actually evaluated against. Frozen at
-   * whatever value it held when the experiment was created — evaluateExperiment
-   * never mutates it. Historical fact: "what was this cycle compared against."
+  /** The baseline value configured at proposal time. Frozen —
+   * evaluateExperiment never mutates it, even when `evaluate-experiment
+   * --baseline` supplies an override for this decision; that override is
+   * NOT reflected here (see `learning` for the value actually used in that
+   * case). Historical fact: "what this experiment was proposed against."
    * Do NOT read this to seed the next cycle's --baseline; use next_baseline_value. */
   baseline_value: number | null;
   result_value: number | null;
@@ -38,8 +40,12 @@ export interface Experiment {
    * baseline_value itself is never touched, so history stays readable. */
   next_baseline_value: number | null;
   /** The decision evaluateExperiment computed mechanically from
-   * result_value/score vs baseline_value, BEFORE any --decision override is
-   * applied. null until the experiment is evaluated. When evaluateExperiment
+   * result_value/score vs whatever baseline was actually used for this
+   * evaluation — baseline_value, unless `evaluate-experiment --baseline`
+   * supplied an override for this decision, in which case the override was
+   * used (check `learning` for which applied). This field reflects that
+   * computation BEFORE any separate --decision override is applied.
+   * null until the experiment is evaluated. When evaluateExperiment
    * is called without --decision, this equals `decision`. When --decision is
    * passed, this preserves what the mechanical rule would have said, so an
    * override is auditable rather than silently replacing the machine's
