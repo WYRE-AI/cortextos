@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added — `evaluate-experiment --baseline` override, ported from PR #174 into #189's mechanism
+
+`evaluate-experiment` compares the measured value against `experiment.baseline_value`, frozen at
+proposal time. That value can go stale by evaluation time — e.g. a baseline measured over a
+non-adjacent window that no longer represents a valid apples-to-apples comparison (the original
+bug, found live 2026-09-04, task_1788524506203: marketing's `exp_1786858829_uzaff` mechanically
+read `keep` comparing 48.65 against a stale 08-16 baseline of 37.6, while a fresh matched-window
+remeasurement showed a real decrease).
+
+PR #174 fixed this with a `--baseline` override, but was superseded by #189 (`--decision` override
++ `correct-experiment-decision`) before merging, and #189's mechanism never carried the baseline
+fix forward — it can override the final decision label, but has no way to correct the comparison
+value itself, so a `--decision` override used to compensate for a stale baseline would still
+ratchet `next_baseline_value` forward using the stale stored value, re-inheriting the same
+staleness on the next cycle.
+
+This ports #174's fix onto #189's current structure: `--baseline <n>` (requires `--justification`,
+same discipline `--decision` already enforces) overrides the local comparison value used for the
+mechanical computation and, on discard, the `next_baseline_value` ratchet. `experiment.baseline_value`
+itself is never touched — it stays the frozen historical fact of what proposal time configured. The
+override is recorded in the persisted `learning` text, not just an ephemeral `console.error`, and
+composes with `--decision`: `--baseline` corrects what the numbers say, `--decision` can still
+override the final call on top of that if needed.
+
 ### Added — Tier 2 cross-provider fallback (GLM-5.3 / Z.ai), shipped disabled
 
 New `src/daemon/glm-fallback.ts`, entered only from `rotation-manager.ts`'s existing "every Tier 1

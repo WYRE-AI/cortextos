@@ -713,6 +713,97 @@ describe('Sprint 3: Experiment Framework', () => {
         expect(result.next_baseline_value).toBe(3); // score is the effective value, not measuredValue 0
       });
     });
+
+    describe('--baseline override (cortextos#174, marketing exp_1786858829_uzaff shape, task_1788524506203)', () => {
+      it('refuses a --baseline override with no --justification', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'h', { baseline: 37.6 });
+        runExperiment(testDir, id);
+        expect(() => evaluateExperiment(testDir, id, 48.65, { baseline: 50.77 })).toThrow(
+          'no --justification',
+        );
+      });
+
+      it('refuses a --baseline override with a blank/whitespace-only --justification', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'h', { baseline: 37.6 });
+        runExperiment(testDir, id);
+        expect(() =>
+          evaluateExperiment(testDir, id, 48.65, { baseline: 50.77, justification: '   ' }),
+        ).toThrow('no --justification');
+      });
+
+      it('refuses a non-finite --baseline override (CodeRabbit #217: NaN would mechanically force discard and serialize next_baseline_value as null)', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'h', { baseline: 37.6 });
+        runExperiment(testDir, id);
+        expect(() =>
+          evaluateExperiment(testDir, id, 48.65, { baseline: NaN, justification: 'bad input' }),
+        ).toThrow('must be a finite number');
+      });
+
+      it('reproduces the real bug without an override: stale stored baseline mechanically reads keep', () => {
+        // The stored baseline_value (37.6) is from a non-adjacent window and
+        // reads as an improvement; this is exactly what happened to
+        // exp_1786858829_uzaff before the correction — no override given.
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'cookie copy test', {
+          direction: 'higher',
+          baseline: 37.6,
+        });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 48.65);
+        expect(result.decision).toBe('keep'); // the bug, reproduced — 48.65 > 37.6
+      });
+
+      it('overrides the mechanical computation without touching stored baseline_value', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'cookie copy test v2', {
+          direction: 'higher',
+          baseline: 37.6,
+        });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 48.65, {
+          baseline: 50.77,
+          justification: 'Adjacent matched-window remeasurement supersedes the stale 08-16 baseline',
+        });
+
+        expect(result.mechanical_decision).toBe('discard'); // computed against the override: 48.65 < 50.77
+        expect(result.decision).toBe('discard'); // no --decision given — mechanical (corrected) answer stands
+        expect(result.baseline_value).toBe(37.6); // frozen, untouched — historical fact preserved
+        expect(result.next_baseline_value).toBe(50.77); // discard: ratchet uses the OVERRIDE, not the stale stored value
+        expect(result.learning).toContain('BASELINE OVERRIDE');
+        expect(result.learning).toContain('50.77');
+        expect(result.learning).toContain('37.6');
+        expect(result.learning).toContain('Adjacent matched-window remeasurement');
+      });
+
+      it('a keep with an override still ratchets forward to the override-driven effective value', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'cookie copy test v3', {
+          direction: 'higher',
+          baseline: 10,
+        });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 60, {
+          baseline: 50,
+          justification: 'Fresher comparison point',
+        });
+        expect(result.mechanical_decision).toBe('keep'); // 60 > 50
+        expect(result.decision).toBe('keep');
+        expect(result.next_baseline_value).toBe(60); // keep: ratchet is the effective (measured) value
+      });
+
+      it('composes with --decision: baseline fixes the mechanical answer, --decision can still override the result', () => {
+        const id = createExperiment(testDir, 'testbot', 'accept_rate', 'cookie copy test v4', {
+          direction: 'higher',
+          baseline: 37.6,
+        });
+        runExperiment(testDir, id);
+        const result = evaluateExperiment(testDir, id, 48.65, {
+          baseline: 50.77,
+          decision: 'keep',
+          justification: 'corrected baseline says discard, but a known one-off measurement glitch favors keep',
+        });
+        expect(result.mechanical_decision).toBe('discard'); // against the corrected baseline
+        expect(result.decision).toBe('keep'); // --decision still wins as the authoritative final call
+        expect(result.decision_corrected_at).not.toBeNull();
+      });
+    });
   });
 
   describe('correctExperimentDecision (post-hoc fix for an already-completed experiment)', () => {
