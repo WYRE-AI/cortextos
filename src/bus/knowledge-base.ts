@@ -352,11 +352,13 @@ export function ingestKnowledgeBase(
   );
 
   const requestedTimeout = Number(process.env.KB_INGEST_TIMEOUT_MS);
-  const ingestTimeoutMs = Math.max(
-    KB_INGEST_TIMEOUT_FLOOR_MS,
-    Number.isFinite(requestedTimeout) && requestedTimeout > 0
-      ? requestedTimeout
-      : sizeScaledDefaultMs,
+  const ingestTimeoutMs = Math.round(
+    Math.max(
+      KB_INGEST_TIMEOUT_FLOOR_MS,
+      Number.isFinite(requestedTimeout) && requestedTimeout > 0
+        ? requestedTimeout
+        : sizeScaledDefaultMs,
+    ),
   );
 
   execFileSync(pythonPath, args, {
