@@ -43,6 +43,17 @@ review before merge. Header fields in the arrival notification (sender name, mes
 a single line before interpolation, closing a newline-based header-forgery injection vector the shared
 PTY-injection sanitizer doesn't cover for this new header format (same review).
 
+`checkA2AInbox`'s per-poll scan now rotates its starting point past wherever the previous poll left
+off, instead of always restarting at the front of sorted filename order (same review, a follow-up
+round after the per-poll file-count/size bounds above). Without rotation, `A2A_MAX_FILES_PER_POLL`
+(20) or more persistently-broken files (oversized/malformed/read-error — none of which are ever
+added to the notified-set, by design, so repair can still pick them up) sorting ahead of a valid
+arrival would occupy the entire per-poll budget on every single poll forever, since nothing ever
+removes them from the front of sort order — a genuine, permanent starvation of real arrivals, not
+just a slower drain. The cursor is in-memory only, deliberately: a restart resets to the start of
+sort order, same as today, rather than persisting a cursor that would need its own corrupt-file
+handling for a cross-poll fairness concern that only bites during an active backlog.
+
 ### Fixed — `migration-collision-check.yml` listed open PRs with a POST
 
 The cross-PR scan called `gh api repos/<repo>/pulls --paginate --slurp -f state=open -f base=<ref> -f per_page=100`. `gh api` defaults to GET, and switches to POST whenever any `-f`/`--raw-field` is present. That call was `POST /repos/{owner}/{repo}/pulls` (create a pull request), which `GITHUB_TOKEN` cannot do, so consumer CI (WYRE-AI/conduit PR #1895) failed with `gh: Resource not accessible by integration (HTTP 403)` and a `subprocess.CalledProcessError`. The 403 is not a permissions gap on GET listing and not a migration collision.

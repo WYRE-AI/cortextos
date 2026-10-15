@@ -149,6 +149,18 @@ export class FastChecker {
   // poll retries the save while this is true, independent of whether that
   // poll found any new arrivals of its own.
   private a2aNotifiedDirty = false;
+  // Rotates checkA2AInbox's scan start past wherever the previous poll left
+  // off (CodeRabbit PR #179 review): without it, >= A2A_MAX_FILES_PER_POLL
+  // persistently-broken files (oversized/malformed/read-error — none of
+  // which are ever added to a2aNotified, by design, so repair can still
+  // pick them up) sorting before a valid arrival would occupy the entire
+  // per-poll budget on every single poll forever, since nothing ever
+  // removes them from the front of sort order. In-memory only, deliberately
+  // — a restart resets to the start of sort order, same as today, rather
+  // than persisting a cursor that would need its own corrupt-file handling
+  // for a cross-poll fairness concern that only bites during an active
+  // backlog.
+  private a2aScanCursor: string | null = null;
 
   constructor(
     agent: AgentProcess,
@@ -445,19 +457,38 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     } catch {
       return { formatted: '', filenames: [] };
     }
+    entries.sort();
+
+    // Rotate to start just after the cursor left by the previous poll (see
+    // a2aScanCursor's doc) rather than always restarting at the front of
+    // sort order.
+    let startIdx = 0;
+    if (this.a2aScanCursor !== null) {
+      const idx = entries.findIndex((f) => f > this.a2aScanCursor!);
+      startIdx = idx === -1 ? 0 : idx; // cursor >= every entry: wrap to start
+    }
+    const rotated = startIdx === 0 ? entries : [...entries.slice(startIdx), ...entries.slice(0, startIdx)];
 
     let formatted = '';
     const filenames: string[] = [];
     let processed = 0;
-    for (const filename of entries) {
-      if (this.a2aNotified.has(filename)) continue;
+    for (const filename of rotated) {
+      if (this.a2aNotified.has(filename)) {
+        // Free to skip (no cap cost) but still advances the cursor, so a
+        // long run of already-notified entries doesn't stop rotation from
+        // reaching whatever comes after them in sort order.
+        this.a2aScanCursor = filename;
+        continue;
+      }
       // Bound total work per poll cycle (CodeRabbit PR #179 review): a
       // backlog that accumulated while the owner was offline must not block
       // this synchronous tick on every outstanding file at once — stop and
       // leave the rest for later polls instead. Excess files are NOT marked
-      // notified, so they're picked up (and counted again against this cap)
-      // next cycle.
+      // notified, and the cursor is NOT advanced past them (break happens
+      // before the cursor update below), so they're the first candidates
+      // examined — counted again against this cap — on the very next poll.
       if (processed >= A2A_MAX_FILES_PER_POLL) break;
+      this.a2aScanCursor = filename;
       const filePath = join(dir, filename);
       try {
         const size = statSync(filePath).size;

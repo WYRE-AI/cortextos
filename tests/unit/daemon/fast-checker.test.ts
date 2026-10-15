@@ -1540,6 +1540,32 @@ describe('FastChecker', () => {
       expect((checker as any).a2aNotified.has('huge.json')).toBe(false);
     });
 
+    it('REGRESSION (CodeRabbit, PR #179): rotates the scan start across polls so persistently-broken files sorted first cannot starve valid arrivals sorted after them forever', () => {
+      mkdirSync(paths.a2aInboxDir!, { recursive: true });
+      const MAX = 20; // A2A_MAX_FILES_PER_POLL in src/daemon/fast-checker.ts
+      // MAX broken files, all sorting before the 2 valid ones below.
+      for (let i = 0; i < MAX; i++) {
+        writeFileSync(join(paths.a2aInboxDir!, `broken-${String(i).padStart(2, '0')}.json`), '{ not valid json');
+      }
+      writeA2AMessage('valid-00.json');
+      writeA2AMessage('valid-01.json');
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { a2aInboxOwner: true });
+
+      // Poll 1: the entire per-poll budget is spent walking the MAX broken
+      // files (none of which ever become notified), so nothing valid is
+      // reached yet.
+      const first = (checker as any).checkA2AInbox();
+      expect(first.filenames).toEqual([]);
+
+      // Poll 2: without rotation, sort order is unchanged and the same MAX
+      // broken files would occupy the entire budget again, forever — the 2
+      // valid files would NEVER be reached. With rotation, the scan starts
+      // past where poll 1 left off and reaches them this time.
+      const second = (checker as any).checkA2AInbox();
+      expect(second.filenames.sort()).toEqual(['valid-00.json', 'valid-01.json']);
+    });
+
     it('saveA2ANotified sets a dirty flag on a failed write and clears it on a successful one', () => {
       const agent = createMockAgent();
       const checker = new FastChecker(agent, paths, '/tmp/framework', { a2aInboxOwner: true });
