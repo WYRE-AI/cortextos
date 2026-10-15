@@ -18,6 +18,42 @@ Tier 1 account has its Tier 2 state cleared so it can't keep serving off a stale
 on is gated behind a still-pending validation pass (tool-call fidelity, PTY/banner-parsing
 compatibility, restart/`--continue` semantics) against a throwaway canary — not done in this change.
 
+### Added — daemon can surface a2a-inbox arrivals in real time instead of waiting for the next heartbeat
+
+`task_1788132068761_23739797`: a2a-inbox (`~/.cortextos/<instance>/a2a-inbox/*.json`, written by the
+external a2a-server process) had exactly one consumer — the owning agent's own HEARTBEAT.md Step 7.5d,
+polled on the agent's 4h heartbeat cadence. Two prior incidents (08-17: messages sat unprocessed 4-12
+days; 08-30: a briefing carried a refuted "silent" premise through two heartbeats) traced back to that
+cadence being structurally too slow for dispatch-latency traffic.
+
+`FastChecker` now polls a2a-inbox every cycle and injects an arrival notification — formatted like the
+existing Telegram/bus-inbox injection blocks — the moment a new file appears, rather than waiting for
+the next heartbeat fire. Fail-quiet and off by default: gated on a new `AgentConfig.a2a_inbox_owner`
+field (absent/false everywhere preserves current behavior exactly; no instance is affected until an
+agent's `config.json` explicitly opts in). Arrival-only by design — the watcher never moves, renames, or
+deletes a2a-inbox files; that stays the owning agent's existing Step 7.5d processing unchanged. Dedup is
+a small persisted "already-notified" filename set (`state/<agent>/.a2a-notified.json`), written only
+after a confirmed PTY injection so a failed injection retries the same arrival next poll instead of
+silently dropping it — the same pattern the bus inbox already uses for its ack ids.
+
+`a2a_inbox_owner` is enforced as exactly-one-per-instance: `AgentManager` tracks the currently-granted
+owner and refuses (loudly, via a log line naming both agents) a second agent's claim rather than letting
+both poll the same a2a-inbox and both inject duplicate notifications — caught by CodeRabbit's PR #179
+review before merge. Header fields in the arrival notification (sender name, message kind) are forced to
+a single line before interpolation, closing a newline-based header-forgery injection vector the shared
+PTY-injection sanitizer doesn't cover for this new header format (same review).
+
+`checkA2AInbox`'s per-poll scan now rotates its starting point past wherever the previous poll left
+off, instead of always restarting at the front of sorted filename order (same review, a follow-up
+round after the per-poll file-count/size bounds above). Without rotation, `A2A_MAX_FILES_PER_POLL`
+(20) or more persistently-broken files (oversized/malformed/read-error — none of which are ever
+added to the notified-set, by design, so repair can still pick them up) sorting ahead of a valid
+arrival would occupy the entire per-poll budget on every single poll forever, since nothing ever
+removes them from the front of sort order — a genuine, permanent starvation of real arrivals, not
+just a slower drain. The cursor is in-memory only, deliberately: a restart resets to the start of
+sort order, same as today, rather than persisting a cursor that would need its own corrupt-file
+handling for a cross-poll fairness concern that only bites during an active backlog.
+
 ### Fixed — `migration-collision-check.yml` listed open PRs with a POST
 
 The cross-PR scan called `gh api repos/<repo>/pulls --paginate --slurp -f state=open -f base=<ref> -f per_page=100`. `gh api` defaults to GET, and switches to POST whenever any `-f`/`--raw-field` is present. That call was `POST /repos/{owner}/{repo}/pulls` (create a pull request), which `GITHUB_TOKEN` cannot do, so consumer CI (WYRE-AI/conduit PR #1895) failed with `gh: Resource not accessible by integration (HTTP 403)` and a `subprocess.CalledProcessError`. The 403 is not a permissions gap on GET listing and not a migration collision.

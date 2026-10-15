@@ -22,6 +22,9 @@ import { validateInstanceId } from './validate.js';
  *     orgs/{org}/tasks/      - org-scoped
  *     orgs/{org}/approvals/  - org-scoped
  *     orgs/{org}/analytics/  - org-scoped
+ *     a2a-inbox/             - instance-level (not per-agent), owned by
+ *                              exactly one agent per instance (see
+ *                              AgentConfig.a2a_inbox_owner)
  */
 export function resolvePaths(
   agentName: string,
@@ -49,6 +52,7 @@ export function resolvePaths(
     approvalDir: join(orgBase, 'approvals'),
     analyticsDir: join(orgBase, 'analytics'),
     deliverablesDir: join(orgBase, 'deliverables'),
+    a2aInboxDir: join(ctxRoot, 'a2a-inbox'),
   };
 }
 
