@@ -32,6 +32,10 @@ vi.mock('../../../src/bus/crons.js', () => ({
 // Imports AFTER mock setup
 // ---------------------------------------------------------------------------
 
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
 import { CronScheduler, NonRetryableError, nextFireFromCron, computeReferenceMs } from '../../../src/daemon/cron-scheduler';
 import type { CronDefinition } from '../../../src/types/index';
 
@@ -306,6 +310,8 @@ describe('CronScheduler', () => {
   let logs: string[];
   let fired: CronDefinition[];
   let scheduler: CronScheduler;
+  let ctxRoot: string;
+  let originalCtxRoot: string | undefined;
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -321,6 +327,15 @@ describe('CronScheduler', () => {
       corrupt: false,
     }));
 
+    // readCronState (loadCrons) and appendExecutionLog (fire path) are real,
+    // unmocked disk I/O — only src/bus/crons.js is mocked above. Both resolve
+    // their root via `process.env.CTX_ROOT ?? process.cwd()`, so without this
+    // every fire in this suite wrote a real `.cortextOS/state/agents/test-agent/`
+    // tree into whatever directory `npm test` was invoked from.
+    originalCtxRoot = process.env.CTX_ROOT;
+    ctxRoot = mkdtempSync(join(tmpdir(), 'cron-scheduler-test-'));
+    process.env.CTX_ROOT = ctxRoot;
+
     scheduler = new CronScheduler({
       agentName: 'test-agent',
       onFire: (cron) => { fired.push(cron); },
@@ -331,6 +346,9 @@ describe('CronScheduler', () => {
   afterEach(() => {
     scheduler.stop();
     vi.useRealTimers();
+    if (originalCtxRoot === undefined) delete process.env.CTX_ROOT;
+    else process.env.CTX_ROOT = originalCtxRoot;
+    rmSync(ctxRoot, { recursive: true, force: true });
   });
 
   // -------------------------------------------------------------------------
