@@ -610,6 +610,78 @@ describe('Bus System', () => {
       expect(report.entries).toHaveLength(0);
     });
 
+    // grower (non-author review of this fix, 2026-10-19): found via a probe,
+    // confirmed pre-existing on main BEFORE this fix (not a regression it
+    // introduced) -- filed as a residual on task_1788305871620 for the
+    // clause-scoped-by-reference approach listed there as a candidate
+    // direction. Two different PR refs in one sentence, only one with a
+    // genuine marker; the sentence-scoped window doesn't distinguish which
+    // ref the marker actually belongs to within that shared sentence, so it
+    // still wrongly dismisses the unrelated one. Asserting the CURRENT
+    // (known-wrong) behavior here, not the desired one -- this documents the
+    // residual rather than claiming it's fixed, same convention as a
+    // skipped/xfail test would serve, kept as a plain assertion so a future
+    // fix for it shows up as a test needing deliberate update, not a silent
+    // pass.
+    it('KNOWN RESIDUAL (task_1788305871620): does not yet distinguish which of two PR refs in the same sentence a genuine marker belongs to', () => {
+      writeTask('myorg', {
+        id: 'task_same_sentence_two_refs',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'PR #55 was a tool artifact, but PR #67 was never investigated.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      // Known-wrong: PR #67 is a genuine, un-investigated blocker and should
+      // be flagged, but currently isn't. Update this assertion (and the
+      // comment above) when task_1788305871620's residual is actually fixed.
+      expect(report.entries).toHaveLength(0);
+    });
+
+    // grower (non-author review, same day): a short comma-bounded aside
+    // ("in fact") sitting between a negation word and the marker made the
+    // clause-boundary scan stop at the nearer comma before ever reaching the
+    // negation, wrongly reading a directly-negated marker as genuine. A real
+    // regression from the sentence/clause-boundary fix above, not pre-existing
+    // (reproduced as passing correctly on pre-fix main).
+    it('still flags a PR reference when a short parenthetical aside sits between the negation and the marker ("is not, in fact, a tool artifact")', () => {
+      writeTask('myorg', {
+        id: 'task_negated_parenthetical_aside',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'PR #67 is not, in fact, a tool artifact.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+    });
+
+    // grower (non-author review, same day): a marker and an unrelated PR ref
+    // joined by a semicolon (no period in between) let the fixed-width
+    // 120-char window bleed across — correctly excluded by the OLD window
+    // (distance > 120 chars) but wrongly included once the window became
+    // sentence-scoped with only `.` as a boundary. `;` is now a boundary too.
+    it('still flags a genuine PR reference when an unrelated marker is semicolon-joined, more than 120 chars away, with no period in between', () => {
+      writeTask('myorg', {
+        id: 'task_semicolon_joined_unrelated_marker',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'A prior finding here (PR #55) was a tool artifact of an unrelated regex bug that took the team ' +
+          'several days to properly characterize and eventually resolve upstream; this task itself remains ' +
+          'genuinely blocked on PR #67 merging into main before we can proceed with the rollout plan.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+      expect(report.entries[0].detail).not.toContain('PR #55');
+    });
+
     // NOTE: the two mentions are kept far apart on purpose (separate
     // sentences, no shared clause) — this exercise found that a stat-source
     // cue sitting in the GAP between two close references (e.g. "...verified

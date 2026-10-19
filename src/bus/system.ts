@@ -357,16 +357,44 @@ const DISMISSAL_MARKER_CUE_REGEX = /\btool artifact\b/gi;
 // keptRefs.push below) — so the window check was a silent no-op for that
 // specific test, not genuinely exercised. A probe using the canonical
 // spacing reproduces the bleed. Fix: scope the window to the SENTENCE
-// containing the PR mention (nearest `.` boundary either side) instead of a
-// fixed character count — a dismissal marker belongs to the same ref only
-// if it's in the same sentence, and the "appended much later" case above
-// still works because each occurrence of the ref gets its own sentence,
-// checked independently.
+// containing the PR mention instead of a fixed character count — a
+// dismissal marker belongs to the same ref only if it's in the same
+// sentence, and the "appended much later" case above still works because
+// each occurrence of the ref gets its own sentence, checked independently.
+//
+// grower (non-author review of this fix, same day): a semicolon-joined
+// clause with no period in between ("...regex bug...upstream; this task
+// itself remains genuinely blocked on PR #67...") let the sentence window
+// stretch past 120 chars with no boundary at all, bleeding into an
+// unrelated marker exactly like the period-only version was built to stop.
+// `;` is now a sentence boundary alongside `.`.
 function sentenceBounds(text: string, index: number): { start: number; end: number } {
-  const start = text.lastIndexOf('.', index - 1) + 1;
-  const dotIndex = text.indexOf('.', index);
-  const end = dotIndex === -1 ? text.length : dotIndex + 1;
+  const start = nearestBoundaryBefore(text, index, SENTENCE_BOUNDARY_REGEX);
+  const end = nearestBoundaryAfter(text, index, SENTENCE_BOUNDARY_REGEX);
   return { start, end };
+}
+
+const SENTENCE_BOUNDARY_REGEX = /[.;]/g;
+
+function nearestBoundaryBefore(text: string, index: number, regex: RegExp): number {
+  let best = 0;
+  regex.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(text))) {
+    const end = m.index + m[0].length;
+    if (end <= index) {
+      best = end;
+    } else {
+      break;
+    }
+  }
+  return best;
+}
+
+function nearestBoundaryAfter(text: string, index: number, regex: RegExp): number {
+  regex.lastIndex = index;
+  const m = regex.exec(text);
+  return m ? m.index : text.length;
 }
 
 // task_1788276323687 (grower, non-author review of the PR that introduced
@@ -379,7 +407,7 @@ function sentenceBounds(text: string, index: number): { start: number; end: numb
 // reference while explicitly ruling the idiom out, not a contrived case.
 //
 // KNOWN LIMITATION, now fixed (task_1788305871620, analyst, 2026-10-19; see
-// that task for the full 8-case regression matrix). Two earlier fixed-width
+// that task for the full regression matrix). Two earlier fixed-width
 // lookback variants (anchored 20-char, then unanchored 20-char) each solved
 // one counterexample and reopened another — "He is not here, this is a tool
 // artifact, PR #67 already dismissed." has "not" negating "here", not the
@@ -392,28 +420,49 @@ function sentenceBounds(text: string, index: number): { start: number; end: numb
 // WINDOW by the same boundary granularity — that conflation is what made
 // every fix trade one case for another. Treating them as two independent
 // granularities resolves it: negation is scoped to the CLAUSE (nearest
-// comma/period/`--` before the marker — tight, because an adverb is the
-// only thing allowed to intervene), while the marker-to-ref window above is
-// scoped to the SENTENCE (looser, because a dismissal clause and its PR
-// reference are typically adjacent clauses of one sentence, not the same
-// clause). Verified against all 8 cases in task_1788305871620 plus the
-// ref-format-masked case above (9/9).
+// comma/period/semicolon/`--` before the marker — tight, because an adverb
+// is the only thing allowed to intervene), while the marker-to-ref window
+// above is scoped to the SENTENCE (looser, because a dismissal clause and
+// its PR reference are typically adjacent clauses of one sentence, not the
+// same clause).
+//
+// grower (non-author review, same day): "PR #67 is not, in fact, a tool
+// artifact." regressed under the clause-boundary-stops-at-first-comma rule
+// above — the comma pair bracketing "in fact" (a short parenthetical aside)
+// stopped the backward scan before it ever reached "not", wrongly reading
+// the marker as un-negated. A comma immediately preceded by another comma
+// within a short span is this kind of aside, not an independent clause
+// boundary — skip past BOTH commas of such a pair and keep walking back for
+// the real clause start, rather than stopping at the first comma reached.
 const NEGATION_CUE_REGEX = /\b(not|isn't|isnt|wasn't|wasnt|never|no longer)\b/i;
-const CLAUSE_BOUNDARY_REGEX = /[,.]|--/g;
+const CLAUSE_BOUNDARY_REGEX = /[,.;]|--/g;
+const PARENTHETICAL_ASIDE_MAX_CHARS = 20;
 
 function clauseStartBefore(text: string, index: number): number {
-  let best = 0;
+  const boundaries: { start: number; end: number }[] = [];
   CLAUSE_BOUNDARY_REGEX.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = CLAUSE_BOUNDARY_REGEX.exec(text))) {
     const end = m.index + m[0].length;
     if (end <= index) {
-      best = end;
+      boundaries.push({ start: m.index, end });
     } else {
       break;
     }
   }
-  return best;
+  let i = boundaries.length - 1;
+  while (i > 0) {
+    const cur = boundaries[i];
+    const prev = boundaries[i - 1];
+    const isCommaPair = text[cur.start] === ',' && text[prev.start] === ',';
+    const gapLen = cur.start - prev.end;
+    if (isCommaPair && gapLen <= PARENTHETICAL_ASIDE_MAX_CHARS) {
+      i -= 2;
+      continue;
+    }
+    break;
+  }
+  return i >= 0 ? boundaries[i].end : 0;
 }
 
 function hasGenuineDismissalMarker(window: string): boolean {
