@@ -568,6 +568,48 @@ describe('Bus System', () => {
       expect(report.entries[0].detail).not.toContain('PR #55');
     });
 
+    // task_1788305871620 (analyst, 2026-10-19): same scenario as the test
+    // above, but with the PR reference written in its canonical "PR #67"
+    // (spaced) form instead of "PR#67". The prior test passed only by
+    // accident — isDismissedElsewhere re-searches the raw text for the
+    // CANONICAL ref string pushed into keptRefs ("PR #<n>", always spaced),
+    // so a mention actually written without a space never literal-matches
+    // and the window check silently never runs. With matching spacing the
+    // fixed 120-char window bled across the sentence boundary into PR #55's
+    // genuine (but unrelated) dismissal marker, wrongly suppressing PR #67.
+    it('still flags a genuine PR reference when "tool artifact" appears but not near that PR number (canonical spacing)', () => {
+      writeTask('myorg', {
+        id: 'task_unrelated_dismissal_spaced',
+        title: 'ship the fix',
+        status: 'blocked',
+        description:
+          'A prior finding here (PR #55) was a tool artifact of an unrelated regex bug, already fixed. ' +
+          'This task itself is genuinely blocked on PR #67 merging.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(1);
+      expect(report.entries[0].detail).toContain('PR #67');
+      expect(report.entries[0].detail).not.toContain('PR #55');
+    });
+
+    // task_1788305871620's case 1 (grower's 3rd-round review, the residual
+    // gap the task was filed to track): an unrelated negation elsewhere in
+    // the same sentence must not be wrongly attributed to the marker.
+    it('still suppresses a genuine dismissal when an unrelated negation precedes the marker in the same sentence ("He is not here, this is a tool artifact...")', () => {
+      writeTask('myorg', {
+        id: 'task_unrelated_negation_same_sentence',
+        title: 'ship the fix',
+        status: 'blocked',
+        description: 'He is not here, this is a tool artifact, PR #67 already dismissed.',
+      });
+
+      const report = checkStaleBlockers(testDir);
+
+      expect(report.entries).toHaveLength(0);
+    });
+
     // NOTE: the two mentions are kept far apart on purpose (separate
     // sentences, no shared clause) — this exercise found that a stat-source
     // cue sitting in the GAP between two close references (e.g. "...verified

@@ -341,7 +341,33 @@ const PRECEDENT_CUE_WINDOW_AFTER = 40;
 // the original mention) is exactly the shape that needs catching, and a
 // windowed check anchored only to the first occurrence would miss it.
 const DISMISSAL_MARKER_CUE_REGEX = /\btool artifact\b/gi;
-const DISMISSAL_CUE_WINDOW = 120;
+
+// task_1788305871620 (analyst, 2026-10-19): the prior fixed-width
+// DISMISSAL_CUE_WINDOW (120 chars either side of a PR mention) had a second,
+// previously-undocumented failure mode distinct from the negation-scoping
+// gap below — it can bleed PAST a sentence boundary into an unrelated PR
+// reference's own genuine dismissal: "A prior finding here (PR #55) was a
+// tool artifact of an unrelated regex bug, already fixed. This task itself
+// is genuinely blocked on PR #67 merging." puts "tool artifact" (describing
+// PR #55) well within 120 chars of "PR #67", wrongly suppressing a real,
+// still-open blocker. The existing regression test for this shape (below)
+// happened to pass anyway, but only by accident: it wrote the second
+// reference as "PR#67" (no space), which doesn't literal-match the
+// canonical "PR #67" string isDismissedElsewhere re-searches for (see
+// keptRefs.push below) — so the window check was a silent no-op for that
+// specific test, not genuinely exercised. A probe using the canonical
+// spacing reproduces the bleed. Fix: scope the window to the SENTENCE
+// containing the PR mention (nearest `.` boundary either side) instead of a
+// fixed character count — a dismissal marker belongs to the same ref only
+// if it's in the same sentence, and the "appended much later" case above
+// still works because each occurrence of the ref gets its own sentence,
+// checked independently.
+function sentenceBounds(text: string, index: number): { start: number; end: number } {
+  const start = text.lastIndexOf('.', index - 1) + 1;
+  const dotIndex = text.indexOf('.', index);
+  const end = dotIndex === -1 ? text.length : dotIndex + 1;
+  return { start, end };
+}
 
 // task_1788276323687 (grower, non-author review of the PR that introduced
 // isDismissedElsewhere): the marker check above had no negation awareness —
@@ -352,48 +378,48 @@ const DISMISSAL_CUE_WINDOW = 120;
 // of the idiom is plausible prose for an agent re-verifying a genuinely open
 // reference while explicitly ruling the idiom out, not a contrived case.
 //
-// Fix stays in the same "narrow explicit cue" register as the marker itself:
-// look at the ~20 chars immediately before each "tool artifact" match for a
-// negation word ANYWHERE in that span (not anchored to sit directly against
-// the match), and only count that occurrence as a genuine dismissal if no
-// negation appears in its lookback. A window can contain multiple
-// occurrences of the marker phrase; one negated occurrence does not
-// invalidate another, genuinely un-negated one elsewhere in the same window.
-//
-// Deliberately NOT anchored to end immediately before the marker (e.g. via a
-// trailing `$` after the negation word) — grower's own follow-up review
-// found that an anchored version still missed "not really a tool artifact"
-// (task_1788276326374's sibling finding), because the intervening adverb
-// broke the adjacency. A short, unanchored lookback catches that case too.
-//
-// KNOWN LIMITATION, not solved here (grower, 3rd-round review of this same
-// function): an UNRELATED negation elsewhere in the lookback can still be
-// wrongly attributed to the marker — "He is not here, this is a tool
-// artifact, PR #67 already dismissed." has "not" negating "here", landing
-// inside the 20-char window ahead of "tool artifact", so this occurrence is
-// wrongly read as negated and the genuine dismissal gets missed (the PR
-// re-flags despite already being resolved — the original #167 bug,
-// reintroduced in this one narrow shape). Two candidate fixes were tried and
-// both introduced a DIFFERENT regression when checked against the full test
-// matrix rather than just the new counterexample: a clause-boundary stop
-// (comma/period/`--`) fixes this case but breaks the "unrelated mention
-// elsewhere" test (a genuine dismissal for one PR reference bleeds across
-// and wrongly suppresses an unrelated one); a sentence-boundary-only variant
-// (period only) fixes that but reopens 3 other cases, including this one.
-// Conclusion: a punctuation-boundary heuristic cannot reliably disambiguate
-// "does this negation modify the marker, or something else nearby" — this
-// is a genuine natural-language-scoping problem, not a one-line fix waiting
-// to be found. Left as-is rather than shipping a narrower fix against an
-// ever-growing adversarial-example list; see task_1788305871620_29811457
-// for the full 8-case matrix both failed attempts were checked against, and
-// for whoever picks this up next.
+// KNOWN LIMITATION, now fixed (task_1788305871620, analyst, 2026-10-19; see
+// that task for the full 8-case regression matrix). Two earlier fixed-width
+// lookback variants (anchored 20-char, then unanchored 20-char) each solved
+// one counterexample and reopened another — "He is not here, this is a tool
+// artifact, PR #67 already dismissed." has "not" negating "here", not the
+// marker, but any FIXED lookback long enough to catch "not really a tool
+// artifact" (the adverb-intervened case) is also long enough to catch this
+// unrelated "not" and wrongly treat the marker as negated, missing a
+// genuine dismissal. The two punctuation-boundary attempts recorded in
+// task_1788305871620 as rejected ("fixes case 3, breaks case 5" / "fixes
+// case 5, reopens cases 1 and 8") were scoping NEGATION and the MARKER
+// WINDOW by the same boundary granularity — that conflation is what made
+// every fix trade one case for another. Treating them as two independent
+// granularities resolves it: negation is scoped to the CLAUSE (nearest
+// comma/period/`--` before the marker — tight, because an adverb is the
+// only thing allowed to intervene), while the marker-to-ref window above is
+// scoped to the SENTENCE (looser, because a dismissal clause and its PR
+// reference are typically adjacent clauses of one sentence, not the same
+// clause). Verified against all 8 cases in task_1788305871620 plus the
+// ref-format-masked case above (9/9).
 const NEGATION_CUE_REGEX = /\b(not|isn't|isnt|wasn't|wasnt|never|no longer)\b/i;
-const NEGATION_LOOKBACK = 20;
+const CLAUSE_BOUNDARY_REGEX = /[,.]|--/g;
+
+function clauseStartBefore(text: string, index: number): number {
+  let best = 0;
+  CLAUSE_BOUNDARY_REGEX.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = CLAUSE_BOUNDARY_REGEX.exec(text))) {
+    const end = m.index + m[0].length;
+    if (end <= index) {
+      best = end;
+    } else {
+      break;
+    }
+  }
+  return best;
+}
 
 function hasGenuineDismissalMarker(window: string): boolean {
   for (const m of window.matchAll(DISMISSAL_MARKER_CUE_REGEX)) {
     const matchIndex = m.index ?? 0;
-    const precedingStart = Math.max(0, matchIndex - NEGATION_LOOKBACK);
+    const precedingStart = clauseStartBefore(window, matchIndex);
     const preceding = window.slice(precedingStart, matchIndex);
     if (!NEGATION_CUE_REGEX.test(preceding)) {
       return true;
@@ -407,9 +433,8 @@ function isDismissedElsewhere(text: string, prRef: string): boolean {
   const mentionRegex = new RegExp(escaped, 'gi');
   for (const m of text.matchAll(mentionRegex)) {
     const matchIndex = m.index ?? 0;
-    const windowStart = Math.max(0, matchIndex - DISMISSAL_CUE_WINDOW);
-    const windowEnd = matchIndex + m[0].length + DISMISSAL_CUE_WINDOW;
-    if (hasGenuineDismissalMarker(text.slice(windowStart, windowEnd))) {
+    const { start, end } = sentenceBounds(text, matchIndex);
+    if (hasGenuineDismissalMarker(text.slice(start, end))) {
       return true;
     }
   }
