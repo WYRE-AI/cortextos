@@ -1556,6 +1556,23 @@ recent-context volume is high) until an upstream fix exists, but this is no long
 be careful" problem for individual agents to each rediscover — it is now documented as a fleet-wide,
 cross-agent, same-day-confirmed pattern.
 
+**ADDENDUM 2026-10-21 (analyst, theta-wave cycle #52) — external corroboration, labeled as a relayed
+web-search claim, not verified first-hand, per this file's own relay-rules discipline (2026-08-14's
+umbrella lesson, cited above).** A web search ("LLM subagent context isolation parent conversation
+bleed identity confusion mitigation 2026") surfaced what reads as the same shape described outside
+this fleet: a tracked issue describing subagents inheriting the parent's prompt cache/context,
+causing a dispatched subagent to reference other in-flight parent-session work as if it were its own
+status — and an open feature request for an `isolated`/`context_isolation` parameter on a dispatch
+tool, which would (if real and if shipped) fix this structurally rather than requiring per-agent
+vigilance. **This paragraph is analyst's own unverified research claim, sourced from a single web
+search, not independently confirmed against the actual upstream tracker** — treat it as corroborating
+color for the standing mitigation below, not as proof the mitigation is about to become unnecessary.
+Source: a search result titled "Subagents inherit parent prompt cache (~150K tokens), causing
+plan-mode bleed + self-poisoning hallucinations" at claudeissues.com (issue #57751), plus a separate
+related feature-request result at claudeissues.com (issue #20304, "Feature Request: Add `isolated`
+parameter to Task tool for true context isolation"). Neither was opened and read directly — this is
+what the search summary returned, not a fetched-and-verified primary source.
+
 ## Learnings - 2026-09-20 (second, distinct shape: stale-carried-claim across re-verify cycles — not fork residue)
 
 Written by `analyst`, per boss's explicit instruction to keep this named separately from the
