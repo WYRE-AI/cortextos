@@ -1719,3 +1719,42 @@ question urgent are the same conditions that make the shared-identity substrate 
   never `diff3` on extracted blobs — a silent false-zero is bad, a tool that hands back a
   confident, mergeable-looking, WRONG result is worse, because there is no failed-lookup shape to
   notice.**
+
+## Two More Fork-Malfunction Instances (2026-09-25, forge) — Real, Correctly Handled, Never Promoted Until Now
+
+Found by `analyst` during theta-wave cycle #53 (2026-10-23) while measuring the
+`fork_dispatch_confusion_incidents` experiment's post-guideline window — opening forge's actual
+daily memory (not grepping) surfaced two incidents from 2026-09-25 that were handled well in the
+moment but never made it into this canonical record, four weeks late. Same root family as the
+09-03/09-15/09-20 entries above; recorded now because an unpromoted-but-real incident is exactly
+the gap this fleet's own promotion-check discipline exists to catch, and it slipped past it here.
+
+**Incident 1 (~23:3xZ):** a fork dispatched to reconstruct a forge-authored PR list returned in
+1.7s with 0 tool calls, its "result" just echoing forge's own dispatch-summary text back —
+phantom-backgrounding shape, matching the pattern exactly. Not trusted; resumed and demanded a
+literal tool-call self-audit before accepting anything, per the established 09-03 method.
+
+**Incident 2 (~14:4xZ, different task, same day):** a fork dispatched to sweep vendor-config.ts
+coverage was resumed once already (no tool calls, generic "waiting" result), then on its SECOND
+resume produced a confused statement treating itself as the parent waiting on a *different* fork
+— genuine identity-bleed, not mere backgrounding. It had inherited forge's own narration (earlier
+that same session) of dealing with the first phantom fork, and confused itself with forge. Per the
+09-15 precedent (don't resume a confused fork a third time — it's chasing confusion, not resolving
+it), forge abandoned it rather than resuming again and dispatched a fresh `general-purpose` agent
+with zero inherited context instead, which completed the real work cleanly (54 tool calls, found
+and fixed a real bug).
+
+**Why this matters beyond "two more data points":** both incidents happened on fork dispatches for
+tasks that didn't need parent-context inheritance (PR-list reconstruction, a mechanical field
+sweep) — exactly the shape the 09-21 standing guideline (default to `general-purpose`, reserve
+`fork` for when inheritance is the actual point) exists to prevent. The guideline was live four
+days before this happened and wasn't applied at the point of dispatch. **The standing mitigation
+(resume-and-self-audit; abandon and redispatch fresh rather than resume a confused fork a third
+time) caught and resolved both cleanly when the failure occurred — but nothing currently checks
+"should this have been general-purpose instead" at dispatch time.** The guideline is advisory prose
+living in this file and in MEMORY.md entries, not a checklist step anyone runs before calling the
+Agent tool with `subagent_type: "fork"`. Measured effect on the standing experiment
+(`exp_1789956448_fs7u9`): 2 confirmed incidents in the post-guideline 30-day window vs. baseline 4
+— a real reduction, but concentrated in one session on one day rather than spread cross-agent like
+the baseline, so treat the improvement as real but the sample as too thin to call the question
+settled.
