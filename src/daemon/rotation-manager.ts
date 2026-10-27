@@ -295,23 +295,6 @@ export class RotationManager {
   }
 
   /**
-   * Restart every currently limit-blocked agent (writing its
-   * `.rotation-recovered` marker first) and clear it from `state.limitBlocked`
-   * only when restartAgent confirms a running Tier 1 PTY. A resolved call is
-   * not that confirmation — see RotationDeps.restartAgent. Shared by both
-   * doRotation() recovery branches — rotating onto a newly-available
-   * candidate account, and the active account recovering in place.
-   *
-   * Any GLM-active marker is cleared immediately before the restart so the
-   * new PTY does not pick the override back up, and restored (with
-   * limitBlocked retained) when the restart throws or does not confirm a
-   * running PTY.
-   *
-   * `restartReason` is the `.restart-planned` text restartAgent() writes.
-   * It stays distinct from `markerReason`: classifyFromMarkers reads
-   * `.rotation-recovered` first, and the planned marker is the fallback.
-   */
-  /**
    * Restart the right population after an active-account flip succeeds:
    * everyone currently limitBlocked, UNLESS that set is empty — nobody was
    * waiting on this rotation (a proactive preflight rotation, or the active
@@ -328,6 +311,11 @@ export class RotationManager {
       : this.restartBlockedAgents(state, markerReason, restartReason);
   }
 
+  /**
+   * Restart every currently limit-blocked agent and clear it from
+   * `state.limitBlocked` only when restartOneAgent confirms a running
+   * Tier 1 PTY — see restartOneAgent for the shared GLM/marker mechanics.
+   */
   private async restartBlockedAgents(state: RotationState, markerReason: string, restartReason: string): Promise<string[]> {
     const toRestart = Object.keys(state.limitBlocked);
     for (const agent of toRestart) {
@@ -337,7 +325,7 @@ export class RotationManager {
     return toRestart;
   }
 
-  /** Restart EVERY currently-running agent — see restartAfterFlip. */
+  /** Restart EVERY currently-running agent — see restartAfterFlip and restartOneAgent. */
   private async restartAllRunningAgents(markerReason: string, restartReason: string): Promise<string[]> {
     const toRestart = this.listRunningAgents();
     for (const agent of toRestart) {
@@ -347,13 +335,20 @@ export class RotationManager {
   }
 
   /**
-   * Shared single-agent restart: clear any GLM Tier-2 marker, write the
-   * rotation marker, call restartAgent, and restore the GLM marker if the
-   * call throws or does not confirm a running PTY. Returns true only on a
-   * confirmed restart. `restartReason` (already distinct per caller) is
-   * what any log line about a non-confirmed restart needs — the agent just
+   * Shared single-agent restart, used by both restartBlockedAgents and
+   * restartAllRunningAgents. A resolved restartAgent() call is not
+   * confirmation a PTY is running — see RotationDeps.restartAgent — so this
+   * returns true only when it actually confirms one.
+   *
+   * Any GLM-active marker is cleared immediately before the restart so the
+   * new PTY does not pick the override back up, and restored when the
+   * restart throws or does not confirm a running PTY — the agent then just
    * stays in whatever state it was already in (blocked, or split-brain)
    * until the next attempt notices it again.
+   *
+   * `restartReason` is the `.restart-planned` text restartAgent() writes.
+   * It stays distinct from `markerReason`: classifyFromMarkers reads
+   * `.rotation-recovered` first, and the planned marker is the fallback.
    */
   private async restartOneAgent(agent: string, markerReason: string, restartReason: string): Promise<boolean> {
     const existing = loadGlmFallbackState(this.deps.ctxRoot).active[agent];
