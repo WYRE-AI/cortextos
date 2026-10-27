@@ -149,7 +149,16 @@ export function loadRotationState(ctxRoot: string): RotationState {
   return loadState(ctxRoot);
 }
 
-/** Default for RotationDeps.listRunningAgents — see its doc comment. */
+/**
+ * Default for RotationDeps.listRunningAgents — see its doc comment.
+ * Deliberately NOT `discoverAllAgents` (src/utils/agent-dir.ts): that helper
+ * is multi-org and enabled-agents.json-driven, a different population than
+ * `writeTokenToAgents()` actually writes to (strictly `orgs/{org}/agents/*`,
+ * no cross-org scan, no qualified `engineer/agent` names). Restarting a
+ * population wider than what just got a new token would restart agents
+ * `restartAgent()` may not even resolve by that name — reintroducing a
+ * different split-brain-adjacent mismatch while fixing this one.
+ */
 function listAgentDirs(frameworkRoot: string, org: string): string[] {
   const agentsBase = join(frameworkRoot, 'orgs', org, 'agents');
   if (!existsSync(agentsBase)) return [];
@@ -196,7 +205,7 @@ function isObservedHealthySince(ctxRoot: string, agent: string, sinceMs: number)
  * retryAt` gate can both skip for many ticks in a row), not just inside
  * doRotation's halt branch.
  */
-function computeRetryAt(state: RotationState, liveAccounts: Record<string, unknown>, t: number): number | null {
+function computeRetryAt(state: RotationState, liveAccounts: Record<string, unknown>): number | null {
   const knownResets = [
     ...Object.entries(state.exhausted)
       .filter(([name]) => name in liveAccounts)
@@ -302,28 +311,37 @@ export class RotationManager {
    * It stays distinct from `markerReason`: classifyFromMarkers reads
    * `.rotation-recovered` first, and the planned marker is the fallback.
    */
+  /**
+   * Restart the right population after an active-account flip succeeds:
+   * everyone currently limitBlocked, UNLESS that set is empty — nobody was
+   * waiting on this rotation (a proactive preflight rotation, or the active
+   * account recovering with no one blocked), so restarting the (empty)
+   * blocked set would restart zero agents even though writeTokenToAgents()
+   * just rewrote every agent's .env unconditionally. See
+   * RotationDeps.listRunningAgents for the incident this closes
+   * (task_1793058444001_76153432, fix direction 1). Shared by both
+   * doRotation() success branches.
+   */
+  private async restartAfterFlip(state: RotationState, markerReason: string, restartReason: string): Promise<string[]> {
+    return Object.keys(state.limitBlocked).length === 0
+      ? this.restartAllRunningAgents(markerReason, restartReason)
+      : this.restartBlockedAgents(state, markerReason, restartReason);
+  }
+
   private async restartBlockedAgents(state: RotationState, markerReason: string, restartReason: string): Promise<string[]> {
     const toRestart = Object.keys(state.limitBlocked);
     for (const agent of toRestart) {
-      const started = await this.restartOneAgent(agent, markerReason, restartReason, ' — stays blocked for next tick');
+      const started = await this.restartOneAgent(agent, markerReason, restartReason);
       if (started) delete state.limitBlocked[agent];
     }
     return toRestart;
   }
 
-  /**
-   * Restart EVERY currently-running agent, not just limitBlocked ones.
-   * Called instead of restartBlockedAgents() when state.limitBlocked is
-   * empty at the moment an active-account flip succeeds — nobody was
-   * waiting on this rotation, so restartBlockedAgents() alone would restart
-   * zero agents even though writeTokenToAgents() just rewrote every
-   * agent's .env unconditionally. See RotationDeps.listRunningAgents for
-   * the incident this closes (task_1793058444001_76153432, fix direction 1).
-   */
+  /** Restart EVERY currently-running agent — see restartAfterFlip. */
   private async restartAllRunningAgents(markerReason: string, restartReason: string): Promise<string[]> {
     const toRestart = this.listRunningAgents();
     for (const agent of toRestart) {
-      await this.restartOneAgent(agent, markerReason, restartReason, ' — still on the OLD credential until its own next restart');
+      await this.restartOneAgent(agent, markerReason, restartReason);
     }
     return toRestart;
   }
@@ -332,11 +350,12 @@ export class RotationManager {
    * Shared single-agent restart: clear any GLM Tier-2 marker, write the
    * rotation marker, call restartAgent, and restore the GLM marker if the
    * call throws or does not confirm a running PTY. Returns true only on a
-   * confirmed restart. `logSuffix` lets callers describe what "didn't
-   * confirm" leaves behind (stays blocked vs. stays split-brain) without
-   * duplicating the GLM clear/restore logic itself.
+   * confirmed restart. `restartReason` (already distinct per caller) is
+   * what any log line about a non-confirmed restart needs — the agent just
+   * stays in whatever state it was already in (blocked, or split-brain)
+   * until the next attempt notices it again.
    */
-  private async restartOneAgent(agent: string, markerReason: string, restartReason: string, logSuffix: string): Promise<boolean> {
+  private async restartOneAgent(agent: string, markerReason: string, restartReason: string): Promise<boolean> {
     const existing = loadGlmFallbackState(this.deps.ctxRoot).active[agent];
     const priorGlm = existing ? { since: existing.since, reason: existing.reason } : undefined;
     if (priorGlm) clearGlmFallbackActive(this.deps.ctxRoot, agent);
@@ -345,11 +364,11 @@ export class RotationManager {
       const started = await this.deps.restartAgent(agent, restartReason);
       if (started === true) return true;
       this.restoreGlmFallback(agent, priorGlm);
-      this.deps.log(`[rotation] restart for ${agent} resolved without a running Tier 1 PTY${logSuffix}`);
+      this.deps.log(`[rotation] restart for ${agent} resolved without a running Tier 1 PTY (${restartReason})`);
       return false;
     } catch (err) {
       this.restoreGlmFallback(agent, priorGlm);
-      this.deps.log(`[rotation] restart failed for ${agent}: ${err}${logSuffix}`);
+      this.deps.log(`[rotation] restart failed for ${agent}: ${err} (${restartReason})`);
       return false;
     }
   }
@@ -392,16 +411,21 @@ export class RotationManager {
     state.limitBlocked[agent] = { detectedAt: t, kind: ev.kind, resetAt: ev.resetAt };
     // The active account is exhausted by definition of the event — but
     // "active" per WHOM? accounts.json's global `active` field is the
-    // obvious read, and the only one checked before this fix. If `agent`
-    // is itself split-brain (its .env already rewritten by a prior
-    // proactive rotation, its process not yet restarted — see
-    // RotationDeps.listRunningAgents) or deliberately pinned to a
-    // different account, the global field names the WRONG account, and
-    // marking it exhausted risks rotating the fleet away from an account
-    // everyone else is correctly and successfully running on
-    // (task_1793058444001_76153432, fix direction 2). Cross-check what
-    // `agent`'s own .env token actually resolves to first; fall back to
-    // the global field only when that resolution is unavailable.
+    // obvious read, and the only one checked before this fix. Cross-check
+    // what `agent`'s own .env token actually resolves to first; fall back
+    // to the global field only when that resolution is unavailable
+    // (task_1793058444001_76153432, fix direction 2).
+    //
+    // Scope, stated honestly: `.env` is the SAME file fix direction 1's
+    // restart-gate (writeTokenToAgents) just rewrote, so during the exact
+    // live split-brain window (new .env on disk, old credential still
+    // loaded in the process) this cross-check sees the NEW account too and
+    // agrees with the global field — it cannot distinguish a still-stale
+    // process from a resynced one. What it DOES catch: a deliberate
+    // per-agent pin (`set-oauth-account --agent`) or any other path that
+    // leaves one agent's `.env` genuinely different from the global field
+    // — a real account mismatch fix direction 1 doesn't cover. Defense in
+    // depth for a different failure, not a second detector for the same one.
     const store = loadAccounts(this.deps.ctxRoot);
     const active = store?.active;
     const ownAccount = store ? resolveAgentAccountName(this.deps.frameworkRoot, this.deps.org, agent, store) : null;
@@ -441,7 +465,7 @@ export class RotationManager {
     if (blocked && state.retryAt !== null) {
       const storeForRetry = loadAccounts(this.deps.ctxRoot);
       if (storeForRetry) {
-        const fresh = computeRetryAt(state, storeForRetry.accounts, t);
+        const fresh = computeRetryAt(state, storeForRetry.accounts);
         if (fresh !== null && fresh !== state.retryAt) {
           state.retryAt = fresh;
           dirty = true;
@@ -558,23 +582,17 @@ export class RotationManager {
         writeTokenToAgents(this.deps.frameworkRoot, this.deps.org, store.accounts[name].access_token);
         // Reload: preflights are slow (real inference); more agents may have blocked meanwhile.
         state = loadState(this.deps.ctxRoot);
-        // GLM markers are cleared inside restartBlockedAgents/
-        // restartAllRunningAgents immediately before each restart, and
-        // restored unless that call confirms a running Tier 1 PTY. Do not
-        // clear them here first — a pre-clear throws away the entry a
-        // failed restart has to put back.
-        //
-        // writeTokenToAgents() above just rewrote EVERY agent's .env,
-        // unconditionally. If nobody is limitBlocked right now, this was a
-        // proactive rotation nobody was waiting on — restartBlockedAgents()
-        // would restart zero agents and leave every running one
-        // split-brain until its own unrelated next restart (fix direction
-        // 1, task_1793058444001_76153432).
-        const markerReason = `rotation recovery: account "${name}" now active (${reason})`;
-        const restartReason = `oauth rotation -> account "${name}" (${reason})`;
-        const toRestart = Object.keys(state.limitBlocked).length === 0
-          ? await this.restartAllRunningAgents(markerReason, restartReason)
-          : await this.restartBlockedAgents(state, markerReason, restartReason);
+        // GLM markers are cleared inside restartAfterFlip's chosen restart
+        // method immediately before each restart, and restored unless that
+        // call confirms a running Tier 1 PTY. Do not clear them here first
+        // — a pre-clear throws away the entry a failed restart has to put
+        // back. See restartAfterFlip's doc comment for why the restart
+        // population depends on whether anyone was limitBlocked.
+        const toRestart = await this.restartAfterFlip(
+          state,
+          `rotation recovery: account "${name}" now active (${reason})`,
+          `oauth rotation -> account "${name}" (${reason})`,
+        );
         state.lastRotationAt = this.now();
         state.retryAt = null;
         state.alertedHalt = false;
@@ -613,17 +631,16 @@ export class RotationManager {
       attempted += 1;
       if (activeResult === 'ok') {
         state = loadState(this.deps.ctxRoot);
-        // Same as the candidate-rotation branch: restartBlockedAgents/
-        // restartAllRunningAgents own the GLM clear/restore. A pre-clear
-        // here cannot be undone. No active-account write happens in this
-        // branch (it recovered in place, no flip), but a prior rotation
-        // into it could still have left non-blocked agents split-brain —
-        // restart everyone when nobody was waiting on this recovery.
-        const markerReason = `rotation recovery: account "${store.active}" recovered (${reason})`;
-        const restartReason = `oauth rotation -> account "${store.active}" (recovered)`;
-        const toRestart = Object.keys(state.limitBlocked).length === 0
-          ? await this.restartAllRunningAgents(markerReason, restartReason)
-          : await this.restartBlockedAgents(state, markerReason, restartReason);
+        // Same as the candidate-rotation branch: restartAfterFlip owns the
+        // GLM clear/restore. A pre-clear here cannot be undone. No
+        // active-account write happens in this branch (it recovered in
+        // place, no flip), but a prior rotation into it could still have
+        // left non-blocked agents split-brain.
+        const toRestart = await this.restartAfterFlip(
+          state,
+          `rotation recovery: account "${store.active}" recovered (${reason})`,
+          `oauth rotation -> account "${store.active}" (recovered)`,
+        );
         state.lastRotationAt = this.now();
         state.retryAt = null;
         state.alertedHalt = false;
@@ -661,7 +678,7 @@ export class RotationManager {
     // ancient orphaned mark again, belt-and-braces with the prune above.
     // computeRetryAt() is the same derivation tick() now also runs every
     // cycle (fix direction 3) — factored out rather than duplicated.
-    state.retryAt = computeRetryAt(state, store.accounts, t) ?? t + RETRY_FALLBACK_MS;
+    state.retryAt = computeRetryAt(state, store.accounts) ?? t + RETRY_FALLBACK_MS;
     const alertNeeded = !state.alertedHalt;
     state.alertedHalt = true;
     this.save(state);

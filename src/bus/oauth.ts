@@ -17,6 +17,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { execFile } from 'child_process';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { parseEnvFile } from '../utils/env.js';
 
 // Hand-rolled Promise wrapper rather than util.promisify(execFile): Node's
 // built-in execFile carries a promisify.custom symbol that changes resolve
@@ -746,14 +747,7 @@ export function resolveAgentAccountName(
 ): string | null {
   const envPath = join(frameworkRoot, 'orgs', org, 'agents', agent, '.env');
   if (!existsSync(envPath)) return null;
-  let content: string;
-  try {
-    content = readFileSync(envPath, 'utf-8');
-  } catch {
-    return null;
-  }
-  const match = content.match(/^CLAUDE_CODE_OAUTH_TOKEN=(.*)$/m);
-  const token = match?.[1]?.trim();
+  const token = parseEnvFile(envPath).CLAUDE_CODE_OAUTH_TOKEN;
   if (!token) return null;
   for (const [name, account] of Object.entries(store.accounts)) {
     if (account.access_token === token) return name;
