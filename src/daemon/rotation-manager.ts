@@ -5,10 +5,10 @@
 // state/oauth/rotation-state.json. Preflight is an inference ping — the usage
 // API 403s on setup-tokens (no user:profile scope).
 
-import { existsSync, readFileSync, writeFileSync, chmodSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
-import { loadAccounts, setActiveAccount, writeTokenToAgents } from '../bus/oauth.js';
+import { loadAccounts, resolveAgentAccountName, setActiveAccount, writeTokenToAgents } from '../bus/oauth.js';
 import {
   attemptGlmFallback,
   clearGlmFallbackActive,
@@ -45,6 +45,26 @@ export interface RotationDeps {
    * once, from the "every Tier 1 account exhausted" halt branch below.
    */
   tryGlmFallback?: (ctxRoot: string, blockedAgents: string[], reason: string, log: (msg: string) => void) => GlmFallbackAttemptResult;
+  /**
+   * Enumerate agents to restart when an active-account flip happens while
+   * NOBODY is limitBlocked (see restartAllRunningAgents) — a proactive
+   * preflight rotation, or the active account recovering with no one
+   * waiting on it. writeTokenToAgents() rewrites every agent's .env
+   * unconditionally regardless of which path triggered the flip, so a
+   * flip with an empty restart set otherwise leaves every already-running
+   * agent split-brain (new .env on disk, old credential still loaded in
+   * its process) until its own unrelated next restart. Real incident:
+   * 2026-10-26T22:50:49Z, 9 of 14 agents stayed split-brain for ~71
+   * minutes this way (task_1793058444001_76153432).
+   *
+   * Defaults to every directory under frameworkRoot/orgs/{org}/agents/ —
+   * the same population writeTokenToAgents() already touches
+   * unconditionally, so a caller that doesn't wire in a live process
+   * registry still gets the conservative "everyone whose .env we just
+   * rewrote" set. The daemon wires in its real live-agent registry
+   * instead (agent-manager.ts), which is more precise.
+   */
+  listRunningAgents?: () => string[];
 }
 
 /**
@@ -129,6 +149,63 @@ export function loadRotationState(ctxRoot: string): RotationState {
   return loadState(ctxRoot);
 }
 
+/** Default for RotationDeps.listRunningAgents — see its doc comment. */
+function listAgentDirs(frameworkRoot: string, org: string): string[] {
+  const agentsBase = join(frameworkRoot, 'orgs', org, 'agents');
+  if (!existsSync(agentsBase)) return [];
+  try {
+    return readdirSync(agentsBase, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Has this agent produced a fresh heartbeat since `sinceMs`? Used to prune
+ * stale `limitBlocked` entries for an agent that recovered via a restart
+ * path OTHER than this manager's own restartBlockedAgents()/
+ * restartAllRunningAgents() — e.g. the hang-detector's no-beat force-restart,
+ * or a context-force-restart — so the entry never clears on its own
+ * (task_1793058444001_76153432, finding 3). Deliberately reads the broad
+ * `last_heartbeat` field (bumped even by the daemon's own idle watchdog
+ * beat), not `last_session_heartbeat` — this only needs to know the agent's
+ * process came back up and is reachable again, not that it is actively
+ * processing a turn right now.
+ */
+function isObservedHealthySince(ctxRoot: string, agent: string, sinceMs: number): boolean {
+  try {
+    const hbPath = join(ctxRoot, 'state', agent, 'heartbeat.json');
+    if (!existsSync(hbPath)) return false;
+    const hb = JSON.parse(readFileSync(hbPath, 'utf-8')) as { last_heartbeat?: string };
+    if (!hb.last_heartbeat) return false;
+    return new Date(hb.last_heartbeat).getTime() > sinceMs;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pure derivation of retryAt from current exhausted/limitBlocked data —
+ * null when neither tracks anything. Factored out so it can be recomputed
+ * on every tick() (finding 4: retryAt was observed pinned at a stale value
+ * across many consecutive ticks despite limitBlocked/exhausted changing
+ * underneath it — doRotation's own recompute only runs when doRotation is
+ * actually re-entered, which its cooldown guard and tick()'s own `t <
+ * retryAt` gate can both skip for many ticks in a row), not just inside
+ * doRotation's halt branch.
+ */
+function computeRetryAt(state: RotationState, liveAccounts: Record<string, unknown>, t: number): number | null {
+  const knownResets = [
+    ...Object.entries(state.exhausted)
+      .filter(([name]) => name in liveAccounts)
+      .map(([, rec]) => rec.resetAt),
+    ...Object.values(state.limitBlocked).map((b) => b.resetAt).filter((x): x is number => x !== null),
+  ];
+  return knownResets.length ? Math.min(...knownResets) + 5 * 60_000 : null;
+}
+
 /**
  * Drop exhaustion marks for accounts no longer in accounts.json (retired or
  * removed). BUG FOUND 2026-08-20: a retired account's mark is never cleared
@@ -160,6 +237,7 @@ export function isLimitBlocked(ctxRoot: string, agent: string): boolean {
 export class RotationManager {
   private readonly now: () => number;
   private readonly tryGlmFallback: NonNullable<RotationDeps['tryGlmFallback']>;
+  private readonly listRunningAgents: NonNullable<RotationDeps['listRunningAgents']>;
   private timer: ReturnType<typeof setInterval> | null = null;
   private rotating = false;
 
@@ -167,6 +245,8 @@ export class RotationManager {
     this.now = deps.now ?? (() => Date.now());
     this.tryGlmFallback = deps.tryGlmFallback ??
       ((ctxRoot, blockedAgents, reason, log) => attemptGlmFallback(ctxRoot, blockedAgents, reason, { log, now: this.now }));
+    this.listRunningAgents = deps.listRunningAgents ??
+      (() => listAgentDirs(this.deps.frameworkRoot, this.deps.org));
   }
 
   private save(state: RotationState): void {
@@ -225,30 +305,81 @@ export class RotationManager {
   private async restartBlockedAgents(state: RotationState, markerReason: string, restartReason: string): Promise<string[]> {
     const toRestart = Object.keys(state.limitBlocked);
     for (const agent of toRestart) {
-      const existing = loadGlmFallbackState(this.deps.ctxRoot).active[agent];
-      const priorGlm = existing ? { since: existing.since, reason: existing.reason } : undefined;
-      if (priorGlm) clearGlmFallbackActive(this.deps.ctxRoot, agent);
-      try {
-        this.writeRestartMarker(agent, markerReason);
-        const started = await this.deps.restartAgent(agent, restartReason);
-        if (started === true) {
-          delete state.limitBlocked[agent];
-        } else {
-          this.restoreGlmFallback(agent, priorGlm);
-          this.deps.log(`[rotation] restart for ${agent} resolved without a running Tier 1 PTY — stays blocked for next tick`);
-        }
-      } catch (err) {
-        this.restoreGlmFallback(agent, priorGlm);
-        this.deps.log(`[rotation] restart failed for ${agent}: ${err} — stays blocked for next tick`);
-      }
+      const started = await this.restartOneAgent(agent, markerReason, restartReason, ' — stays blocked for next tick');
+      if (started) delete state.limitBlocked[agent];
     }
     return toRestart;
+  }
+
+  /**
+   * Restart EVERY currently-running agent, not just limitBlocked ones.
+   * Called instead of restartBlockedAgents() when state.limitBlocked is
+   * empty at the moment an active-account flip succeeds — nobody was
+   * waiting on this rotation, so restartBlockedAgents() alone would restart
+   * zero agents even though writeTokenToAgents() just rewrote every
+   * agent's .env unconditionally. See RotationDeps.listRunningAgents for
+   * the incident this closes (task_1793058444001_76153432, fix direction 1).
+   */
+  private async restartAllRunningAgents(markerReason: string, restartReason: string): Promise<string[]> {
+    const toRestart = this.listRunningAgents();
+    for (const agent of toRestart) {
+      await this.restartOneAgent(agent, markerReason, restartReason, ' — still on the OLD credential until its own next restart');
+    }
+    return toRestart;
+  }
+
+  /**
+   * Shared single-agent restart: clear any GLM Tier-2 marker, write the
+   * rotation marker, call restartAgent, and restore the GLM marker if the
+   * call throws or does not confirm a running PTY. Returns true only on a
+   * confirmed restart. `logSuffix` lets callers describe what "didn't
+   * confirm" leaves behind (stays blocked vs. stays split-brain) without
+   * duplicating the GLM clear/restore logic itself.
+   */
+  private async restartOneAgent(agent: string, markerReason: string, restartReason: string, logSuffix: string): Promise<boolean> {
+    const existing = loadGlmFallbackState(this.deps.ctxRoot).active[agent];
+    const priorGlm = existing ? { since: existing.since, reason: existing.reason } : undefined;
+    if (priorGlm) clearGlmFallbackActive(this.deps.ctxRoot, agent);
+    try {
+      this.writeRestartMarker(agent, markerReason);
+      const started = await this.deps.restartAgent(agent, restartReason);
+      if (started === true) return true;
+      this.restoreGlmFallback(agent, priorGlm);
+      this.deps.log(`[rotation] restart for ${agent} resolved without a running Tier 1 PTY${logSuffix}`);
+      return false;
+    } catch (err) {
+      this.restoreGlmFallback(agent, priorGlm);
+      this.deps.log(`[rotation] restart failed for ${agent}: ${err}${logSuffix}`);
+      return false;
+    }
   }
 
   start(): void {
     this.timer = setInterval(() => { void this.tick(); }, TICK_MS);
     // Don't hold the process open for the rotation tick alone.
     (this.timer as { unref?: () => void }).unref?.();
+  }
+
+  /**
+   * Drop limitBlocked entries for agents independently observed healthy
+   * (a fresh heartbeat) since they were marked blocked — they recovered via
+   * a restart path this manager doesn't own (hang-detector, context-force-
+   * restart) and restartBlockedAgents() will never see them to clear them
+   * itself. Left unpruned, a stale entry sits forever and keeps poisoning
+   * retryAt's Math.min() the same way pruneOrphanedExhaustion() already
+   * guards against for `exhausted` (task_1793058444001_76153432, fix
+   * direction 3, first half).
+   */
+  private pruneStaleLimitBlocked(state: RotationState): boolean {
+    let changed = false;
+    for (const [agent, rec] of Object.entries(state.limitBlocked)) {
+      if (isObservedHealthySince(this.deps.ctxRoot, agent, rec.detectedAt)) {
+        delete state.limitBlocked[agent];
+        changed = true;
+        this.deps.log(`[rotation] pruned stale limitBlocked entry for ${agent} — observed healthy (heartbeat advanced past ${new Date(rec.detectedAt).toISOString()}), recovered via a non-rotation restart path`);
+      }
+    }
+    return changed;
   }
 
   stop(): void {
@@ -259,12 +390,27 @@ export class RotationManager {
     const t = this.now();
     const state = loadState(this.deps.ctxRoot);
     state.limitBlocked[agent] = { detectedAt: t, kind: ev.kind, resetAt: ev.resetAt };
-    // The active account is exhausted by definition of the event. Always mark it
-    // (fallback expiry when no hint) — the mark also tells doRotation's
-    // active-recovery recheck "don't waste a ping, the banner is fresh proof".
-    const active = loadAccounts(this.deps.ctxRoot)?.active;
-    if (active) {
-      state.exhausted[active] = { observedAt: t, resetAt: ev.resetAt ?? t + RETRY_FALLBACK_MS, source: 'limit-banner' };
+    // The active account is exhausted by definition of the event — but
+    // "active" per WHOM? accounts.json's global `active` field is the
+    // obvious read, and the only one checked before this fix. If `agent`
+    // is itself split-brain (its .env already rewritten by a prior
+    // proactive rotation, its process not yet restarted — see
+    // RotationDeps.listRunningAgents) or deliberately pinned to a
+    // different account, the global field names the WRONG account, and
+    // marking it exhausted risks rotating the fleet away from an account
+    // everyone else is correctly and successfully running on
+    // (task_1793058444001_76153432, fix direction 2). Cross-check what
+    // `agent`'s own .env token actually resolves to first; fall back to
+    // the global field only when that resolution is unavailable.
+    const store = loadAccounts(this.deps.ctxRoot);
+    const active = store?.active;
+    const ownAccount = store ? resolveAgentAccountName(this.deps.frameworkRoot, this.deps.org, agent, store) : null;
+    const exhaustedAccount = ownAccount ?? active;
+    if (ownAccount && active && ownAccount !== active) {
+      this.deps.log(`[rotation] ${agent} reported a limit event while accounts.json says active="${active}" but ${agent}'s own .env token resolves to "${ownAccount}" — marking "${ownAccount}" exhausted, not the global active field (split-brain guard)`);
+    }
+    if (exhaustedAccount) {
+      state.exhausted[exhaustedAccount] = { observedAt: t, resetAt: ev.resetAt ?? t + RETRY_FALLBACK_MS, source: 'limit-banner' };
     }
     this.save(state);
     this.deps.log(`[rotation] ${agent} limit-blocked (${ev.kind}, reset ${ev.resetAt ? new Date(ev.resetAt).toISOString() : 'unknown'})`);
@@ -274,7 +420,35 @@ export class RotationManager {
   async tick(): Promise<void> {
     const t = this.now();
     const state = loadState(this.deps.ctxRoot);
+    let dirty = this.pruneStaleLimitBlocked(state);
+
     const blocked = Object.keys(state.limitBlocked).length > 0;
+
+    // Keep an EXISTING retryAt current even on ticks where no rotation
+    // attempt actually runs — doRotation's own recompute only fires when it
+    // is re-entered, and both its cooldown guard and the `t < retryAt` gate
+    // just below can skip that for many consecutive ticks while
+    // limitBlocked/exhausted keeps changing underneath it
+    // (task_1793058444001_76153432, fix direction 3, second half).
+    //
+    // Gated on retryAt !== null deliberately: null means "no scheduled
+    // retry yet — try as soon as possible," which is exactly what the gate
+    // below does with it. Recomputing from current exhausted/limitBlocked
+    // data here would manufacture a real (possibly far-future) retryAt out
+    // of stale exhaustion marks left over from an already-resolved rotation
+    // and WRONGLY defer a retry that should fire immediately — this must
+    // only ever refresh a retry that is already scheduled, never invent one.
+    if (blocked && state.retryAt !== null) {
+      const storeForRetry = loadAccounts(this.deps.ctxRoot);
+      if (storeForRetry) {
+        const fresh = computeRetryAt(state, storeForRetry.accounts, t);
+        if (fresh !== null && fresh !== state.retryAt) {
+          state.retryAt = fresh;
+          dirty = true;
+        }
+      }
+    }
+    if (dirty) this.save(state);
 
     if (blocked && (state.retryAt === null || t >= state.retryAt)) {
       await this.attemptRotation('retry for blocked agents');
@@ -384,15 +558,23 @@ export class RotationManager {
         writeTokenToAgents(this.deps.frameworkRoot, this.deps.org, store.accounts[name].access_token);
         // Reload: preflights are slow (real inference); more agents may have blocked meanwhile.
         state = loadState(this.deps.ctxRoot);
-        // GLM markers are cleared inside restartBlockedAgents immediately
-        // before each restart, and restored unless that call confirms a
-        // running Tier 1 PTY. Do not clear them here first — a pre-clear
-        // throws away the entry a failed restart has to put back.
-        const toRestart = await this.restartBlockedAgents(
-          state,
-          `rotation recovery: account "${name}" now active (${reason})`,
-          `oauth rotation -> account "${name}" (${reason})`,
-        );
+        // GLM markers are cleared inside restartBlockedAgents/
+        // restartAllRunningAgents immediately before each restart, and
+        // restored unless that call confirms a running Tier 1 PTY. Do not
+        // clear them here first — a pre-clear throws away the entry a
+        // failed restart has to put back.
+        //
+        // writeTokenToAgents() above just rewrote EVERY agent's .env,
+        // unconditionally. If nobody is limitBlocked right now, this was a
+        // proactive rotation nobody was waiting on — restartBlockedAgents()
+        // would restart zero agents and leave every running one
+        // split-brain until its own unrelated next restart (fix direction
+        // 1, task_1793058444001_76153432).
+        const markerReason = `rotation recovery: account "${name}" now active (${reason})`;
+        const restartReason = `oauth rotation -> account "${name}" (${reason})`;
+        const toRestart = Object.keys(state.limitBlocked).length === 0
+          ? await this.restartAllRunningAgents(markerReason, restartReason)
+          : await this.restartBlockedAgents(state, markerReason, restartReason);
         state.lastRotationAt = this.now();
         state.retryAt = null;
         state.alertedHalt = false;
@@ -431,13 +613,17 @@ export class RotationManager {
       attempted += 1;
       if (activeResult === 'ok') {
         state = loadState(this.deps.ctxRoot);
-        // Same as the candidate-rotation branch: restartBlockedAgents owns
-        // the GLM clear/restore. A pre-clear here cannot be undone.
-        const toRestart = await this.restartBlockedAgents(
-          state,
-          `rotation recovery: account "${store.active}" recovered (${reason})`,
-          `oauth rotation -> account "${store.active}" (recovered)`,
-        );
+        // Same as the candidate-rotation branch: restartBlockedAgents/
+        // restartAllRunningAgents own the GLM clear/restore. A pre-clear
+        // here cannot be undone. No active-account write happens in this
+        // branch (it recovered in place, no flip), but a prior rotation
+        // into it could still have left non-blocked agents split-brain —
+        // restart everyone when nobody was waiting on this recovery.
+        const markerReason = `rotation recovery: account "${store.active}" recovered (${reason})`;
+        const restartReason = `oauth rotation -> account "${store.active}" (recovered)`;
+        const toRestart = Object.keys(state.limitBlocked).length === 0
+          ? await this.restartAllRunningAgents(markerReason, restartReason)
+          : await this.restartBlockedAgents(state, markerReason, restartReason);
         state.lastRotationAt = this.now();
         state.retryAt = null;
         state.alertedHalt = false;
@@ -473,13 +659,9 @@ export class RotationManager {
     // — pruneOrphanedExhaustion already drops these going forward, but this
     // filter is the load-bearing guard against Math.min() ever picking an
     // ancient orphaned mark again, belt-and-braces with the prune above.
-    const knownResets = [
-      ...Object.entries(state.exhausted)
-        .filter(([name]) => name in store.accounts)
-        .map(([, rec]) => rec.resetAt),
-      ...Object.values(state.limitBlocked).map(b => b.resetAt).filter((x): x is number => x !== null),
-    ];
-    state.retryAt = knownResets.length ? Math.min(...knownResets) + 5 * 60_000 : t + RETRY_FALLBACK_MS;
+    // computeRetryAt() is the same derivation tick() now also runs every
+    // cycle (fix direction 3) — factored out rather than duplicated.
+    state.retryAt = computeRetryAt(state, store.accounts, t) ?? t + RETRY_FALLBACK_MS;
     const alertNeeded = !state.alertedHalt;
     state.alertedHalt = true;
     this.save(state);

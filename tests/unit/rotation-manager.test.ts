@@ -149,13 +149,31 @@ describe('RotationManager', () => {
     expect(readFileSync(join(ctxRoot, 'state/boss/.rotation-recovered'), 'utf-8')).toContain('account "a" recovered');
   });
 
-  it('proactive preflight rotates when the ACTIVE account hits its limit', async () => {
+  it('proactive preflight rotates when the ACTIVE account hits its limit, and restarts EVERY running agent — not just the (empty) blocked set (task_1793058444001_76153432, fix 1)', async () => {
     preflight.mockImplementation(async (tok: string) => (tok === 'tok-a' ? 'limit' : 'ok'));
     t += 30 * 60_000 + 1;                          // preflight interval elapsed
     await rm.tick();
     const accounts = JSON.parse(readFileSync(join(ctxRoot, 'state/oauth/accounts.json'), 'utf-8'));
     expect(accounts.active).toBe('b');
-    expect(restartAgent).not.toHaveBeenCalled();   // nobody blocked → empty restart set
+    // Nobody was limitBlocked when this rotation fired — writeTokenToAgents
+    // still rewrote every agent's .env, so every running agent (boss, dev)
+    // must be restarted or it split-brains (old process, new .env) until
+    // its own unrelated next restart. This is the real 2026-10-26T22:50:49Z
+    // incident: a proactive rotation that restarted zero of 14 agents.
+    expect(restartAgent).toHaveBeenCalledTimes(2);
+    expect(restartAgent).toHaveBeenCalledWith('boss', expect.any(String));
+    expect(restartAgent).toHaveBeenCalledWith('dev', expect.any(String));
+    expect(readFileSync(join(frameworkRoot, 'orgs/wyre/agents/boss/.env'), 'utf-8')).toContain('tok-b');
+    expect(readFileSync(join(frameworkRoot, 'orgs/wyre/agents/dev/.env'), 'utf-8')).toContain('tok-b');
+  });
+
+  it('a non-blocked-retry rotation leaves the restart-set EMPTY again once a real limit event is pending — unaffected by the fix above', async () => {
+    // Sanity check that fix 1 is scoped to the empty-limitBlocked case only:
+    // the normal blocked-retry path still restarts ONLY the blocked agent.
+    preflight.mockImplementation(async (tok: string) => (tok === 'tok-b' ? 'ok' : 'limit'));
+    await rm.onLimitEvent('boss', EV);
+    expect(restartAgent).toHaveBeenCalledTimes(1);
+    expect(restartAgent).toHaveBeenCalledWith('boss', expect.any(String));
   });
 
   it('proactive preflight leaves a healthy active account alone', async () => {
@@ -217,6 +235,84 @@ describe('RotationManager', () => {
       expect(sendAlert).toHaveBeenCalledTimes(2);
       await rm.onLimitEvent('boss', EV);           // tick->3, still all-error, but within 30min infra cooldown
       expect(sendAlert).toHaveBeenCalledTimes(2);  // no third alert yet
+    });
+  });
+
+  describe('onLimitEvent split-brain own-credential cross-check (task_1793058444001_76153432, fix 2)', () => {
+    it("marks the account the REPORTING AGENT'S OWN .env token resolves to, not accounts.json's global active field, when they disagree", async () => {
+      // accounts.json says active='a', but boss's own .env (for whatever
+      // reason — a deliberate per-agent pin, or a prior fix-1 gap) is
+      // pointing at 'b'. The event is really about 'b', not 'a'. Keep 'a'
+      // itself healthy so doRotation's own (separate, legitimate)
+      // active-account recheck can't also mark it exhausted and confound
+      // the assertion — this isolates onLimitEvent's own behavior only.
+      writeFileSync(join(frameworkRoot, 'orgs/wyre/agents/boss/.env'), 'CLAUDE_CODE_OAUTH_TOKEN=tok-b\n');
+      preflight.mockImplementation(async (tok: string) => (tok === 'tok-a' ? 'ok' : 'limit'));
+      await rm.onLimitEvent('boss', EV);
+      const state = loadRotationState(ctxRoot);
+      expect(state.exhausted.b).toBeDefined();
+      expect(state.exhausted.b.source).toBe('limit-banner');
+      expect(state.exhausted.a).toBeUndefined();
+    });
+
+    it('falls back to the global active field when the reporting agent has no resolvable .env token', async () => {
+      writeFileSync(join(frameworkRoot, 'orgs/wyre/agents/boss/.env'), '# no token line here\n');
+      preflight.mockResolvedValue('limit');
+      await rm.onLimitEvent('boss', EV);
+      const state = loadRotationState(ctxRoot);
+      expect(state.exhausted.a).toBeDefined();
+      expect(state.exhausted.a.source).toBe('limit-banner');
+    });
+
+    it('agrees with the global active field in the common case (agent correctly resynced) — no behavior change', async () => {
+      // makeAgentEnvs() already set boss's .env to tok-a, matching active='a'.
+      preflight.mockResolvedValue('limit');
+      await rm.onLimitEvent('boss', EV);
+      const state = loadRotationState(ctxRoot);
+      expect(state.exhausted.a).toBeDefined();
+      expect(state.exhausted.a.source).toBe('limit-banner');
+    });
+  });
+
+  describe('stale limitBlocked pruning + retryAt recompute (task_1793058444001_76153432, fix 3)', () => {
+    it('prunes a limitBlocked entry once the agent is independently observed healthy (fresh heartbeat) via a non-rotation restart path', async () => {
+      preflight.mockResolvedValue('limit'); // stays halted — boss remains limitBlocked
+      await rm.onLimitEvent('boss', EV);
+      expect(isLimitBlocked(ctxRoot, 'boss')).toBe(true);
+      // boss recovers via some OTHER restart path (hang-detector force-restart,
+      // context-force-restart) that this manager never sees — simulated by a
+      // fresh heartbeat written after detectedAt, with nothing going through
+      // restartBlockedAgents/restartAllRunningAgents.
+      mkdirSync(join(ctxRoot, 'state', 'boss'), { recursive: true });
+      writeFileSync(join(ctxRoot, 'state', 'boss', 'heartbeat.json'), JSON.stringify({ last_heartbeat: new Date(t + 60_000).toISOString() }));
+      restartAgent.mockClear();
+      t += 60_000; // still well inside the 10-min cooldown
+      await rm.tick();
+      expect(isLimitBlocked(ctxRoot, 'boss')).toBe(false);
+      expect(restartAgent).not.toHaveBeenCalled(); // pruned, never re-restarted
+    });
+
+    it('does NOT prune a limitBlocked entry whose heartbeat has not advanced since it was marked blocked', async () => {
+      preflight.mockResolvedValue('limit');
+      await rm.onLimitEvent('boss', EV);
+      await rm.tick(); // no heartbeat.json written at all for boss
+      expect(isLimitBlocked(ctxRoot, 'boss')).toBe(true);
+    });
+
+    it('recomputes retryAt every tick from current on-disk exhausted/limitBlocked data, even on a tick where no rotation attempt runs at all', async () => {
+      // Seed a halted state directly, bypassing onLimitEvent/doRotation —
+      // isolates the fix from doRotation's own (pre-existing) recompute.
+      const FAR_FUTURE_RETRY = t + 60 * 60_000; // 1h out: tick()'s own gate (t >= retryAt) stays false
+      const EARLIER_RESET = t + 5 * 60_000;     // a real, much-earlier reset hint just landed on disk
+      writeFileSync(join(ctxRoot, 'state/oauth/rotation-state.json'), JSON.stringify({
+        limitBlocked: { dev: { detectedAt: t, kind: 'session', resetAt: EARLIER_RESET } },
+        exhausted: {}, lastRotationAt: 0, retryAt: FAR_FUTURE_RETRY, lastPreflightAt: 0,
+        alertedHalt: true, consecutiveInfraTicks: 0, lastInfraAlertAt: 0,
+      }));
+      await rm.tick();
+      expect(preflight).not.toHaveBeenCalled();   // confirms doRotation never ran this tick
+      expect(restartAgent).not.toHaveBeenCalled();
+      expect(loadRotationState(ctxRoot).retryAt).toBe(EARLIER_RESET + 5 * 60_000); // recomputed anyway
     });
   });
 });

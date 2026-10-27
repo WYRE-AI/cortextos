@@ -729,6 +729,39 @@ export function writeTokenToAgents(
 }
 
 /**
+ * Resolve which named account in `store` an agent's own `.env`
+ * CLAUDE_CODE_OAUTH_TOKEN actually belongs to. Defense-in-depth for
+ * onLimitEvent (rotation-manager.ts): a limit event names the reporting
+ * AGENT, but the handler previously always blamed `accounts.json`'s global
+ * `active` field — wrong whenever this agent's own credential differs from
+ * it (a split-brain agent mid-restart-gate window, or a deliberate
+ * per-agent `set-oauth-account --agent` pin). Returns null if the agent has
+ * no `.env`, no token line, or the token matches no known account.
+ */
+export function resolveAgentAccountName(
+  frameworkRoot: string,
+  org: string,
+  agent: string,
+  store: AccountsStore,
+): string | null {
+  const envPath = join(frameworkRoot, 'orgs', org, 'agents', agent, '.env');
+  if (!existsSync(envPath)) return null;
+  let content: string;
+  try {
+    content = readFileSync(envPath, 'utf-8');
+  } catch {
+    return null;
+  }
+  const match = content.match(/^CLAUDE_CODE_OAUTH_TOKEN=(.*)$/m);
+  const token = match?.[1]?.trim();
+  if (!token) return null;
+  for (const [name, account] of Object.entries(store.accounts)) {
+    if (account.access_token === token) return name;
+  }
+  return null;
+}
+
+/**
  * Flip the active account and record the rotation, WITHOUT any preflight.
  * Used by the daemon's rotation manager, whose preflight is an inference ping
  * (the usage API rejects setup-tokens — no user:profile scope).

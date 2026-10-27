@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### Fixed — OAuth rotation could split-brain the fleet on a proactive (non-blocked-retry) rotation
+
+`rotation-manager.ts`'s `doRotation()` rewrote every agent's `.env` via `writeTokenToAgents()`
+unconditionally on every active-account flip, but only restarted agents already in
+`state.limitBlocked`. A proactive preflight rotation (nobody blocked yet) or the active account
+recovering with no one waiting on it therefore restarted zero agents — every already-running agent
+kept its OLD in-process credential while its on-disk `.env` pointed at the new account, until its
+own unrelated next restart. Real incident: 2026-10-26T22:50:49Z, 9 of 14 agents stayed split-brain
+for ~71 minutes this way (`task_1793058444001_76153432`).
+
+Three fixes, same PR:
+1. **Restart-gate on active-flip.** When an active-account flip succeeds with `state.limitBlocked`
+   empty, every currently-running agent is restarted (`restartAllRunningAgents()`), not just the
+   (empty) blocked set. `RotationDeps.listRunningAgents` lets the daemon wire in its real live-agent
+   registry; defaults to enumerating `frameworkRoot/orgs/{org}/agents/` for callers that don't.
+2. **`onLimitEvent` own-credential cross-check.** The handler previously always marked
+   `accounts.json`'s global `active` field exhausted, regardless of what the reporting agent's own
+   `.env` token actually resolves to (`resolveAgentAccountName`, new in `oauth.ts`). A split-brain
+   or deliberately-pinned agent's limit event could mislabel the wrong account as exhausted and
+   rotate the fleet away from one everyone else was correctly running on.
+3. **Stale `limitBlocked`/`retryAt` cleanup.** An agent that recovers via a restart path this
+   manager doesn't own (hang-detector, context-force-restart) never clears its own
+   `state.limitBlocked` entry — `tick()` now prunes any entry whose agent shows a fresh heartbeat
+   since it was marked blocked. Separately, `retryAt` is now recomputed from current
+   exhausted/limitBlocked data on every tick where one is already scheduled (gated on
+   `retryAt !== null`, so a not-yet-scheduled retry still fires immediately rather than having one
+   manufactured from stale data), not only when `doRotation()` happens to be re-entered.
+
 ### Added — Tier 2 cross-provider fallback (GLM-5.3 / Z.ai), shipped disabled
 
 New `src/daemon/glm-fallback.ts`, entered only from `rotation-manager.ts`'s existing "every Tier 1

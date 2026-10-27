@@ -161,6 +161,12 @@ export class AgentManager {
         org: env.org,
         preflight: preflightAccount,
         restartAgent: (name, reason) => this.restartAgent(name, reason),
+        // Real live-agent registry, not the directory-enumeration default —
+        // an agent dir can exist (disabled, or mid-crash-loop) without a
+        // currently-running PTY, which this.agents.keys() correctly excludes.
+        // See RotationDeps.listRunningAgents (task_1793058444001_76153432,
+        // fix direction 1).
+        listRunningAgents: () => Array.from(this.agents.keys()),
         sendAlert: (text) => {
           const handle = this.alertHandle;
           if (handle) handle.api.sendMessage(handle.chatId, text).catch(() => {});
