@@ -1,6 +1,12 @@
 // tests/unit/limit-detector.test.ts
 import { describe, it, expect } from 'vitest';
-import { stripAnsi, scanForLimit, parseResetHint, LimitScanner } from '../../src/daemon/limit-detector.js';
+import {
+  stripAnsi,
+  stripAnsiTrackingCursor,
+  scanForLimit,
+  parseResetHint,
+  LimitScanner,
+} from '../../src/daemon/limit-detector.js';
 
 // Real sequences captured from the 2026-07-14/15 incidents. Cursor-positioning
 // escapes sit BETWEEN words — after stripping, words may join with no space.
@@ -105,6 +111,102 @@ describe('LimitScanner', () => {
     const s = new LimitScanner(() => NOW);
     s.push('x'.repeat(5000));
     expect(s.push(SESSION_RAW)).not.toBeNull();      // banner still detectable after big flush
+  });
+});
+
+describe('CSI-nG character-drop (2026-10-28 outage, task_1793398908707_34091701)', () => {
+  // Byte-for-byte from infra's own stdout.log during the real 47h outage —
+  // not a hand-typed guess. The "/rat" ESC[8G "-limi" ESC[14G "-option"
+  // ESC[22G shape is the exact cause: each CSI n G jump skips the ONE column
+  // immediately before a hyphen (or the string's end) by exactly one more
+  // than the text just written occupies, and the character that belonged
+  // there (e, t, s) is never transmitted — not whitespace, not reordered,
+  // genuinely absent. Confirmed this is the ONLY occurrence of this literal
+  // shape in a 35MB/4-day capture spanning the outage; LIMIT_RE's phrase
+  // ("weekly limit") never shows the same corruption anywhere in that file.
+  const OUTAGE_RAW =
+    `\r\x1b[1B\x1b[49m\x1b[38;5;246m  ⎿  \x1b[38;5;211mYou've hit your weekly limit · resets Nov 1 at 2am (UTC)\x1b[39m\x1b[K\r\x1b[1B\x1b[K\r\x1b[1B\x1b[38;5;246m✻\x1b[39m \x1b[38;5;246mChurned for 0s · done 10:22 PM\x1b[39m\x1b[K\r\x1b[1B\x1b[K\r\x1b[1B\x1b[48;5;237m\x1b[38;5;246m❯ \x1b[38;5;231m/rat\x1b[8G-limi\x1b[14G-option\x1b[22G\x1b[39m`;
+
+  // 2026-10-30T22:00:00Z — within the real outage window.
+  const OUTAGE_NOW = Date.UTC(2026, 9, 30, 22);
+
+  it('documents the defect: naive stripAnsi alone reads the dialog marker as "/rat-limi-option", which never matches', () => {
+    const normalized = stripAnsi(OUTAGE_RAW).replace(/\s+/g, '');
+    expect(normalized).toContain('/rat-limi-option');
+    expect(normalized).not.toContain('/rate-limit-options');
+  });
+
+  it('this is what silently broke rotation for ~47h: scanForLimit on the naively-stripped text returns null despite a real banner', () => {
+    expect(scanForLimit(stripAnsi(OUTAGE_RAW), OUTAGE_NOW)).toBeNull();
+  });
+
+  it('stripAnsiTrackingCursor backfills exactly the dropped columns, enabling a correct match', () => {
+    const cursor = { col: 1 };
+    const reconstructed = stripAnsiTrackingCursor(OUTAGE_RAW, cursor);
+    const ev = scanForLimit(reconstructed, OUTAGE_NOW);
+    expect(ev).not.toBeNull();
+    expect(ev!.kind).toBe('weekly');
+  });
+
+  it('LimitScanner (the actual live path) fires on the real captured incident bytes', () => {
+    const s = new LimitScanner(() => OUTAGE_NOW);
+    expect(s.push(OUTAGE_RAW)).not.toBeNull();
+  });
+
+  it('control: a forward CSI-nG skip bigger than MAX_GAP_PER_JUMP does not let unrelated text falsely complete the dialog marker', () => {
+    // A single huge jump (e.g. a genuinely different CSI use this module
+    // doesn't model, such as a full-screen reposition) must not manufacture
+    // enough "matches anything" filler to bridge two otherwise-unrelated
+    // fragments into a false match.
+    const huge = `/rat\x1b[500G-limi-option`;
+    const cursor = { col: 1 };
+    expect(scanForLimit(stripAnsiTrackingCursor(huge, cursor), OUTAGE_NOW)).toBeNull();
+  });
+
+  it('control: existing fixtures with no forward skip still produce zero GAP_CHARs (no behavior change for clean renders)', () => {
+    const cursor = { col: 1 };
+    const reconstructed = stripAnsiTrackingCursor(SESSION_RAW, cursor);
+    expect(reconstructed).toBe(stripAnsi(SESSION_RAW));
+  });
+
+  it('still returns null for a prose mention of the corrupted shape — the AND-gate with LIMIT_RE still guards against false-firing', () => {
+    const cursor = { col: 1 };
+    const quoted = stripAnsiTrackingCursor(
+      'the banner showed /rate-limit-options once the bug was fixed, said the retro doc',
+      cursor
+    );
+    expect(scanForLimit(quoted, OUTAGE_NOW)).toBeNull();
+  });
+
+  it('carries an escape sequence split across two push() calls instead of leaking its digits as literal text', () => {
+    // Confirmed live via node-pty: a real PTY can deliver an SGR code split
+    // mid-sequence, e.g. "...\x1b[38;5;2" in one read and "11mHello" in the
+    // next. Without carrying the dangling tail over to the next call, the
+    // stray "[38;5;2" and "11m" fall through as literal printable
+    // characters, each silently inflating the tracked cursor column and
+    // throwing off every later CSI-n-G jump's forward/backward judgment.
+    const cursor = { col: 1 };
+    const part1 = stripAnsiTrackingCursor('\x1b[38;5;2', cursor);
+    const part2 = stripAnsiTrackingCursor('11mHello', cursor);
+    expect(part1).toBe(''); // held in cursor.pending, not leaked as text
+    expect(part2).toBe('Hello');
+    expect(cursor.col).toBe(6); // only "Hello" advanced the column, not the escape's digits
+  });
+
+  it('live PTY path recovers through a real split exactly like the one above, reproduced from the real outage bytes', () => {
+    // The real OUTAGE_RAW banner, sliced at a fixed 37-byte boundary chosen
+    // without regard for escape sequences (mirroring how node-pty actually
+    // delivered it live — see tests/integration/limit-detector-live-pty.manual.test.ts),
+    // which happens to split an SGR code mid-sequence right before the limit
+    // phrase. If the carry-over above regressed, this is what would catch it.
+    const CHUNK = 37;
+    const s = new LimitScanner(() => OUTAGE_NOW);
+    let ev = null;
+    for (let i = 0; i < OUTAGE_RAW.length; i += CHUNK) {
+      ev = s.push(OUTAGE_RAW.slice(i, i + CHUNK)) ?? ev;
+    }
+    expect(ev).not.toBeNull();
+    expect(ev!.kind).toBe('weekly');
   });
 });
 
