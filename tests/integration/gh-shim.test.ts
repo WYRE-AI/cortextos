@@ -328,6 +328,154 @@ ${fakeGhAppToken("WYRE-AI", "minted-once")}
     expect(stdout).toBe("");
   });
 
+  // task_1793545606849_47060600 (2026-11-01): wyre-technology is this
+  // fleet's own origin org but isn't on ALLOWLIST (unverified whether the
+  // App is even installed there) -- reads keep failing open exactly like
+  // any other non-allowlisted org, but a recognized WRITE must refuse
+  // instead of running under ambient auth (the #210 shape, one more org).
+  // This is the "inject the forbidden fail-open shape, suite must catch
+  // it" mutation-test pattern: each "REFUSES" test below is the forbidden
+  // shape (a write silently succeeding under ambient auth on a
+  // fleet-adjacent org) made assertable, not just a happy-path check.
+  describe("fleet-adjacent, not-allowlisted org (wyre-technology)", () => {
+    it("still fails open for an ordinary READ (pr view, via --repo)", async () => {
+      writeFakeExe("cortextos", `echo "should not be called" >&2; exit 1`);
+      writeFakeExe("gh", `echo "REAL_GH ARGS: $*"; echo "GH_TOKEN=[$GH_TOKEN]"`);
+
+      const { stdout, stderr, code } = await runShim(
+        ["pr", "view", "123", "--repo", "wyre-technology/cortextos"],
+        fakeRepo,
+      );
+      expect(code).toBe(0);
+      expect(stdout).toContain("REAL_GH ARGS: pr view 123 --repo wyre-technology/cortextos");
+      expect(stdout).toContain("GH_TOKEN=[]");
+      expect(stderr).toBe("");
+    });
+
+    it("still fails open for a READ resolved via cwd's origin remote (pr list)", async () => {
+      await initGitRepo("git@github.com:wyre-technology/cortextos.git");
+      writeFakeExe("cortextos", `echo "should not be called" >&2; exit 1`);
+      writeFakeExe("gh", `echo "REAL_GH ARGS: $*"`);
+
+      const { stdout, code } = await runShim(["pr", "list"], fakeRepo);
+      expect(code).toBe(0);
+      expect(stdout).toContain("REAL_GH ARGS: pr list");
+    });
+
+    it("still fails open for a `gh api` GET (no --method)", async () => {
+      writeFakeExe("cortextos", `echo "should not be called" >&2; exit 1`);
+      writeFakeExe("gh", `echo "REAL_GH ARGS: $*"`);
+
+      const { stdout, code } = await runShim(
+        ["api", "repos/wyre-technology/cortextos/pulls/123/comments"],
+        fakeRepo,
+      );
+      expect(code).toBe(0);
+      expect(stdout).toContain("REAL_GH ARGS: api repos/wyre-technology/cortextos/pulls/123/comments");
+    });
+
+    it("REFUSES a write (pr merge) -- no mint attempt, no ambient-auth fallback, real gh never invoked", async () => {
+      writeFakeExe("cortextos", `echo "should not be called for minting" >&2; exit 1`);
+      writeFakeExe("gh", `echo "FORBIDDEN: ran under ambient auth" >&2; exit 1`);
+
+      const { stdout, stderr, code } = await runShim(
+        ["pr", "merge", "123", "--merge", "--repo", "wyre-technology/cortextos"],
+        fakeRepo,
+      );
+      expect(code).not.toBe(0);
+      expect(stderr).toMatch(/REFUSING.*fleet-adjacent.*WRITE/);
+      expect(stderr).not.toContain("FORBIDDEN");
+      expect(stdout).toBe("");
+    });
+
+    it("REFUSES a write (issue comment) resolved via cwd's origin remote", async () => {
+      await initGitRepo("git@github.com:wyre-technology/cortextos.git");
+      writeFakeExe("gh", `echo "FORBIDDEN: ran under ambient auth" >&2; exit 1`);
+
+      const { stdout, stderr, code } = await runShim(
+        ["issue", "comment", "1", "--body", "hi"],
+        fakeRepo,
+      );
+      expect(code).not.toBe(0);
+      expect(stderr).toMatch(/REFUSING.*fleet-adjacent.*WRITE/);
+      expect(stdout).toBe("");
+    });
+
+    it("REFUSES a `gh api` write via explicit --method POST", async () => {
+      writeFakeExe("gh", `echo "FORBIDDEN: ran under ambient auth" >&2; exit 1`);
+
+      const { stderr, code } = await runShim(
+        [
+          "api",
+          "repos/wyre-technology/cortextos/pulls/123/comments",
+          "--method",
+          "POST",
+          "-f",
+          "body=hi",
+        ],
+        fakeRepo,
+      );
+      expect(code).not.toBe(0);
+      expect(stderr).toMatch(/REFUSING.*fleet-adjacent.*WRITE/);
+    });
+
+    it("REFUSES a `gh api` write implied by a body-setting flag alone (no explicit --method)", async () => {
+      // gh itself defaults the method to POST once -f/-F/--raw-field/--input
+      // is present -- the shim must treat this as a write too, not just an
+      // explicit --method/-X.
+      writeFakeExe("gh", `echo "FORBIDDEN: ran under ambient auth" >&2; exit 1`);
+
+      const { stderr, code } = await runShim(
+        ["api", "repos/wyre-technology/cortextos/issues/1/comments", "-f", "body=hi"],
+        fakeRepo,
+      );
+      expect(code).not.toBe(0);
+      expect(stderr).toMatch(/REFUSING.*fleet-adjacent.*WRITE/);
+    });
+
+    it("does not misclassify noun/verb when --repo appears as a global flag before the noun", async () => {
+      // `gh --repo OWNER/REPO pr view 123` -- --repo's VALUE must not be
+      // mistaken for the noun. A read here must still fail open, not refuse.
+      writeFakeExe("cortextos", `echo "should not be called" >&2; exit 1`);
+      writeFakeExe("gh", `echo "REAL_GH ARGS: $*"`);
+
+      const { stdout, code } = await runShim(
+        ["--repo", "wyre-technology/cortextos", "pr", "view", "123"],
+        fakeRepo,
+      );
+      expect(code).toBe(0);
+      expect(stdout).toContain("REAL_GH ARGS: --repo wyre-technology/cortextos pr view 123");
+    });
+
+    it("leaves an unrelated, non-fleet-adjacent org's write unaffected (still fails open)", async () => {
+      // Confirms the new check is scoped to FLEET_ADJACENT_READONLY_ORGS
+      // only -- ordinary gh use for any other org must be completely
+      // unchanged by this fix.
+      writeFakeExe("cortextos", `echo "should not be called" >&2; exit 1`);
+      writeFakeExe("gh", `echo "REAL_GH ARGS: $*"`);
+
+      const { stdout, code } = await runShim(
+        ["pr", "merge", "123", "--merge", "--repo", "some-other-org/some-repo"],
+        fakeRepo,
+      );
+      expect(code).toBe(0);
+      expect(stdout).toContain("REAL_GH ARGS: pr merge 123 --merge --repo some-other-org/some-repo");
+    });
+
+    it("leaves the real ALLOWLIST (WYRE-AI) write path unaffected -- still mints, never hits the new refusal", async () => {
+      writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "minted-for-write"));
+      writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+      writeFakeExe("gh", `echo "GH_TOKEN=$GH_TOKEN"`);
+
+      const { stdout, code } = await runShim(
+        ["pr", "merge", "123", "--merge", "--repo", "WYRE-AI/conduit"],
+        fakeRepo,
+      );
+      expect(code).toBe(0);
+      expect(stdout).toContain("GH_TOKEN=minted-for-write");
+    });
+  });
+
   it("writes the token cache atomically (temp file + rename, no partial file left behind)", async () => {
     await initGitRepo("git@github.com:WYRE-AI/conduit.git");
     writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "cached-token"));

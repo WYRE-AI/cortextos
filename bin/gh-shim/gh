@@ -25,6 +25,34 @@
 # fired. "A refusing guard beats a warning one" (this org's 2026-08-17
 # doctrine) -- see task_1790244063432.
 #
+# FLEET-ADJACENT, NOT ALLOWLISTED (task_1793545606849_47060600, 2026-11-01):
+# wyre-technology is this fleet's own origin org (cortextos/conduit both
+# resolve there) but is NOT on ALLOWLIST -- nobody has confirmed the
+# wyre-agent-fleet App is even installed there, so treating it like
+# WYRE-AI (mint-or-refuse for everything) would convert every ordinary
+# wyre-technology READ into a refusal the moment this ships, unverifiable
+# from this seat (cortex-secret's own OP_SERVICE_ACCOUNT_TOKEN gap blocks
+# testing the mint path at all right now -- see task_1793058444001). A
+# blanket fail-open for it is also wrong: that's what let boss's 2026-11-01
+# stale-pr sweep read it under ambient personal auth and over-generalize a
+# "gh is working again" conclusion (retracted same hour) -- a false-green
+# LIVENESS hazard, not an attribution one, since a read changes nothing on
+# GitHub. The real, irreversible hazard is a WRITE landing under ambient
+# auth for an org this fleet actually has repos in -- the #210 shape,
+# scoped to one more org. So: reads keep failing open exactly as before
+# (FLEET_ADJACENT_READONLY_ORGS behaves identically to any other
+# non-allowlisted org for a read); a recognized WRITE verb instead REFUSES,
+# same as a mint failure does for an allowlisted org, but for a different
+# reason (there is no mint path configured for this org at all -- refusing
+# is the only safe option, not "mint or refuse"). is_write_call() below is
+# a known-verb DENYLIST (not a read allowlist) deliberately: an
+# unrecognized future `gh` subcommand falls through as a read (fail-open),
+# which matches point (a) above -- ordinary gh use must keep working --
+# and keeps this change narrow rather than risking a new false refusal on
+# some verb nobody enumerated. The residual risk (a brand-new write verb
+# this list hasn't caught up to yet) is accepted, not unlimited: it only
+# ever degrades back to today's existing fail-open behavior, never worse.
+#
 # See bus/gh-bot.sh (the explicit opt-in sibling; same org-resolution
 # shape, no allowlist since it's explicit) and task_1790244063432.
 set -euo pipefail
@@ -53,6 +81,9 @@ if [[ -z "$REAL_GH" || "$(realpath_of "${REAL_GH%/*}")" == "$SHIM_DIR" ]]; then
 fi
 
 ALLOWLIST=("WYRE-AI")
+# See the FLEET-ADJACENT, NOT ALLOWLISTED comment block above for why this
+# is a separate list from ALLOWLIST rather than an addition to it.
+FLEET_ADJACENT_READONLY_ORGS=("wyre-technology")
 CACHE_DIR="${CTX_ROOT:-$HOME/.cortextos}/state/gh-shim"
 CACHE_TTL_SECS=2700 # 45min -- comfortably inside gh-app-token's ~1h token life
 
@@ -62,6 +93,87 @@ is_allowlisted() {
     [[ "${org,,}" == "$needle" ]] && return 0
   done
   return 1
+}
+
+is_fleet_adjacent_readonly() {
+  local needle="${1,,}"
+  for org in "${FLEET_ADJACENT_READONLY_ORGS[@]}"; do
+    [[ "${org,,}" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+# Known WRITE verbs per `gh` noun group, i.e. a DENYLIST not a read
+# allowlist -- see the design note above FLEET_ADJACENT_READONLY_ORGS for
+# why an unrecognized noun+verb combination deliberately falls through as
+# a read. `gh api` is handled separately: a write if an explicit non-GET
+# --method/-X is given, or any body-setting flag is present (gh itself
+# defaults an `api` call's method to POST once a body field is supplied via
+# -f/-F/--raw-field/--input, even with no explicit --method).
+is_write_call() {
+  local -a positional=()
+  local prev="" arg
+  for arg in "$@"; do
+    if [[ "$prev" == "--repo" || "$prev" == "-R" || "$prev" == "--method" || "$prev" == "-X" ]]; then
+      prev="$arg"
+      continue
+    fi
+    case "$arg" in
+      -*) prev="$arg" ;;
+      *) positional+=("$arg"); prev="$arg" ;;
+    esac
+  done
+  local noun="${positional[0]:-}" verb="${positional[1]:-}"
+
+  if [[ "$noun" == "api" ]]; then
+    local a prev2=""
+    for a in "$@"; do
+      if [[ "$prev2" == "--method" || "$prev2" == "-X" ]]; then
+        [[ "${a^^}" != "GET" ]] && return 0
+      fi
+      case "$a" in
+        --method=*) [[ "${a#--method=}" != [Gg][Ee][Tt] ]] && return 0 ;;
+        -f|-F|--raw-field|--input|-f*|-F*) return 0 ;;
+      esac
+      prev2="$a"
+    done
+    return 1
+  fi
+
+  case "$noun" in
+    pr|issue)
+      case "$verb" in
+        create|edit|close|reopen|merge|comment|review|ready|lock|unlock|delete|transfer|pin|unpin) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    repo)
+      case "$verb" in
+        create|delete|edit|archive|unarchive|rename|fork|set-default|deploy-key) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    release)
+      case "$verb" in
+        create|edit|delete|upload|delete-asset) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    workflow)
+      case "$verb" in
+        run|enable|disable) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    run)
+      case "$verb" in
+        rerun|cancel|delete) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    gist|label)
+      case "$verb" in
+        create|edit|delete) return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    *)
+      return 1 ;;
+  esac
 }
 
 # [HOST/]OWNER/REPO -> OWNER (strips an optional leading host segment, e.g.
@@ -123,6 +235,17 @@ for arg in "$@"; do
     exec "$REAL_GH" "$@"
   fi
 done
+
+# Fleet-adjacent but not allowlisted (today: wyre-technology): a READ keeps
+# failing open exactly like any other non-allowlisted org, below. A
+# recognized WRITE refuses outright -- no mint attempt (none is configured
+# for this org tier) and no ambient-auth fallback, the same #210 shape
+# ALLOWLIST's own mint-failure branch refuses for a different reason.
+if [[ -n "$ORG" ]] && is_fleet_adjacent_readonly "$ORG" && is_write_call "$@"; then
+  echo "gh-shim: REFUSING -- \"$ORG\" is fleet-adjacent but not on the mint allowlist, and this looks like a WRITE (would run under today's ambient gh auth, the exact silent-impersonation shape #210 closed). Reads to this org still pass through unchanged; a write here needs a human decision, not an ambient fallback. See task_1793545606849_47060600." >&2
+  cortextos bus log-event error gh_shim_fleet_adjacent_write_refused error --meta "{\"org\":\"$ORG\"}" >/dev/null 2>&1 || true
+  exit 1
+fi
 
 # Not our own org (or undeterminable) -- ordinary gh usage, pass through
 # silently. This is the common case (foreign repos, --help, auth status,
