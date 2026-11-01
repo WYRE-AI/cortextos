@@ -26,32 +26,50 @@
 # doctrine) -- see task_1790244063432.
 #
 # FLEET-ADJACENT, NOT ALLOWLISTED (task_1793545606849_47060600, 2026-11-01):
-# wyre-technology is this fleet's own origin org (cortextos/conduit both
-# resolve there) but is NOT on ALLOWLIST -- nobody has confirmed the
-# wyre-agent-fleet App is even installed there, so treating it like
-# WYRE-AI (mint-or-refuse for everything) would convert every ordinary
-# wyre-technology READ into a refusal the moment this ships, unverifiable
-# from this seat (cortex-secret's own OP_SERVICE_ACCOUNT_TOKEN gap blocks
-# testing the mint path at all right now -- see task_1793058444001). A
-# blanket fail-open for it is also wrong: that's what let boss's 2026-11-01
-# stale-pr sweep read it under ambient personal auth and over-generalize a
-# "gh is working again" conclusion (retracted same hour) -- a false-green
-# LIVENESS hazard, not an attribution one, since a read changes nothing on
-# GitHub. The real, irreversible hazard is a WRITE landing under ambient
-# auth for an org this fleet actually has repos in -- the #210 shape,
-# scoped to one more org. So: reads keep failing open exactly as before
-# (FLEET_ADJACENT_READONLY_ORGS behaves identically to any other
-# non-allowlisted org for a read); a recognized WRITE verb instead REFUSES,
-# same as a mint failure does for an allowlisted org, but for a different
-# reason (there is no mint path configured for this org at all -- refusing
-# is the only safe option, not "mint or refuse"). is_write_call() below is
-# a known-verb DENYLIST (not a read allowlist) deliberately: an
-# unrecognized future `gh` subcommand falls through as a read (fail-open),
-# which matches point (a) above -- ordinary gh use must keep working --
-# and keeps this change narrow rather than risking a new false refusal on
-# some verb nobody enumerated. The residual risk (a brand-new write verb
-# this list hasn't caught up to yet) is accepted, not unlimited: it only
-# ever degrades back to today's existing fail-open behavior, never worse.
+# wyre-technology is fleet-adjacent -- it hosts real fleet-infrastructure
+# repos (wyre-cortextos-bootstrap, wyre-bossbot, wyre-a2a, afkbot-mcp,
+# brain-mcp; see task_1789994297501's pr-sweep inventory) -- but is NOT on
+# ALLOWLIST: that same task already confirmed, live, more than once
+# (2026-09-21/10-06/10-16), that the wyre-agent-fleet App has NO
+# installation there ("No installation found for org wyre-technology").
+# Treating it like WYRE-AI (mint-or-refuse for everything) would therefore
+# convert every ordinary wyre-technology READ into a refusal the moment
+# this shipped -- confirmed broken, not merely untested. (Correction on
+# this comment's own prior wording, same day: cortextos/conduit do NOT
+# resolve to wyre-technology -- both migrated to WYRE-AI at some point
+# before 2026-11-01; don't cite them as evidence here again.) A blanket
+# fail-open for wyre-technology is also wrong: that's what let boss's
+# 2026-11-01 stale-pr sweep read it under ambient personal auth and
+# over-generalize a "gh is working again" conclusion (retracted same
+# hour) -- a false-green LIVENESS hazard, not an attribution one, since a
+# read changes nothing on GitHub. The real, irreversible hazard is a
+# WRITE landing under ambient auth for an org this fleet actually has
+# repos in -- the #210 shape, scoped to one more org. So: reads keep
+# failing open exactly as before (FLEET_ADJACENT_READONLY_ORGS behaves
+# identically to any other non-allowlisted org for a read); a recognized
+# WRITE verb instead REFUSES, same as a mint failure does for an
+# allowlisted org, but for a different reason (there is no mint path
+# configured for this org at all -- refusing is the only safe option, not
+# "mint or refuse"). is_write_call() below is a known-verb DENYLIST (not a
+# read allowlist) deliberately: an unrecognized future `gh` subcommand
+# falls through as a read (fail-open), which matches point (a) above --
+# ordinary gh use must keep working -- and keeps this change narrow
+# rather than risking a new false refusal on some verb nobody enumerated.
+# The residual risk (a brand-new write verb this list hasn't caught up to
+# yet) is accepted, not unlimited: it only ever degrades back to today's
+# existing fail-open behavior, never worse.
+#
+# STANDING TELL, so nobody rediscovers 2026-11-01 the hard way (boss's
+# note on the same day): this file's own read fail-open for
+# FLEET_ADJACENT_READONLY_ORGS is a DELIBERATE, KNOWN false-green
+# liveness hazard -- a successful `gh` read against wyre-technology (or
+# any future entry in that list) proves NOTHING about whether the real
+# mint path (cortex-secret/OP-token/the App itself) is working, because
+# it never touched that path at all. A liveness/health probe for "is gh
+# auth actually working" MUST target an ALLOWLISTED org (today: WYRE-AI),
+# never a FLEET_ADJACENT_READONLY_ORGS one -- a clean read there is
+# ambiguous between "everything is fine" and "the real auth path is
+# fully dead and this is ambient personal auth quietly covering for it."
 #
 # See bus/gh-bot.sh (the explicit opt-in sibling; same org-resolution
 # shape, no allowlist since it's explicit) and task_1790244063432.
