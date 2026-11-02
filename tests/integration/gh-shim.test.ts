@@ -213,6 +213,81 @@ describe.skipIf(!existsSync(SHIM))("bin/gh-shim/gh", () => {
     expect(stdout).toContain("GH_TOKEN=minted-token-leading-slash");
   });
 
+  it("mints a token for an allowlisted org via a `gh api orgs/OWNER/...` positional path", async () => {
+    writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "minted-token-orgs-api"));
+    writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+    writeFakeExe("gh", `echo "GH_TOKEN=$GH_TOKEN"`);
+
+    const { stdout, code } = await runShim(
+      ["api", "orgs/WYRE-AI/repos"],
+      fakeRepo, // not a git checkout at all -- only the api path can find the org
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GH_TOKEN=minted-token-orgs-api");
+  });
+
+  // task_1793376196436_10996725 / task_1793631942810_47429515: `gh repo
+  // list/view/clone` take their target as a bare POSITIONAL arg, which
+  // neither the --repo/-R rule nor the `api repos|orgs/OWNER/...` rule
+  // above ever matched -- it fell straight to the cwd-origin fallback.
+  it("mints a token for an allowlisted org via the bare positional form of `gh repo list ORG`", async () => {
+    writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "minted-token-repo-list"));
+    writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+    writeFakeExe("gh", `echo "GH_TOKEN=$GH_TOKEN"`);
+
+    // fakeRepo has no git origin at all here -- the old code fell through
+    // to ambient auth (GH_TOKEN empty) for a genuine WYRE-AI target, the
+    // silent-impersonation shape #210 exists to close.
+    const { stdout, code } = await runShim(
+      ["repo", "list", "WYRE-AI", "--limit", "5"],
+      fakeRepo,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GH_TOKEN=minted-token-repo-list");
+  });
+
+  it("mints a token for an allowlisted org via the bare positional form of `gh repo view OWNER/REPO`", async () => {
+    writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "minted-token-repo-view"));
+    writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+    writeFakeExe("gh", `echo "GH_TOKEN=$GH_TOKEN"`);
+
+    const { stdout, code } = await runShim(
+      ["repo", "view", "WYRE-AI/conduit"],
+      fakeRepo,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GH_TOKEN=minted-token-repo-view");
+  });
+
+  it("fails open silently for `gh repo list NON-ALLOWLISTED-ORG` via the bare positional form", async () => {
+    writeFakeExe("cortextos", `echo "should not be called" >&2; exit 1`);
+    writeFakeExe("gh", `echo "GH_TOKEN=[$GH_TOKEN]"`);
+
+    const { stdout, code } = await runShim(
+      ["repo", "list", "some-other-org", "--limit", "5"],
+      fakeRepo,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GH_TOKEN=[]");
+  });
+
+  it("does not misattribute `gh repo list wyre-technology` to WYRE-AI from a WYRE-AI-origin'd checkout (false-refusal regression)", async () => {
+    // Before the positional-arg fix, this fell through to the cwd-origin
+    // fallback, which resolved to WYRE-AI (the checkout's own origin) --
+    // so a non-allowlisted target got wrongly routed into bot-token
+    // minting, and would REFUSE outright if minting failed.
+    await initGitRepo("git@github.com:WYRE-AI/conduit.git");
+    writeFakeExe("cortextos", `echo "should not be called" >&2; exit 1`);
+    writeFakeExe("gh", `echo "GH_TOKEN=[$GH_TOKEN]"`);
+
+    const { stdout, code } = await runShim(
+      ["repo", "list", "wyre-technology", "--limit", "5"],
+      fakeRepo,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("GH_TOKEN=[]");
+  });
+
   it("mints a token for an allowlisted org via a host-prefixed `--repo HOST/OWNER/REPO`", async () => {
     writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "minted-token-host-prefixed"));
     writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);

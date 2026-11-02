@@ -87,22 +87,42 @@ for arg in "$@"; do
     --repo=*) ORG="$(owner_of "${arg#--repo=}")"; break ;;
     -R?*) ORG="$(owner_of "${arg#-R}")"; break ;;
   esac
-  # 2) `gh api repos/OWNER/REPO/...` — the canonical form for calls made
-  # outside any checkout (no --repo flag at all). Without this, e.g.
-  # `gh api repos/WYRE-AI/conduit/pulls/123/comments` from a non-checkout
-  # cwd falls through to the origin-remote check below, finds nothing, and
-  # silently uses ambient auth — reproducing the exact bug this shim
-  # exists to fix, with no signal (unlike bus/gh-bot.sh, which dies loudly
-  # on an undetermined org). Also accepts a leading slash (`gh api` allows
-  # both `repos/...` and `/repos/...`).
-  if [[ "$arg" =~ ^/?repos/([^/]+)/ ]]; then
-    ORG="${BASH_REMATCH[1]}"
+  # 2) `gh api repos/OWNER/REPO/...` or `gh api orgs/OWNER/...` — the
+  # canonical forms for calls made outside any checkout (no --repo flag
+  # at all). Without this, e.g. `gh api repos/WYRE-AI/conduit/pulls/123/
+  # comments` from a non-checkout cwd falls through to the origin-remote
+  # check below, finds nothing, and silently uses ambient auth —
+  # reproducing the exact bug this shim exists to fix, with no signal
+  # (unlike bus/gh-bot.sh, which dies loudly on an undetermined org).
+  # Also accepts a leading slash (`gh api` allows both `repos/...` and
+  # `/repos/...`).
+  if [[ "$arg" =~ ^/?(repos|orgs)/([^/]+)(/|$) ]]; then
+    ORG="${BASH_REMATCH[2]}"
     break
   fi
   prev="$arg"
 done
 
-# 3) fall back to the cwd's origin remote
+# 3) `gh repo list/view/clone ORG[/REPO]` -- the bare positional form for
+# these three subcommands. Without this, "gh repo list wyre-technology"
+# (or "repo view OWNER/REPO", "repo clone OWNER/REPO") falls straight to
+# the cwd fallback below, which can misattribute it to whatever org the
+# CURRENT CHECKOUT happens to point at -- wrong in both directions: a
+# non-WYRE-AI target gets wrongly REFUSED from inside a WYRE-AI checkout,
+# and a genuine WYRE-AI target gets wrongly PASSED THROUGH to ambient auth
+# from a cwd with no git origin at all (the silent-impersonation shape
+# #210 exists to close). task_1793376196436_10996725 /
+# task_1793631942810_47429515.
+if [[ -z "$ORG" && "${1:-}" == "repo" ]] \
+   && [[ "${2:-}" == "list" || "${2:-}" == "view" || "${2:-}" == "clone" ]]; then
+  for arg in "${@:3}"; do
+    [[ "$arg" == -* ]] && continue # a flag, not the positional target
+    ORG="$(owner_of "$arg")"
+    break
+  done
+fi
+
+# 4) fall back to the cwd's origin remote
 if [[ -z "$ORG" ]]; then
   REMOTE_URL="$(git remote get-url origin 2>/dev/null || true)"
   ORG="$(printf '%s' "$REMOTE_URL" | sed -nE 's#.*[:/]([^/]+)/[^/]+(\.git)?$#\1#p')"
