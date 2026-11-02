@@ -259,6 +259,22 @@ describe.skipIf(!existsSync(SHIM))("bin/gh-shim/gh", () => {
     expect(stdout).toContain("GH_TOKEN=minted-token-repo-view");
   });
 
+  it.each(["clone", "fork", "delete", "edit", "archive", "unarchive", "set-default"])(
+    "mints a token for an allowlisted org via the bare positional form of `gh repo %s OWNER/REPO`",
+    async (verb) => {
+      writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", `minted-token-repo-${verb}`));
+      writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
+      writeFakeExe("gh", `echo "GH_TOKEN=$GH_TOKEN"`);
+
+      const { stdout, code } = await runShim(
+        ["repo", verb, "WYRE-AI/conduit"],
+        fakeRepo,
+      );
+      expect(code).toBe(0);
+      expect(stdout).toContain(`GH_TOKEN=minted-token-repo-${verb}`);
+    },
+  );
+
   it("fails open silently for `gh repo list NON-ALLOWLISTED-ORG` via the bare positional form", async () => {
     writeFakeExe("cortextos", `echo "should not be called" >&2; exit 1`);
     writeFakeExe("gh", `echo "GH_TOKEN=[$GH_TOKEN]"`);

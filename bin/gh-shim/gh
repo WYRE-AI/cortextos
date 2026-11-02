@@ -103,24 +103,37 @@ for arg in "$@"; do
   prev="$arg"
 done
 
-# 3) `gh repo list/view/clone ORG[/REPO]` -- the bare positional form for
-# these three subcommands. Without this, "gh repo list wyre-technology"
-# (or "repo view OWNER/REPO", "repo clone OWNER/REPO") falls straight to
-# the cwd fallback below, which can misattribute it to whatever org the
-# CURRENT CHECKOUT happens to point at -- wrong in both directions: a
+# 3) `gh repo <verb> ORG[/REPO]` -- the bare positional form shared by
+# every `gh repo` subcommand that takes an EXISTING repo as its target
+# (list/view/clone/fork/delete/edit/archive/unarchive/set-default --
+# "list" takes a bare owner, the rest take OWNER/REPO or resolve against
+# the cwd when omitted, same as all the others). Without this, "gh repo
+# list wyre-technology" (or "repo view OWNER/REPO", etc) falls straight
+# to the cwd fallback below, which can misattribute it to whatever org
+# the CURRENT CHECKOUT happens to point at -- wrong in both directions: a
 # non-WYRE-AI target gets wrongly REFUSED from inside a WYRE-AI checkout,
 # and a genuine WYRE-AI target gets wrongly PASSED THROUGH to ambient auth
 # from a cwd with no git origin at all (the silent-impersonation shape
 # #210 exists to close). task_1793376196436_10996725 /
 # task_1793631942810_47429515.
-if [[ -z "$ORG" && "${1:-}" == "repo" ]] \
-   && [[ "${2:-}" == "list" || "${2:-}" == "view" || "${2:-}" == "clone" ]]; then
-  for arg in "${@:3}"; do
-    [[ "$arg" == -* ]] && continue # a flag, not the positional target
-    ORG="$(owner_of "$arg")"
-    break
-  done
-fi
+#
+# Deliberately NOT matched here: `repo create` (positional is a NEW name
+# to create, not an existing target -- a non-allowlisted "org" from it
+# just falls through to ambient auth same as any undetermined case, so
+# this is a safe exclusion, not a gap) and `repo rename`/`repo sync`
+# (their positional is a new name / sync destination, not the repo being
+# acted on -- matching it would WRONGLY skip the cwd fallback for a call
+# that should resolve against the current checkout's own org).
+case "${1:-}/${2:-}" in
+  repo/list | repo/view | repo/clone | repo/fork | repo/delete | \
+  repo/edit | repo/archive | repo/unarchive | repo/set-default)
+    for arg in "${@:3}"; do
+      [[ "$arg" == -* ]] && continue # a flag, not the positional target
+      ORG="$(owner_of "$arg")"
+      break
+    done
+    ;;
+esac
 
 # 4) fall back to the cwd's origin remote
 if [[ -z "$ORG" ]]; then
