@@ -209,6 +209,21 @@ describe('ingestKnowledgeBase — timeout sizing (task_1787849190389_13577787)',
     expect(getTimeoutArg()).toBe(825_000);
   });
 
+  it('odd byte count: scaled default is rounded to an integer, never a fractional ms (regression for ERR_OUT_OF_RANGE)', () => {
+    delete process.env.KB_INGEST_TIMEOUT_MS;
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('');
+    // 406_489 * 1.5 = 609_733.5ms -- reproduces forge's real ERR_OUT_OF_RANGE
+    // crash (execFileSync's timeout option requires an integer).
+    fsMocks.statSync.mockReturnValue({ size: 406_489 } as any);
+
+    ingestKnowledgeBase(['/some/file.md'], ingestBaseOptions);
+
+    const arg = getTimeoutArg();
+    expect(Number.isInteger(arg)).toBe(true);
+    expect(arg).toBe(609_734);
+  });
+
   it('huge input: scaled default is capped at 1 hour, does not grow unbounded', () => {
     delete process.env.KB_INGEST_TIMEOUT_MS;
     mockConfiguredKb();
