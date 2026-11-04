@@ -264,44 +264,53 @@ def get_genai_client(api_key):
     return genai.Client(api_key=api_key)
 
 
-def _retry_generate_content(client, *, model, contents, backoffs=(5, 15, 45)):
-    """Call client.models.generate_content with bounded retries on transient APIErrors.
+def _retry_with_backoff(fn, *, label, backoffs=(5, 15, 45)):
+    """Call the zero-arg `fn` with bounded retries on transient APIErrors.
 
     Retries on HTTP code in TRANSIENT_HTTP_CODES or status name in
     TRANSIENT_STATUS_NAMES; re-raises immediately on any other APIError (auth,
     malformed request, etc.); re-raises last_err after all attempts exhausted.
+    `label` is used only in log lines, to say which call is retrying.
 
     backoffs is a tuple of sleep seconds between attempts. len(backoffs) is the
     attempt count. Tests pass (0, 0, 0) to skip sleeps.
+
+    Single implementation shared by generate_content and embed_content (was two
+    near-identical ~25-line copies until 2026-09-03, task_1788420454462_38838015
+    — embed_content had no retry at all, generate_content already did; adding a
+    second copy for embed_content was caught in review as the wrong depth for
+    the fix and collapsed into this shared version instead. A third API surface
+    needing retry needs only a `fn` callable, not a third copy of this loop).
     """
     from google.genai import errors as _genai_errors
     last_err = None
     for attempt, backoff in enumerate(backoffs, start=1):
         try:
-            return client.models.generate_content(model=model, contents=contents)
+            return fn()
         except _genai_errors.APIError as e:
             last_err = e
             is_transient = (e.code in TRANSIENT_HTTP_CODES) or (e.status in TRANSIENT_STATUS_NAMES)
             if not is_transient:
                 raise
             if attempt < len(backoffs):
-                print(f"    Transient error (HTTP {e.code} {e.status or ''}); retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
+                print(f"    Transient error (HTTP {e.code} {e.status or ''}) on {label}; retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
                 time.sleep(backoff)
             else:
-                print(f"    Exhausted retries on transient error: HTTP {e.code} {e.status or ''}")
+                print(f"    Exhausted retries on transient {label} error: HTTP {e.code} {e.status or ''}")
     raise last_err if last_err else RuntimeError("retry loop completed without response or error")
 
 
 def embed_content(client, config, content, task_type="RETRIEVAL_DOCUMENT"):
     """Embed content using Gemini Embedding 2. Content can be text string or list of Parts."""
     from google.genai import types
-    result = client.models.embed_content(
-        model=config.get("embedding_model", "gemini-embedding-2-preview"),
-        contents=content,
-        config=types.EmbedContentConfig(
-            output_dimensionality=config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS),
-            task_type=task_type,
-        ),
+    model = config.get("embedding_model", "gemini-embedding-2-preview")
+    embed_config = types.EmbedContentConfig(
+        output_dimensionality=config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS),
+        task_type=task_type,
+    )
+    result = _retry_with_backoff(
+        lambda: client.models.embed_content(model=model, contents=content, config=embed_config),
+        label="embed_content",
     )
     if _tracker:
         _tracker.track_embedding(content)
@@ -848,7 +857,7 @@ def ingest_pdf(client, config, collection, file_path):
     print(f"  Analyzing PDF: {file_path.name}...")
 
     # Gemini Flash returns 503 UNAVAILABLE during high-demand windows. Without
-    # retries, a single 503 kills the ingest. _retry_generate_content wraps the
+    # retries, a single 503 kills the ingest. _retry_with_backoff wraps the
     # call with bounded retries on transient SDK conditions (HTTP 429/500/503,
     # status UNAVAILABLE/RESOURCE_EXHAUSTED) and fails fast on everything else.
     extraction_prompt = (
@@ -860,13 +869,14 @@ def ingest_pdf(client, config, collection, file_path):
         "Separate each page's content with '=== PAGE N ===' markers.\n"
         "Be thorough - this will be used for search and retrieval."
     )
-    response = _retry_generate_content(
-        client,
-        model=config.get("gemini_model", "gemini-2.5-flash"),
-        contents=[
-            types.Part.from_bytes(data=data, mime_type="application/pdf"),
-            extraction_prompt,
-        ],
+    gen_model = config.get("gemini_model", "gemini-2.5-flash")
+    gen_contents = [
+        types.Part.from_bytes(data=data, mime_type="application/pdf"),
+        extraction_prompt,
+    ]
+    response = _retry_with_backoff(
+        lambda: client.models.generate_content(model=gen_model, contents=gen_contents),
+        label="generate_content",
     )
     if _tracker:
         _tracker.track_generation(response)
