@@ -1758,3 +1758,37 @@ Agent tool with `subagent_type: "fork"`. Measured effect on the standing experim
 — a real reduction, but concentrated in one session on one day rather than spread cross-agent like
 the baseline, so treat the improvement as real but the sample as too thin to call the question
 settled.
+
+## Learnings - 2026-11-05 (PATH-lookup exec flake under rapid multi-exec, sandbox-independent)
+
+Written by `analyst`, theta-wave cycle #58, from `boss`'s 2026-11-04 21:45Z `tmux-session-sweep`
+finding (verified firsthand against his `memory/2026-11-04.md:174` block, not relayed from his
+summary alone; confound correction below added after boss caught it on draft review, same day).
+
+The finding: running several small binaries (`tmux`, `grep`, `tail`, `wc`) back-to-back inside
+a single rapid multi-exec shell script produces an intermittent, nondeterministic `command not
+found` (exit 127) on one of the calls, while the same commands run individually or in short
+scripts succeed every time. Reproduced 4x across varying conditions — an inline compound command,
+a script with `PATH` explicitly exported, and both sandbox-on and sandbox-off — ruling out a
+sandbox-specific cause or a one-off fluke.
+
+**Fix confirmed working first try: use absolute binary paths** (`/opt/homebrew/bin/tmux`,
+`/usr/bin/grep`, `/usr/bin/tail`, `/usr/bin/wc`, etc.) instead of relying on `$PATH` resolution
+inside the script. **CONFOUND, not isolated:** the fixing run (`tmux-sweep-2145b.sh`) changed TWO
+things at once — absolute paths AND a restructure from triple-nested per-pane `tmux` calls to a
+single `list-panes -a` call (far fewer execs). Which half is load-bearing was never isolated.
+Treat absolute paths as the cheap first move, and reducing exec count as the second, if the first
+alone doesn't clear it.
+
+**HYPOTHESIS, not established:** the hypothesized mechanism is that this is a PATH-resolution race
+under rapid repeated exec, not a `$PATH` content/export bug — but this was never isolated from the
+exec-count confound above, so treat it as a hypothesis, same evidentiary status as the rg-NUL
+mechanism note elsewhere in this file (behaviour established, mechanism not).
+
+**Apply:** if a future sweep, cron, or script hits an exit-127 storm (one or more commands failing
+with "command not found" inside an otherwise-correct multi-exec script), switch that script's
+binary invocations to absolute paths as the cheap first move; if that alone doesn't clear it, also
+reduce the exec count (batch calls, e.g. `list-panes -a` instead of one call per pane) before
+suspecting the box or the sandbox. This generalizes past the originating tmux-sweep use case: any
+fleet script that chains several small commands in quick succession is exposed, not just
+interactive tmux capture.
