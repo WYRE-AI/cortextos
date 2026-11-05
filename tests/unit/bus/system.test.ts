@@ -816,6 +816,7 @@ describe('Bus System', () => {
 
       expect(report.status).toBe('clean');
       expect(report.pull_drift?.behind).toBe(false);
+      expect(report.pull_drift?.relationship).toBe('equal');
       expect(report.build_drift?.stale).toBe(false);
     });
 
@@ -836,11 +837,65 @@ describe('Bus System', () => {
 
       expect(report.status).toBe('drift');
       expect(report.pull_drift?.behind).toBe(true);
+      expect(report.pull_drift?.relationship).toBe('behind');
+      expect(report.pull_drift?.ahead).toBe(false);
+      expect(report.pull_drift?.commits_ahead).toBe(0);
       expect(report.pull_drift?.commits_behind).toBe(1);
       expect(report.pull_drift?.commit_summaries).toHaveLength(1);
       expect(report.pull_drift?.commit_summaries[0]).toContain('second');
       // build_drift stays clean — dist/ still matches the (unchanged) local HEAD.
       expect(report.build_drift?.stale).toBe(false);
+    });
+
+    // 2026-11-05T04:26Z live incident (task_1793852916330_97375701): a local
+    // commit not yet pushed read as `behind: true, commits_behind: 0` — a
+    // self-contradicting signal. Local being purely AHEAD must never set
+    // `behind`, and must report its own real commit count.
+    it('reports relationship "ahead" (not "behind") when local has an unpushed commit', () => {
+      const head = sh('git rev-parse HEAD', localDir);
+      writeManifest(head);
+
+      writeFileSync(join(localDir, 'unpushed.txt'), 'c');
+      sh('git add unpushed.txt && git commit -q -m unpushed', localDir);
+      // dist/ still matches the new local HEAD — this is pull drift only.
+      writeManifest(sh('git rev-parse HEAD', localDir));
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.pull_drift?.relationship).toBe('ahead');
+      expect(report.pull_drift?.behind).toBe(false);
+      expect(report.pull_drift?.ahead).toBe(true);
+      expect(report.pull_drift?.commits_behind).toBe(0);
+      expect(report.pull_drift?.commits_ahead).toBe(1);
+    });
+
+    it('reports relationship "diverged" when local and origin each have commits the other lacks', () => {
+      const head = sh('git rev-parse HEAD', localDir);
+      writeManifest(head);
+
+      // Another agent pushes to origin...
+      const otherDir = join(fixtureDir, 'other2');
+      sh(`git clone -q -b main ${originDir} other2`, fixtureDir);
+      sh('git config user.email test@test.com', otherDir);
+      sh('git config user.name Other', otherDir);
+      writeFileSync(join(otherDir, 'origin-only.txt'), 'o');
+      sh('git add origin-only.txt && git commit -q -m origin-only', otherDir);
+      sh('git push -q origin HEAD:main', otherDir);
+
+      // ...while this checkout independently commits locally, never pulling.
+      writeFileSync(join(localDir, 'local-only.txt'), 'l');
+      sh('git add local-only.txt && git commit -q -m local-only', localDir);
+      writeManifest(sh('git rev-parse HEAD', localDir));
+
+      const report = checkDeployDrift(localDir);
+
+      expect(report.status).toBe('drift');
+      expect(report.pull_drift?.relationship).toBe('diverged');
+      expect(report.pull_drift?.behind).toBe(true);
+      expect(report.pull_drift?.ahead).toBe(true);
+      expect(report.pull_drift?.commits_behind).toBe(1);
+      expect(report.pull_drift?.commits_ahead).toBe(1);
     });
 
     it('reports build drift when dist/build-manifest.json gitSha does not match local HEAD', () => {

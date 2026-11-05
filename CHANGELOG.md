@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed — `checkDeployDrift`'s `pull_drift.behind` conflated ahead/behind/diverged into one boolean
+
+Found live 2026-11-05T04:26Z (deploy-drift-watch transition, task_1793852916330_97375701):
+`pull_drift.behind` was set whenever local HEAD simply differed from `origin/main`, so a checkout
+that was purely AHEAD (an unpushed local commit) read `behind: true` with `commits_behind: 0`,
+producing a self-contradicting "local is 0 commit(s) behind origin/main" message.
+
+`checkDeployDrift` now computes both directions explicitly (`git rev-list HEAD..origin/main
+--count` and `git rev-list origin/main..HEAD --count`) and reports a real `relationship`
+(`equal`/`behind`/`ahead`/`diverged`) alongside the now-accurate `behind`/`ahead` booleans and a
+new `commits_ahead` field. `bus check-deploy-drift --format text` reports the correct direction
+instead of always assuming "behind".
+
 ### Added — `evaluate-experiment --baseline` override, ported from PR #174 into #189's mechanism
 
 `evaluate-experiment` compares the measured value against `experiment.baseline_value`, frozen at

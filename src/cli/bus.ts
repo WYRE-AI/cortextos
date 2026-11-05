@@ -1139,13 +1139,20 @@ busCommand
       } else if (report.status === 'clean') {
         console.log(`Clean — local HEAD ${report.pull_drift!.local_head.slice(0, 8)} matches origin/main and dist/.`);
       } else {
-        if (report.pull_drift!.behind) {
+        const pd = report.pull_drift!;
+        if (pd.relationship === 'behind' || pd.relationship === 'diverged') {
           console.log(
-            `PULL DRIFT: local is ${report.pull_drift!.commits_behind} commit(s) behind origin/main ` +
-            `(${report.pull_drift!.local_head.slice(0, 8)} -> ${report.pull_drift!.origin_head.slice(0, 8)}).`,
+            `PULL DRIFT: local is ${pd.commits_behind} commit(s) behind origin/main ` +
+            `(${pd.local_head.slice(0, 8)} -> ${pd.origin_head.slice(0, 8)}).`,
           );
-          for (const line of report.pull_drift!.commit_summaries) console.log(`  ${line}`);
-          if (report.pull_drift!.truncated) console.log(`  ...(${report.pull_drift!.commits_behind - COMMIT_LOG_LIMIT} more)`);
+          for (const line of pd.commit_summaries) console.log(`  ${line}`);
+          if (pd.truncated) console.log(`  ...(${pd.commits_behind - COMMIT_LOG_LIMIT} more)`);
+        }
+        if (pd.relationship === 'ahead' || pd.relationship === 'diverged') {
+          console.log(
+            `PULL DRIFT: local is ${pd.commits_ahead} commit(s) AHEAD of origin/main, unpushed ` +
+            `(${pd.origin_head.slice(0, 8)} -> ${pd.local_head.slice(0, 8)}).`,
+          );
         }
         if (report.build_drift!.stale) {
           console.log(`BUILD DRIFT: ${report.build_drift!.reason}`);

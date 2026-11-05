@@ -556,10 +556,16 @@ export function checkStaleBlockers(ctxRoot: string): StaleBlockerReport {
 }
 
 export interface PullDrift {
+  /** True only when local is strictly BEHIND (missing commits origin has). */
   behind: boolean;
+  /** True when local is AHEAD (has commits origin doesn't — e.g. unpushed). */
+  ahead: boolean;
+  /** The real relationship — `behind`/`ahead` alone can't express "diverged". */
+  relationship: 'equal' | 'behind' | 'ahead' | 'diverged';
   local_head: string;
   origin_head: string;
   commits_behind: number;
+  commits_ahead: number;
   commit_summaries: string[];
   truncated: boolean;
 }
@@ -662,13 +668,29 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
     return { status: 'error', checked_at, error: 'failed to resolve HEAD or origin/main' };
   }
 
-  const behind = localHead !== originHead;
+  // `behind` used to mean "the two SHAs simply differ," which conflates three
+  // distinct relationships: local is missing commits origin has (true
+  // behind), local has commits origin doesn't (ahead — e.g. an unpushed
+  // local commit in this shared checkout), or both (diverged). Compute each
+  // direction explicitly so the boolean and the message below can't claim
+  // "behind" for a checkout that is actually ahead.
   let commitsBehind = 0;
-  let commitSummaries: string[] = [];
-  if (behind) {
+  let commitsAhead = 0;
+  if (localHead !== originHead) {
     try {
       commitsBehind = parseInt(execSync('git rev-list HEAD..origin/main --count', execOpts).trim(), 10);
     } catch { /* default 0 */ }
+    try {
+      commitsAhead = parseInt(execSync('git rev-list origin/main..HEAD --count', execOpts).trim(), 10);
+    } catch { /* default 0 */ }
+  }
+  const behind = commitsBehind > 0;
+  const ahead = commitsAhead > 0;
+  const relationship: PullDrift['relationship'] =
+    behind && ahead ? 'diverged' : behind ? 'behind' : ahead ? 'ahead' : 'equal';
+
+  let commitSummaries: string[] = [];
+  if (behind) {
     try {
       commitSummaries = execSync(`git log HEAD..origin/main --oneline -${COMMIT_LOG_LIMIT}`, execOpts)
         .trim().split('\n').filter(Boolean);
@@ -677,9 +699,12 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
 
   const pull_drift: PullDrift = {
     behind,
+    ahead,
+    relationship,
     local_head: localHead,
     origin_head: originHead,
     commits_behind: commitsBehind,
+    commits_ahead: commitsAhead,
     commit_summaries: commitSummaries,
     truncated: commitsBehind > COMMIT_LOG_LIMIT,
   };
@@ -755,14 +780,15 @@ export function checkDeployDrift(frameworkRoot: string): DeployDriftReport {
     }
   }
 
+  const pullDrifted = pull_drift.relationship !== 'equal';
   const drift_kind: DeployDriftReport['drift_kind'] =
-    pull_drift.behind && build_drift.stale ? 'both'
-      : pull_drift.behind ? 'pull'
+    pullDrifted && build_drift.stale ? 'both'
+      : pullDrifted ? 'pull'
         : build_drift.stale ? 'build'
           : undefined;
 
   return {
-    status: (pull_drift.behind || build_drift.stale) ? 'drift' : 'clean',
+    status: (pullDrifted || build_drift.stale) ? 'drift' : 'clean',
     ...(drift_kind ? { drift_kind } : {}),
     checked_at,
     pull_drift,
