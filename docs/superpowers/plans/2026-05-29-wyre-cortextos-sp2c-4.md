@@ -164,7 +164,7 @@ cd infra/terraform
 # YAML render check
 sed -e 's/${cortextos_instance}/prod/g' \
     -e 's/${cortextos_org}/wyre/g' \
-    -e 's|${cortextos_repo_url}|https://github.com/wyre-technology/cortextos|g' \
+    -e 's|${cortextos_repo_url}|https://github.com/WYRE-AI/cortextos|g' \
     -e 's/${cortextos_branch}/main/g' \
     -e 's/${node_major_version}/20/g' \
     -e 's/${key_vault_name}/cortextos-prod-kv-test/g' \
@@ -321,7 +321,7 @@ git push origin feat/sp2c-4-admin-bootstrap
 - [ ] **Step 1: Open**
 
 ```bash
-gh pr create --repo wyre-technology/cortextos --base main --head feat/sp2c-4-admin-bootstrap \
+gh pr create --repo WYRE-AI/cortextos --base main --head feat/sp2c-4-admin-bootstrap \
   --title "SP2c-4: dashboard env auto-provisioning at first boot" \
   --body "Implements docs/superpowers/specs/2026-05-29-wyre-cortextos-sp2c-4-admin-bootstrap.md. Cloud-init generates ADMIN_PASSWORD + AUTH_SECRET, writes dashboard/.env.local, mirrors to Key Vault. Plus the ecosystem.ts fix to use next start in production. A fresh VM now signs in on first browser visit."
 ```

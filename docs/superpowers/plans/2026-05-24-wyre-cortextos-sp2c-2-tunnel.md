@@ -510,7 +510,7 @@ cd infra/terraform
 # YAML shape check with all placeholders substituted (including the new key_vault_uri):
 sed -e 's/${cortextos_instance}/prod/g' \
     -e 's/${cortextos_org}/wyre/g' \
-    -e 's|${cortextos_repo_url}|https://github.com/wyre-technology/cortextos|g' \
+    -e 's|${cortextos_repo_url}|https://github.com/WYRE-AI/cortextos|g' \
     -e 's/${cortextos_branch}/main/g' \
     -e 's/${node_major_version}/20/g' \
     -e 's|${key_vault_uri}|https://kv.vault.azure.net/|g' \
@@ -633,7 +633,7 @@ git push -u origin feat/sp2c-2-tunnel
 - [ ] **Step 4: Open the PR**
 
 ```bash
-gh pr create --repo wyre-technology/cortextos --base main --head feat/sp2c-2-tunnel \
+gh pr create --repo WYRE-AI/cortextos --base main --head feat/sp2c-2-tunnel \
   --title "SP2c-2: Cloudflare Tunnel + Access (subdomain routing)" \
   --body "Implements the Tunnel + Access half of docs/superpowers/specs/2026-05-24-wyre-cortextos-sp2c-tunnel-backups-design.md.
 

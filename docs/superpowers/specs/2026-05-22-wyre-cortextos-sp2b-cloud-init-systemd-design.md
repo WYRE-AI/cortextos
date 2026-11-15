@@ -262,5 +262,5 @@ runs `systemctl start cortextos-bootstrap`.
 - `docs/runbook/sp2b-host.md` (a stub — full runbook in SP2c) documents:
   how to read daemon logs, how to re-run bootstrap, where the sentinel
   file lives.
-- PR opened against `wyre-technology/cortextos`; SP2c plan referenced
+- PR opened against `WYRE-AI/cortextos`; SP2c plan referenced
   in the description as the next step.

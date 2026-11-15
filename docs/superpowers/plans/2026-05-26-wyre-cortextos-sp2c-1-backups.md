@@ -354,7 +354,7 @@ git push origin feat/sp2c-tunnel-backups
 - [ ] **Step 1: Open the PR**
 
 ```bash
-gh pr create --repo wyre-technology/cortextos --base main --head feat/sp2c-tunnel-backups \
+gh pr create --repo WYRE-AI/cortextos --base main --head feat/sp2c-tunnel-backups \
   --title "SP2c-1: daily data-disk backups" \
   --body "First sub-step of SP2c (spec: docs/superpowers/specs/2026-05-24-wyre-cortextos-sp2c-tunnel-backups-design.md).
 

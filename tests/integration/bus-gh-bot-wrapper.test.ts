@@ -133,7 +133,7 @@ echo "ARGS: $*"
   });
 
   it("uses an explicit --org over remote detection (e.g. wyre-technology default vs WYRE-AI)", async () => {
-    await initGitRepo("git@github.com:wyre-technology/cortextos.git");
+    await initGitRepo("git@github.com:WYRE-AI/cortextos.git");
     writeFakeExe("cortextos", fakeGhAppToken("WYRE-AI", "explicit-org-token"));
     writeFakeExe("cortex-secret", FAKE_CORTEX_SECRET);
     writeFakeExe("gh", `echo "GH_TOKEN=$GH_TOKEN"`);

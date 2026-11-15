@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give cortextOS a per-engineer namespace so shared org agents and personal specialist agents coexist on one host, and ship a `wyre-technology/cortextos` fork with one-command engineer provisioning.
+**Goal:** Give cortextOS a per-engineer namespace so shared org agents and personal specialist agents coexist on one host, and ship a `WYRE-AI/cortextos` fork with one-command engineer provisioning.
 
 **Architecture:** Personal agents nest at `orgs/<org>/engineers/<engineer>/agents/<name>`; shared agents stay at `orgs/<org>/agents/<name>`. All agent-directory resolution is funneled through one resolver module so namespace logic lives in exactly one place. A new `add-engineer` CLI command scaffolds namespaces.
 
@@ -28,18 +28,18 @@ Infrastructure task — no tests.
 gh repo fork asachs01/cortextos --org wyre-technology --fork-name cortextos --clone=false
 ```
 
-Expected: `✓ Created fork wyre-technology/cortextos`.
+Expected: `✓ Created fork WYRE-AI/cortextos`.
 
 - [ ] **Step 2: Re-point the local repo's remotes**
 
 ```bash
 cd ~/cortextos
-git remote set-url origin git@github.com:wyre-technology/cortextos.git
+git remote set-url origin git@github.com:WYRE-AI/cortextos.git
 git remote set-url upstream git@github.com:grandamenium/cortextos.git
 git remote -v
 ```
 
-Expected: `origin` → `wyre-technology/cortextos`, `upstream` → `grandamenium/cortextos`.
+Expected: `origin` → `WYRE-AI/cortextos`, `upstream` → `grandamenium/cortextos`.
 
 - [ ] **Step 3: Push the working branch**
 
@@ -718,7 +718,7 @@ git commit -m "feat: qualified, collision-free PM2 names for namespaced agents"
 Insert immediately below the first heading in `README.md`:
 
 ```markdown
-> **WYRE fork.** This is `wyre-technology/cortextos`, WYRE's hard fork of
+> **WYRE fork.** This is `WYRE-AI/cortextos`, WYRE's hard fork of
 > [grandamenium/cortextos](https://github.com/grandamenium/cortextos). It adds
 > per-engineer namespaces so a shared agent fleet and personal specialist agents
 > run together on one host. See `CONTRIBUTING.md` for the upstream-sync process.
@@ -741,7 +741,7 @@ At the top of `CHANGELOG.md`, below the title/preamble, add:
 ### Changed
 - `listAgents` now also discovers namespaced agents.
 - `cortextos ecosystem` emits qualified, collision-free PM2 process names.
-- Forked to `wyre-technology/cortextos`; `CONTRIBUTING.md` documents upstream sync.
+- Forked to `WYRE-AI/cortextos`; `CONTRIBUTING.md` documents upstream sync.
 ```
 
 - [ ] **Step 3: Commit**
@@ -759,7 +759,7 @@ git commit -m "docs: WYRE fork branding and SP1 changelog"
 
 ```bash
 git push origin feat/wyre-team-edition
-gh pr create --repo wyre-technology/cortextos --base main --head feat/wyre-team-edition \
+gh pr create --repo WYRE-AI/cortextos --base main --head feat/wyre-team-edition \
   --title "SP1: per-engineer namespace foundation" \
   --body "Implements docs/superpowers/specs/2026-05-20-wyre-cortextos-sp1-fork-namespace-design.md — centralized agent-dir resolution, namespaced agent discovery, add-engineer command, qualified PM2 names. SP2-4 tracked separately."
 ```
@@ -768,7 +768,7 @@ Expected: PR URL printed.
 
 - [ ] **Step 2: Confirm CI is green**
 
-Run: `gh pr checks --repo wyre-technology/cortextos`
+Run: `gh pr checks --repo WYRE-AI/cortextos`
 Expected: build + test checks pass.
 
 ---
