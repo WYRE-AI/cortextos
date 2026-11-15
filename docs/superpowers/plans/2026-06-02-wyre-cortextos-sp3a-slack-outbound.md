@@ -892,7 +892,7 @@ git push -u origin feat/sp3a-slack-outbound
 - [ ] **Step 3: Open the PR**
 
 ```bash
-gh pr create --repo wyre-technology/cortextos --base main --head feat/sp3a-slack-outbound \
+gh pr create --repo WYRE-AI/cortextos --base main --head feat/sp3a-slack-outbound \
   --title "SP3a: Slack outbound — agents can post to channels with per-agent identity" \
   --body "Implements docs/superpowers/specs/2026-06-02-wyre-cortextos-sp3-slack-design.md (SP3a slice).
 

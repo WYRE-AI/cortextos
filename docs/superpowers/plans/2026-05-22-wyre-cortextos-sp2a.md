@@ -669,7 +669,7 @@ If nothing changed, skip this step.
 
 ```bash
 git push -u origin feat/sp2-central-host
-gh pr create --repo wyre-technology/cortextos --base main --head feat/sp2-central-host \
+gh pr create --repo WYRE-AI/cortextos --base main --head feat/sp2-central-host \
   --title "SP2a: Terraform skeleton for the central host" \
   --body "Provisions the Azure VM, data disk, network, and Key Vault per docs/superpowers/specs/2026-05-21-wyre-cortextos-sp2-central-host-design.md. Cloud-init is a placeholder (SP2b lands the real bootstrap). No Cloudflare Tunnel yet (SP2c). Verified end-to-end against a real Azure subscription: terraform apply provisioned cleanly, data disk attached, terraform destroy left no orphans."
 ```

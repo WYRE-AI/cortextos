@@ -77,7 +77,7 @@ one-function change.
 
 ## Implementation outline
 
-1. **Create the fork.** `gh repo fork`/create `wyre-technology/cortextos` from
+1. **Create the fork.** `gh repo fork`/create `WYRE-AI/cortextos` from
    `asachs01/cortextos`. Add `upstream` → `grandamenium/cortextos`. Document the
    cherry-pick sync process in `CONTRIBUTING.md`.
 
@@ -145,7 +145,7 @@ one-function change.
 
 ## Definition of done (SP1)
 
-- `wyre-technology/cortextos` exists with `upstream` configured and sync documented.
+- `WYRE-AI/cortextos` exists with `upstream` configured and sync documented.
 - Agent path resolution flows through one resolver; all hardcoded joins removed.
 - `engineers/<name>/agents/` namespaces are discovered, addressable, and run under
   unique PM2 process names.

@@ -8,7 +8,7 @@
 
 ## Context
 
-SP1 landed the per-engineer namespace foundation on `wyre-technology/cortextos`
+SP1 landed the per-engineer namespace foundation on `WYRE-AI/cortextos`
 (merged as `afb6ebf` in PR #1). The code now structurally supports shared org
 agents and per-engineer personal agents on one host. SP2 builds that host.
 
@@ -57,7 +57,7 @@ Engineers / Telegram
 ## Decomposition inside SP2
 
 Even SP2 is too big for one implementation plan. Three sequential PRs against
-`wyre-technology/cortextos`, each leaving the system in a working state:
+`WYRE-AI/cortextos`, each leaving the system in a working state:
 
 | # | Sub-step | What it ships |
 |---|---|---|

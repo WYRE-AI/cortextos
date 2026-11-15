@@ -229,7 +229,7 @@ Quick sanity check that the file is valid YAML when the templatefile variables a
 # Hand-render with a fake var set just to validate YAML shape.
 sed -e 's/${cortextos_instance}/prod/g' \
     -e 's/${cortextos_org}/wyre/g' \
-    -e 's|${cortextos_repo_url}|https://github.com/wyre-technology/cortextos|g' \
+    -e 's|${cortextos_repo_url}|https://github.com/WYRE-AI/cortextos|g' \
     -e 's/${cortextos_branch}/main/g' \
     -e 's/${node_major_version}/20/g' \
     cloud-init.yaml.tftpl | python3 -c "import sys, yaml; yaml.safe_load(sys.stdin)" && echo "YAML OK"
@@ -330,7 +330,7 @@ Add at the bottom of `infra/terraform/variables.tf`:
 variable "cortextos_repo_url" {
   type        = string
   description = "Git URL the bootstrap clones into /opt/cortextos."
-  default     = "https://github.com/wyre-technology/cortextos.git"
+  default     = "https://github.com/WYRE-AI/cortextos.git"
 }
 
 variable "cortextos_branch" {
@@ -714,7 +714,7 @@ git push origin feat/sp2b-cloud-init
 - [ ] **Step 2: Open the PR**
 
 ```bash
-gh pr create --repo wyre-technology/cortextos --base main --head feat/sp2b-cloud-init \
+gh pr create --repo WYRE-AI/cortextos --base main --head feat/sp2b-cloud-init \
   --title "SP2b: cloud-init bootstrap and systemd units" \
   --body "Implements docs/superpowers/specs/2026-05-22-wyre-cortextos-sp2b-cloud-init-systemd-design.md.
 
