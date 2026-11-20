@@ -296,6 +296,49 @@ describe('nextFireFromCron — infeasible dom+month pre-check', () => {
     const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
     expect(nextFireFromCron('15 4 31 1 *', fromMs)).toBe(Date.parse('2027-01-31T04:15:00.000Z'));
   });
+
+  // The UTC fast path (native Date getters) must agree EXACTLY with the Intl
+  // path it bypasses. "UTC" and "Etc/UTC" are the same zone but take different
+  // branches — the former uses getters, the latter builds an Intl formatter —
+  // so comparing them across a spread of expressions pins the equivalence.
+  it('UTC fast path agrees exactly with the Intl path (vs the equivalent Etc/UTC)', () => {
+    // Cases are anchored close to their match so BOTH paths scan a short
+    // window: the Etc/UTC side still pays Intl per candidate minute, so
+    // pairing a sparse expression with a far anchor here would cost ~9s each
+    // and time the test out — the very cost this fast path exists to remove.
+    // Every cron field is still covered.
+    const cases: Array<{ from: string; expr: string; why: string }> = [
+      { from: '2026-07-13T08:00:00.000Z', expr: '*/15 * * * *',  why: 'minute step' },
+      { from: '2026-07-13T08:00:00.000Z', expr: '0 9 * * 1-5',   why: 'weekday range' },
+      { from: '2026-12-31T23:59:00.000Z', expr: '30 6 1 * *',    why: 'year/month/day rollover' },
+      { from: '2026-03-08T06:30:00.000Z', expr: '0 2 * * *',     why: 'US DST date — UTC must not shift' },
+      { from: '2027-01-29T00:00:00.000Z', expr: '0 0 31 1,2 *',  why: 'sparse dom+month' },
+      { from: '2028-02-27T00:00:00.000Z', expr: '0 0 29 2 *',    why: 'leap day' },
+      { from: '2027-01-30T00:00:00.000Z', expr: '15 4 31 1 *',   why: 'exact date + hour + minute' },
+    ];
+    for (const { from, expr, why } of cases) {
+      const fromMs = Date.parse(from);
+      expect(
+        nextFireFromCron(expr, fromMs),
+        `${expr} @ ${from} (${why})`,
+      ).toBe(nextFireFromCron(expr, fromMs, 'Etc/UTC'));
+    }
+  });
+
+  it('resolves a sparse UTC expression fast enough for the scheduler tick', () => {
+    // Regression guard for the Intl-per-candidate-minute cost. This expression
+    // scans ~291K candidate minutes (Jul 2026 -> Jan 2027); via
+    // Intl.formatToParts that measured 9,382ms, which blew the 10s test timeout
+    // under load and burned that same CPU inside the daemon on every schedule
+    // computation. Native UTC getters measured 340ms. Bound generously so this
+    // fails on a return to per-minute Intl, not on CI jitter.
+    const fromMs = Date.parse('2026-07-13T08:00:00.000Z');
+    const t0 = performance.now();
+    const next = nextFireFromCron('0 0 31 1,2 *', fromMs);
+    const elapsed = performance.now() - t0;
+    expect(next).toBe(Date.parse('2027-01-31T00:00:00.000Z'));
+    expect(elapsed).toBeLessThan(3000);
+  });
 });
 
 // ---------------------------------------------------------------------------
