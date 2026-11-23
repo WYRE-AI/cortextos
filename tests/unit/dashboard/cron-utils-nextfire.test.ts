@@ -71,4 +71,19 @@ describe('dashboard nextFireFromCronExpr — matches the daemon', () => {
       ).toBe(nextFireFromCron(expr, fromMs, tz));
     }
   });
+
+  it('rejects malformed and out-of-range tokens without expanding them', () => {
+    const t0 = performance.now();
+    expect(nextFireFromCronExpr('0-999999999 * * * *', AT('2026-07-13T08:00:00.000Z'))).toBeNaN();
+    expect(nextFireFromCronExpr('5abc * * * *', AT('2026-07-13T08:00:00.000Z'))).toBeNaN();
+    expect(nextFireFromCronExpr('60 * * * *', AT('2026-07-13T08:00:00.000Z'))).toBeNaN();
+    expect(nextFireFromCronExpr('*/0 * * * *', AT('2026-07-13T08:00:00.000Z'))).toBeNaN();
+    expect(performance.now() - t0).toBeLessThan(120);
+  });
+
+  it('finds a valid long-horizon schedule instead of reporting it impossible', () => {
+    // Feb 29 after Feb 29 2024 next occurs in 2028, beyond a 366-day window.
+    expect(nextFireFromCronExpr('0 0 29 2 *', AT('2024-03-01T00:00:00.000Z')))
+      .toBe(AT('2028-02-29T00:00:00.000Z'));
+  });
 });

@@ -206,23 +206,31 @@ const WEEKDAY_ABBR_TO_NUM: Record<string, number> = {
 
 interface CronFields { minute: number; hour: number; day: number; month: number; weekday: number }
 
+function parseCronInt(token: string, min: number, max: number, what: string): number {
+  // Strict digits only: parseInt('5abc') would silently accept trailing text.
+  if (!/^\d{1,4}$/.test(token)) throw new Error(`Invalid ${what}: ${token}`);
+  const n = Number(token);
+  if (n < min || n > max) throw new Error(`Out-of-range ${what}: ${token}`);
+  return n;
+}
+
 function expandCronField(field: string, min: number, max: number): number[] {
   const result = new Set<number>();
   for (const part of field.split(',')) {
     if (part === '*') {
       for (let i = min; i <= max; i++) result.add(i);
     } else if (part.startsWith('*/')) {
-      const step = parseInt(part.slice(2), 10);
-      if (isNaN(step) || step <= 0) throw new Error(`Invalid step: ${part}`);
+      const step = parseCronInt(part.slice(2), 1, max, 'step');
       for (let i = min; i <= max; i += step) result.add(i);
     } else if (part.includes('-')) {
-      const [lo, hi] = part.split('-').map(s => parseInt(s, 10));
-      if (isNaN(lo) || isNaN(hi) || lo > hi) throw new Error(`Invalid range: ${part}`);
+      const pieces = part.split('-');
+      if (pieces.length !== 2) throw new Error(`Invalid range: ${part}`);
+      const lo = parseCronInt(pieces[0], min, max, 'range start');
+      const hi = parseCronInt(pieces[1], min, max, 'range end');
+      if (lo > hi) throw new Error(`Invalid range: ${part}`);
       for (let i = lo; i <= hi; i++) result.add(i);
     } else {
-      const n = parseInt(part, 10);
-      if (isNaN(n)) throw new Error(`Invalid value: ${part}`);
-      result.add(n);
+      result.add(parseCronInt(part, min, max, 'value'));
     }
   }
   return [...result].sort((a, b) => a - b);
@@ -311,20 +319,23 @@ export function nextFireFromCronExpr(
     };
   }
 
+  // Calendar-aware scan. Non-matching days are skipped to the next local
+  // midnight and non-matching hours to the next hour, so a valid schedule that
+  // fires years away (0 0 29 2 *) is found without a minute-by-minute walk.
+  // The horizon covers one full leap-year cycle plus the century exception.
   let candidate = Math.floor(fromMs / 60_000) * 60_000 + 60_000;
-  const MAX_MINUTES = 366 * 24 * 60;
-  for (let i = 0; i < MAX_MINUTES; i++) {
+  const horizon = fromMs + 9 * 366 * 24 * 60 * 60_000;
+  while (candidate <= horizon) {
     const f = fieldsAt(candidate);
-    if (
-      months.includes(f.month) &&
-      doms.includes(f.day) &&
-      dows.includes(f.weekday) &&
-      hours.includes(f.hour) &&
-      minutes.includes(f.minute)
-    ) {
+    if (!months.includes(f.month) || !doms.includes(f.day) || !dows.includes(f.weekday)) {
+      candidate += (24 * 60 - (f.hour * 60 + f.minute)) * 60_000;
+    } else if (!hours.includes(f.hour)) {
+      candidate += (60 - f.minute) * 60_000;
+    } else if (!minutes.includes(f.minute)) {
+      candidate += 60_000;
+    } else {
       return candidate;
     }
-    candidate += 60_000;
   }
   return NaN;
 }
