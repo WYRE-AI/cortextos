@@ -917,6 +917,21 @@ describe('FastChecker', () => {
       expect(execMock.mock.calls.length).toBe(callsBefore);
     });
 
+    it('stop() during bootstrap releases start() and never arms the heartbeat timer', async () => {
+      const { execFile } = await import('child_process');
+      const agent = createMockAgent('my-agent');
+      agent.isBootstrapped.mockReturnValue(false);
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { pollInterval: WATCHDOG_POLL_MS });
+      startedCheckers.push(checker);
+      const started = checker.start();
+      await vi.advanceTimersByTimeAsync(3000);
+      checker.stop();
+      await expect(started).resolves.toBeUndefined();
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      expect(execFile).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
     it('does not fire before bootstrap completes', async () => {
       const { execFile } = await import('child_process');
       const agent = createMockAgent('my-agent');

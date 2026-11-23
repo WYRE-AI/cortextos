@@ -173,6 +173,14 @@ export class FastChecker {
 
     // Wait for bootstrap
     await this.waitForBootstrap();
+    if (!this.running) {
+      // stop() arrived during bootstrap: do not arm the heartbeat timer or poll.
+      this.log('Stopped during bootstrap. Not starting poll loop.');
+      if (process.platform !== 'win32') {
+        process.removeListener('SIGUSR1', sigusr1Handler);
+      }
+      return;
+    }
     this.log('Bootstrap complete. Beginning poll loop.');
 
     // Idle-session heartbeat watchdog: fires every 50 min regardless of REPL state
@@ -227,6 +235,8 @@ export class FastChecker {
    */
   stop(): void {
     this.running = false;
+    // Release a pending bootstrap or poll sleep so start() can return.
+    this.wake();
     if (this.heartbeatTimer !== null) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -555,12 +565,13 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
    */
   private async waitForBootstrap(timeoutMs: number = 30000): Promise<void> {
     const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
+    while (this.running && Date.now() - start < timeoutMs) {
       if (this.agent.isBootstrapped()) {
         return;
       }
-      await sleep(2000);
+      await this.sleepInterruptible(2000);
     }
+    if (!this.running) return;
     this.log('Bootstrap timeout - proceeding anyway');
   }
 
